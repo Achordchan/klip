@@ -39,3 +39,6 @@ func truncateUTF8(s string, limit int) string {
 	}
 	return s[:limit]
 }
+
+// ImportedFileName exposes the canonical snapshot cache mapping to legacy readers.
+func ImportedFileName(index int, name string) string { return importedFileName(index, name) }

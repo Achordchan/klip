@@ -122,7 +122,7 @@ func TestAutoSuppressedBusyAndSignedOut(t *testing.T) {
 		t.Errorf("manual while signed out: %v, runs %d", second, r.runs.Load())
 	}
 	// A background trigger while signed out is silent.
-	r.a.Trigger(ctx, "remote_event", false)
+	r.a.Trigger(ctx, "sse", false)
 	time.Sleep(50 * time.Millisecond)
 	r.mu.Lock()
 	n := len(r.done)

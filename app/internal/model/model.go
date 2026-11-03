@@ -86,21 +86,22 @@ func ParseTime(s string) (time.Time, error) {
 type Item struct {
 	// LocalSyncMutation is local recovery evidence, saved atomically with the
 	// item in history.json. Snapshot SQL deliberately does not export it.
-	LocalSyncMutation string   `json:"LocalSyncMutation,omitempty"`
-	ID                string   `json:"Id"`
-	Kind              Kind     `json:"Kind"`
-	CapturedAt        Time     `json:"CapturedAt"`
-	ApproxBytes       int64    `json:"ApproxBytes"`
-	Text              *string  `json:"Text"`
-	ImageFilePath     *string  `json:"ImageFilePath"`
-	FilePaths         []string `json:"FilePaths"`
-	Pinned            bool     `json:"Pinned"`
-	CopyCount         int32    `json:"CopyCount"`
-	FirstCapturedAt   *Time    `json:"FirstCapturedAt"`
-	Note              *string  `json:"Note"`
-	ContentHash       *string  `json:"ContentHash"`
-	SourceAppName     *string  `json:"SourceAppName"`
-	SourceAppPath     *string  `json:"SourceAppPath"`
+	LocalCaptureMutation string   `json:"LocalCaptureMutation,omitempty"`
+	LocalSyncMutation    string   `json:"LocalSyncMutation,omitempty"`
+	ID                   string   `json:"Id"`
+	Kind                 Kind     `json:"Kind"`
+	CapturedAt           Time     `json:"CapturedAt"`
+	ApproxBytes          int64    `json:"ApproxBytes"`
+	Text                 *string  `json:"Text"`
+	ImageFilePath        *string  `json:"ImageFilePath"`
+	FilePaths            []string `json:"FilePaths"`
+	Pinned               bool     `json:"Pinned"`
+	CopyCount            int32    `json:"CopyCount"`
+	FirstCapturedAt      *Time    `json:"FirstCapturedAt"`
+	Note                 *string  `json:"Note"`
+	ContentHash          *string  `json:"ContentHash"`
+	SourceAppName        *string  `json:"SourceAppName"`
+	SourceAppPath        *string  `json:"SourceAppPath"`
 }
 
 // UnmarshalJSON gives CopyCount the default the C# record gives a missing
@@ -129,3 +130,17 @@ func Str(p *string) string {
 
 // Ptr returns a pointer to s.
 func Ptr(s string) *string { return &s }
+
+// UTF16Len is the length of s in UTF-16 units, which is what C#'s
+// string.Length counts: the sizes in the history are twice that.
+func UTF16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}

@@ -143,6 +143,11 @@ func Export(ctx context.Context, l paths.Layout, snapshotPath string, items []mo
 	}
 	list := make([]Blob, 0, len(blobs))
 	for _, b := range blobs {
+		stable, err := stageExportBlob(l, b)
+		if err != nil {
+			return ExportResult{}, err
+		}
+		b.SourcePath = stable
 		list = append(list, b)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].SHA256 < list[j].SHA256 })
@@ -1450,4 +1455,48 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// stageExportBlob freezes exported bytes under their content hash. A concurrent
+// cache replacement either leaves the expected bytes or fails export validation.
+func stageExportBlob(l paths.Layout, b Blob) (string, error) {
+	dest := l.BlobPath(b.SHA256)
+	if sum, err := fileSHA256(dest); err == nil && strings.EqualFold(sum, b.SHA256) {
+		return dest, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
+		return "", err
+	}
+	in, err := os.Open(b.SourcePath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	out, err := os.CreateTemp(filepath.Dir(dest), "export-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(out.Name())
+	if _, err = io.Copy(out, in); err != nil {
+		out.Close()
+		return "", err
+	}
+	if err = out.Sync(); err != nil {
+		out.Close()
+		return "", err
+	}
+	if err = out.Close(); err != nil {
+		return "", err
+	}
+	sum, err := fileSHA256(out.Name())
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(sum, b.SHA256) {
+		return "", errors.New("snapshot payload changed during export")
+	}
+	if err = durable.Rename(out.Name(), dest); err != nil {
+		return "", err
+	}
+	return dest, nil
 }

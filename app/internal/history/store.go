@@ -38,6 +38,7 @@ func Load(l paths.Layout) ([]model.Item, error) {
 	if err := json.Unmarshal(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")), &items); err != nil {
 		return nil, err
 	}
+	recoverCapturedFiles(l.Files(), items)
 	// An interrupted cache replacement is undone before Normalize decides
 	// that an item has no content.
 	snapshot.RecoverPayloads(l, items)
@@ -161,7 +162,7 @@ func Normalize(l paths.Layout, it model.Item) (model.Item, bool) {
 			return it, false
 		}
 		// The C# code counts UTF-16 units times two.
-		it.ApproxBytes = int64(utf16Len(t)) * 2
+		it.ApproxBytes = int64(model.UTF16Len(t)) * 2
 		return it, true
 
 	case model.KindFileList:
