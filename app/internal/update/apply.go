@@ -123,10 +123,11 @@ func (l logger) say(msg string) {
 }
 
 type rollbackItem struct {
-	path, backup string
-	existed      bool
-	moved        bool
-	manifest     bool
+	path, backup   string
+	existed        bool
+	moved          bool
+	manifest       bool
+	originalDigest string
 }
 
 // RunPlan is the helper: it waits for the program to exit and then, as the
@@ -392,7 +393,11 @@ func applyFiles(p Plan, h Hooks, lg logger, rollback *[]rollbackItem) error {
 			if err = os.Remove(backup); err != nil {
 				return err
 			}
-			*rollback = append(*rollback, rollbackItem{path: candidate, backup: backup, existed: true, moved: true})
+			digest, err := transitionDigest(candidate)
+			if err != nil {
+				return err
+			}
+			*rollback = append(*rollback, rollbackItem{path: candidate, backup: backup, existed: true, moved: true, originalDigest: digest})
 			if err := saveRecovery(p.InstallDir, *rollback); err != nil {
 				return err
 			}
@@ -612,6 +617,9 @@ func HelperMain(args []string, h Hooks) (handled bool, code int) {
 		pid, _ := strconv.Atoi(args[3])
 		waitExit(pid)
 		if err := RecoverInterruptedUpdate(args[2]); err != nil {
+			h = h.fill()
+			h.Alert("Klip 恢复失败", "自动恢复未完成："+err.Error()+"\n请关闭占用文件的程序后重试；若仍失败，请重新安装。请保留恢复日志和备份。")
+			fmt.Fprintln(os.Stderr, "recover-update:", err)
 			return true, 1
 		}
 		release()
