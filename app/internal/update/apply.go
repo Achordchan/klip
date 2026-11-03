@@ -519,7 +519,23 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o644)
+	f, err := os.CreateTemp(filepath.Dir(path), ".update-json-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(append(b, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return durable.Rename(f.Name(), path)
 }
 
 func copyFile(src, dst string) error {
@@ -645,7 +661,7 @@ func HelperMain(args []string, h Hooks) (handled bool, code int) {
 func removeRecoveryJournal(root string, sleep func(time.Duration)) error {
 	var err error
 	for i := 0; i < 5; i++ {
-		err = os.Remove(recoveryPath(root))
+		err = durable.Remove(recoveryPath(root))
 		if err == nil || os.IsNotExist(err) {
 			return nil
 		}
