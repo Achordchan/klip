@@ -102,3 +102,57 @@ func TestHistoryCleanupNeverDeletesExternalImage(t *testing.T) {
 		t.Fatal("external image deleted")
 	}
 }
+
+func TestUnreadableCaptureEvidencePreservesBothCaches(t *testing.T) {
+	for _, evidence := range []string{"missing", "truncated"} {
+		t.Run(evidence, func(t *testing.T) {
+			root := t.TempDir()
+			for _, name := range []string{"item", "item.capture-backup"} {
+				if err := os.Mkdir(filepath.Join(root, name), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, name, "payload"), []byte(name), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if evidence == "truncated" {
+				if err := os.WriteFile(filepath.Join(root, "item.capture-backup.capture-time"), []byte(`"partial`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recoverCapturedFiles(root)
+			for _, name := range []string{"item", "item.capture-backup"} {
+				b, err := os.ReadFile(filepath.Join(root, name, "payload"))
+				if err != nil || string(b) != name {
+					t.Fatalf("lost %s: %q %v", name, b, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCaptureEvidencePublicationFailureLeavesCachesUntouched(t *testing.T) {
+	l := paths.Layout{Root: t.TempDir()}
+	s := NewService(l)
+	s.deferCleanup = true
+	for _, id := range []string{"old", "new"} {
+		if err := os.MkdirAll(filepath.Join(l.Files(), id), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(l.Files(), id, "0000_doc.txt"), []byte(id), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(l.Files(), "old.capture-backup.capture-time"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if s.replaceCapturedFiles(model.Item{ID: "old", LocalCaptureMutation: "old-marker"}, model.Item{ID: "new", LocalCaptureMutation: "new-marker", FilePaths: []string{"doc.txt"}}) {
+		t.Fatal("replacement proceeded without durable evidence")
+	}
+	for _, id := range []string{"old", "new"} {
+		b, err := os.ReadFile(filepath.Join(l.Files(), id, "0000_doc.txt"))
+		if err != nil || string(b) != id {
+			t.Fatalf("changed %s: %q %v", id, b, err)
+		}
+	}
+}

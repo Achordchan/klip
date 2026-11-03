@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"klip/internal/durable"
 	"klip/internal/model"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func (s *Service) replaceCapturedFiles(old, next model.Item) bool {
 			}
 		}
 		b, _ := json.Marshal(next.LocalCaptureMutation)
-		if err := os.WriteFile(backup+".capture-time", b, 0600); err != nil {
+		if err := writeCaptureEvidence(backup+".capture-time", b); err != nil {
 			return false
 		}
 	}
@@ -166,10 +167,29 @@ func recoverCaptureTransactions(root string, retireOnly bool, histories ...[]mod
 		}
 		if _, err := os.Lstat(to); os.IsNotExist(err) {
 			_ = os.Rename(backup, to)
-		} else if err == nil {
-			_ = os.RemoveAll(backup)
 		}
 	}
+}
+
+// Evidence must reach disk before either cache rename can become visible.
+func writeCaptureEvidence(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".capture-evidence-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return durable.Rename(f.Name(), path)
 }
 
 func captureMutationID() string {
