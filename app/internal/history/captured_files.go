@@ -64,14 +64,17 @@ func (s *Service) replaceCapturedFiles(old, next model.Item) bool {
 			return false
 		}
 	}
+	if err := durable.SyncTree(from); err != nil {
+		return false
+	}
 	var err error
 	hadOld := false
-	if err = os.Rename(to, backup); err == nil {
+	if err = durable.Rename(to, backup); err == nil {
 		hadOld = true
 	} else if !os.IsNotExist(err) {
 		return false
 	}
-	if err = os.Rename(from, to); err != nil {
+	if err = durable.Rename(from, to); err != nil {
 		if hadOld {
 			_ = os.Rename(backup, to)
 		}
