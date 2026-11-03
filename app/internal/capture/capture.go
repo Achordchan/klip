@@ -30,6 +30,7 @@ import (
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/webp"
 
+	"klip/internal/durable"
 	"klip/internal/history"
 	"klip/internal/model"
 	"klip/internal/paths"
@@ -730,10 +731,14 @@ func copyFileBounded(src, dst string, limit int64) (err error) {
 		out.Close()
 		return err
 	}
+	if err = out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
 	if err = out.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, dst)
+	return durable.Rename(tmp, dst)
 }
 
 func newGUID() string {
