@@ -52,8 +52,8 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (TokenSet, er
 	return c.tokenRequest(ctx, "/auth/refresh", map[string]any{"refreshToken": strings.TrimSpace(refreshToken)})
 }
 
-// CurrentEmail asks who the access token is. It says "" when the server does
-// not accept it.
+// CurrentEmail asks who the access token is. It says "" when the server turns
+// the token down (400, 401, 403); any other failure is an error.
 func (c *Client) CurrentEmail(ctx context.Context, accessToken string) (string, error) {
 	if strings.TrimSpace(accessToken) == "" {
 		return "", nil
@@ -71,7 +71,13 @@ func (c *Client) CurrentEmail(ctx context.Context, accessToken string) (string, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", nil
+		switch resp.StatusCode {
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+			return "", nil // the token is turned down
+		}
+		// The server is busy or failing (5xx, 429...): that says nothing
+		// about the token, and the caller must not take it for a refusal.
+		return "", &APIError{StatusCode: resp.StatusCode, Message: "account check failed"}
 	}
 	b, _ := io.ReadAll(resp.Body)
 	var s string

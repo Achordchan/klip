@@ -244,6 +244,8 @@ func TestUploadRemembersTheItemsItSent(t *testing.T) {
 	captured := textItemAt("7c9e6679-7425-40de-944b-e07fc1f90ae7", "captured while uploading")
 	h := &changingHistory{first: []model.Item{sent}, later: []model.Item{captured, sent}}
 	s := signedIn(model.DefaultSettings())
+	s.SyncLastRemoteVersion = model.Ptr("v1")
+	s.SyncLastRemoteSha256 = model.Ptr("sha-1")
 	syn := unitSyncer(t, srv, s, h)
 
 	if _, err := syn.UploadAfterLocalMutation(context.Background()); err != nil {

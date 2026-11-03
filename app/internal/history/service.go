@@ -336,6 +336,60 @@ func (s *Service) Remove(id string) {
 	s.fire()
 }
 
+// RemoveMany removes the items ids, at once: one change. An id that is not
+// there is passed over; an item added meanwhile stays.
+func (s *Service) RemoveMany(ids []string) {
+	var t trash
+	removed := false
+	s.mu.Lock()
+	for _, id := range ids {
+		if s.removeLocked(id, &t) {
+			removed = true
+		}
+	}
+	if !removed {
+		s.mu.Unlock()
+		return
+	}
+	s.empty(context.Background(), t)
+	s.mu.Unlock()
+	s.fire()
+}
+
+// RemoveSelected removes the items pick selects from the history as it is,
+// in one step: nothing is added or changed between the choice and the
+// removal (pick runs with the history locked, and must not use it). It
+// returns what it removed; one change, or none.
+func (s *Service) RemoveSelected(pick func(items []model.Item) []model.Item) []model.Item {
+	var t trash
+	s.mu.Lock()
+	chosen := pick(append([]model.Item(nil), s.items...))
+	selected := make(map[string]bool, len(chosen))
+	for _, it := range chosen {
+		selected[strings.ToLower(it.ID)] = true
+	}
+	var removed []model.Item
+	kept := make([]model.Item, 0, len(s.items))
+	for _, it := range s.items {
+		if selected[strings.ToLower(it.ID)] {
+			removed = append(removed, it)
+			t.add(it)
+		} else {
+			kept = append(kept, it)
+		}
+	}
+	s.items = kept
+
+	if len(removed) == 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	s.empty(context.Background(), t)
+	s.mu.Unlock()
+	s.fire()
+	return removed
+}
+
 func (s *Service) removeLocked(id string, t *trash) bool {
 	idx := indexOf(s.items, id)
 	if idx < 0 {

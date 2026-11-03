@@ -70,11 +70,13 @@ func (s *Session) AccessToken(ctx context.Context) (string, error) {
 // a refresh token that is already gone.
 func (s *Session) Refresh(ctx context.Context) (bool, error) {
 	before := s.Settings.Get()
-	refresh := strings.TrimSpace(model.Str(before.AuthRefreshToken))
-	if refresh == "" {
-		return false, nil
+	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	defer cancel()
+	unlock, err := LockRefresh(ctx)
+	if err != nil {
+		return false, err
 	}
-
+	defer unlock()
 	refreshMu.Lock()
 	defer refreshMu.Unlock()
 
@@ -85,7 +87,7 @@ func (s *Session) Refresh(ctx context.Context) (bool, error) {
 		cur.AuthExpiresAtUnixMs > s.now().UnixMilli()+30_000 {
 		return true, nil
 	}
-	refresh = strings.TrimSpace(model.Str(cur.AuthRefreshToken))
+	refresh := strings.TrimSpace(model.Str(cur.AuthRefreshToken))
 	if refresh == "" {
 		return false, nil
 	}
@@ -157,4 +159,21 @@ func sameRefreshToken(m *model.Settings, refresh string) bool {
 // (429, 5xx, a proxy error) is temporary and must not sign the user out.
 func refreshRejected(e *APIError) bool {
 	return e.StatusCode == 400 || e.StatusCode == 401
+}
+
+var refreshSem = make(chan struct{}, 1)
+
+// refreshTimeout bounds one refresh request, and so how long the lock is held.
+const refreshTimeout = 30 * time.Second
+
+// LockRefresh takes the refresh lock that Session.Refresh takes; whoever else
+// refreshes the stored tokens (the account window) holds it too, and looks at
+// the stored tokens again after getting it. Waiting for it ends with ctx.
+func LockRefresh(ctx context.Context) (unlock func(), err error) {
+	select {
+	case refreshSem <- struct{}{}:
+		return func() { <-refreshSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

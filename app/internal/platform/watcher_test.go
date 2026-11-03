@@ -96,3 +96,73 @@ func TestWatcherContentFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestWatcherRepeatsALookThatTookNothing(t *testing.T) {
+	var seq atomic.Int64
+	seq.Store(1)
+	var looks, empties atomic.Int32
+	empties.Store(2) // the first two looks take nothing
+	w := &Watcher{
+		Interval: 5 * time.Millisecond,
+		Seq:      seq.Load,
+		OnChange: func() { looks.Add(1) },
+		Retry:    func() bool { return empties.Add(-1) >= 0 },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+	time.Sleep(30 * time.Millisecond)
+	seq.Store(2) // a change, caught half way: the data is not there yet
+	deadline := time.Now().Add(3 * time.Second)
+	for looks.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := looks.Load(); got != 3 {
+		t.Fatalf("looks = %d, want 3 (the change, and a repeat for each look that took nothing)", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := looks.Load(); got != 3 {
+		t.Fatalf("kept looking after something was there: %d", got)
+	}
+}
+
+func TestWatcherRetryStopsWhenTheCounterMoves(t *testing.T) {
+	var seq atomic.Int64
+	seq.Store(1)
+	var looks atomic.Int32
+	w := &Watcher{
+		Interval: 5 * time.Millisecond,
+		Seq:      seq.Load,
+		OnChange: func() {
+			if looks.Add(1) == 1 {
+				seq.Store(3) // another copy arrives during the repeats
+			}
+		},
+		Retry: func() bool { return true }, // always "took nothing"
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+	time.Sleep(30 * time.Millisecond)
+	seq.Store(2)
+	time.Sleep(400 * time.Millisecond)
+	// look 1: the change to 2 (it moves the counter on to 3); the repeat
+	// notices and stops; the tick sees 3 and looks once more, and from there
+	// the counter is steady: the repeats go on until they are used up.
+	if got := looks.Load(); got < 2 || got > 2+int32(len(retryDelays)) {
+		t.Fatalf("looks = %d", got)
+	}
+}
+
+func TestWatcherWithoutCounterDoesNotRetry(t *testing.T) {
+	var retries atomic.Int32
+	w := &Watcher{Interval: 5 * time.Millisecond, Seq: func() int64 { return -1 },
+		OnChange: func() {}, Retry: func() bool { retries.Add(1); return true }}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+	time.Sleep(60 * time.Millisecond)
+	if retries.Load() != 0 {
+		t.Fatalf("Retry was asked %d times where every tick looks anyway", retries.Load())
+	}
+}

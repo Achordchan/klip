@@ -108,6 +108,7 @@ type Service struct {
 	triesFor        atomic.Value                // the change the budget is for
 	retryGeneration atomic.Uint64
 	tries           atomic.Int32 // retries of an unreadable clipboard in a row
+	took            atomic.Bool  // whether the last Capture took something (see FoundNothing)
 	skipped         atomic.Bool  // a Capture gave way to an Apply
 	writeGen        atomic.Int64 // moves at the start and the end of every Apply
 }
@@ -330,12 +331,15 @@ func (s *Service) capture(ctx context.Context, expected *uint64) error {
 		return nil
 	}
 	gen := s.writeGen.Load()
+	s.took.Store(false)
 	opt := s.options()
 	if s.applying.Load() > 0 {
 		s.noteSkipped()
+		s.took.Store(true) // the retry after the Apply is on its way
 		return nil
 	}
 	if s.isOwnChange() {
+		s.took.Store(true) // ours: nothing to look for
 		return nil
 	}
 	// When the clipboard could not be read (it was busy), the watcher has
@@ -346,6 +350,7 @@ func (s *Service) capture(ctx context.Context, expected *uint64) error {
 		return nil
 	}
 	if strings.HasPrefix(key, "seq:") && s.lastDone.Load() == any(key) {
+		s.took.Store(true)
 		return nil // this change was taken already (the watcher saw it late)
 	}
 	wantRetry := false
@@ -401,6 +406,7 @@ func (s *Service) capture(ctx context.Context, expected *uint64) error {
 			it.SourceAppName, it.SourceAppPath = &app.Name, &app.Path
 		}
 		s.History.Add(it)
+		s.took.Store(true)
 		if strings.HasPrefix(key, "tok:") && s.CapturedToken != nil {
 			s.CapturedToken(strings.TrimPrefix(key, "tok:"))
 		}
@@ -749,6 +755,15 @@ func newGUID() string {
 	h := hex.EncodeToString(b)
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
 }
+
+// FoundNothing says whether the last Capture took nothing from the clipboard.
+// A program that declares what it will put on the clipboard and writes it a
+// moment later moves the change counter for the first step only: a look in
+// between sees nothing, or what was there before, and nothing tells the
+// watcher to look again. So a look that took nothing is repeated a few times
+// (platform.Watcher.Retry); one that took something, or that left the
+// clipboard alone because the app had just written it itself, is not.
+func (s *Service) FoundNothing() bool { return !s.took.Load() }
 
 // ---- apply
 

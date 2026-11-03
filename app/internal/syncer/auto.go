@@ -24,7 +24,9 @@ type Auto struct {
 	Done func(reason string, manual bool, err error)
 	// Context, when set, is the application's lifetime context for a follow-up
 	// run: the trigger that queued it may have been cancelled by then.
-	Context context.Context
+	Context  context.Context
+	Begin    func(string, bool)
+	Progress func(Progress, string, bool)
 
 	busy        atomic.Bool
 	suppressed  atomic.Bool
@@ -46,13 +48,14 @@ type Auto struct {
 // NewAuto returns an Auto that runs s. A change of the history that the
 // sync's suppression hid is told to it (Syncer.mutateHistory).
 func NewAuto(s *Syncer, done func(reason string, manual bool, err error)) *Auto {
-	a := &Auto{
-		CanSync: s.CanAutoSync,
-		Run: func(ctx context.Context, reason string, manual bool) error {
-			_, err := s.Run(ctx, nil, reason)
-			return err
-		},
-		Done: done,
+	a := &Auto{CanSync: s.CanAutoSync, Done: done}
+	a.Run = func(ctx context.Context, reason string, manual bool) error {
+		var progress func(Progress)
+		if a.Progress != nil {
+			progress = func(p Progress) { a.Progress(p, reason, manual) }
+		}
+		_, err := s.Run(ctx, progress, reason)
+		return err
 	}
 	s.changed = func() { a.OnHistoryChanged(a.baseContext()) }
 	return a
@@ -71,7 +74,7 @@ func (a *Auto) Suppress(on bool) { a.suppressed.Store(on) }
 
 // Trigger runs a sync now, unless one is running. A manual one that cannot
 // start because there is no sign-in reports ErrNotLoggedIn.
-func (a *Auto) Trigger(ctx context.Context, reason string, manual bool) {
+func (a *Auto) Trigger(ctx context.Context, reason string, manual bool) bool {
 	a.startMu.Lock()
 	if a.busy.Load() {
 		// A background trigger that cannot start is remembered: it may be the
@@ -81,11 +84,12 @@ func (a *Auto) Trigger(ctx context.Context, reason string, manual bool) {
 			a.pending.Store(true)
 		}
 		a.startMu.Unlock()
-		return
+		return false
 	}
 	a.busy.Store(true)
 	a.startMu.Unlock()
 	go a.perform(ctx, reason, manual)
+	return true
 }
 
 // perform runs one sync and then hands over to pending work, if any.
@@ -96,6 +100,9 @@ func (a *Auto) perform(ctx context.Context, reason string, manual bool) {
 		}
 		a.finish(ctx)
 		return
+	}
+	if a.Begin != nil {
+		a.Begin(reason, manual)
 	}
 	err := a.Run(ctx, reason, manual)
 	if err == nil && !manual {
@@ -176,4 +183,28 @@ func (a *Auto) OnHistoryChanged(ctx context.Context) {
 		a.timer.Stop()
 	}
 	a.timer = time.AfterFunc(a.debounce(), func() { a.Trigger(ctx, "auto", false) })
+}
+
+func (a *Auto) Suppressed() bool { return a.suppressed.Load() }
+func (a *Auto) Exclusive(ctx context.Context, f func()) bool {
+	for {
+		a.startMu.Lock()
+		if !a.busy.Load() {
+			a.busy.Store(true)
+			a.startMu.Unlock()
+			break
+		}
+		a.startMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	defer a.finish(ctx)
+	if ctx.Err() != nil {
+		return false
+	}
+	f()
+	return true
 }

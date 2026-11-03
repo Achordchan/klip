@@ -187,6 +187,16 @@ func (s *Syncer) UploadAfterLocalMutation(ctx context.Context) (*syncclient.Uplo
 	if err := s.bindFor(account); err != nil {
 		return nil, err
 	}
+	manifest, _, err := s.remoteManifest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	st := s.settings()
+	if (manifest.Version != "" || manifest.UpdatedAt != nil) && !sameRemoteSnapshot(model.Str(st.SyncLastRemoteVersion), manifest.Version, model.Str(st.SyncLastRemoteSha256), manifest.SnapshotSHA256) {
+		if err := s.mergeAndApply(ctx, manifest, s.Fingerprint(), nil, "local_mutation", account); err != nil {
+			return nil, err
+		}
+	}
 	up, fp, err := s.uploadWithFingerprint(ctx, nil, "local_mutation", account)
 	if err != nil {
 		return nil, err

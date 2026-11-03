@@ -1,0 +1,33 @@
+{
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": [
+        "icon256.png",
+        "icon128.png",
+        "icon48.png",
+        "icon32.png",
+        "icon16.png"
+      ]
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "0.0.0.0",
+          "product_version": "0.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "CompanyName": "Achord Chan",
+            "FileDescription": "Klip",
+            "InternalName": "maccy",
+            "LegalCopyright": "Achord Chan",
+            "OriginalFilename": "maccy.exe",
+            "ProductName": "Klip"
+          }
+        }
+      }
+    }
+  }
+}

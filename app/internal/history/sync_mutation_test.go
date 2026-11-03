@@ -76,3 +76,12 @@ func TestClearedHistoryPersistsMutationAcrossRestart(t *testing.T) {
 		t.Fatal("restart lost empty-history marker")
 	}
 }
+
+func TestBatchRemovalKeepsUnselectedOrder(t *testing.T) {
+	s := NewService(paths.Layout{Root: t.TempDir()})
+	s.items = []model.Item{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	removed := s.RemoveSelected(func([]model.Item) []model.Item { return []model.Item{{ID: "b"}, {ID: "b"}, {ID: "missing"}} })
+	if len(removed) != 1 || removed[0].ID != "b" || len(s.Items()) != 2 || s.Items()[0].ID != "a" || s.Items()[1].ID != "c" {
+		t.Fatal("batch partition changed semantics")
+	}
+}

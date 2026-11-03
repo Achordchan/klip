@@ -978,6 +978,46 @@ func cacheDirAndCopy(r *rig, src string) ([]string, error) {
 	return []string{dst, filepath.Dir(dst)}, err
 }
 
+func TestFoundNothing(t *testing.T) {
+	r := newRig(t)
+	c := r.clip
+	look := func() bool {
+		t.Helper()
+		r.capture()
+		return r.s.FoundNothing()
+	}
+	if !look() {
+		t.Error("an empty clipboard took something")
+	}
+	c.formats = []string{"text/plain"}
+	c.text = "  "
+	if !look() {
+		t.Error("blank text took something")
+	}
+	c.text = "hello"
+	if look() {
+		t.Error("text was taken, yet FoundNothing")
+	}
+	// The same text again is merged away by the rule that the newest item is
+	// not captured twice: nothing taken, so the watcher looks once more.
+	if !look() {
+		t.Error("a repeat of the newest text took something")
+	}
+	// A kind that is switched off.
+	r.s.CaptureText = false
+	c.text = "other"
+	if !look() {
+		t.Error("text with text capture off took something")
+	}
+	r.s.CaptureText = true
+	// Our own write is not looked for again.
+	r.s.MarkWriteByUs()
+	c.text = "ours"
+	if err := r.s.Capture(context.Background()); err != nil || r.s.FoundNothing() {
+		t.Errorf("the app's own write must not ask for another look: %v", err)
+	}
+}
+
 func TestBlockedOnlyAllowlistDoesNotBecomeUnrestricted(t *testing.T) {
 	allowed := parseExtensions(".exe,.dll")
 	if allowed == nil || len(allowed) != 0 {

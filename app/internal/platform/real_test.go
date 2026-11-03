@@ -92,7 +92,7 @@ func newRealRig(t *testing.T) *realRig {
 		if err := cs.Capture(ctx); err != nil {
 			t.Errorf("capture: %v", err)
 		}
-	}}
+	}, Retry: cs.FoundNothing}
 	r := &realRig{t: t, h: h, cap: cs, l: l, stop: cancel, done: make(chan struct{})}
 	go func() { w.Run(ctx); close(r.done) }()
 	time.Sleep(100 * time.Millisecond) // let the watcher record the counter
@@ -343,5 +343,42 @@ func TestRealChangeSeq(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if b := ChangeSeq(); b == a {
 		t.Fatal("counter did not move after a copy")
+	}
+}
+
+// pbcopy clears the clipboard and then writes it, and the change counter
+// moves only for the clear: a look in between sees nothing. Copies made one
+// right after another must still all be captured.
+func TestRealRapidCopies(t *testing.T) {
+	r := newRealRig(t)
+	top := func() string {
+		if it := r.h.Items(); len(it) > 0 {
+			return model.Str(it[0].Text)
+		}
+		return ""
+	}
+	waitTop := func(want string) bool {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if top() == want {
+				return true
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		a, b := fmt.Sprint("rapid A", i), fmt.Sprint("rapid B", i)
+		pbcopy(t, a)
+		if !waitTop(a) {
+			t.Fatalf("round %d: %q was not captured (top %q)", i, a, top())
+		}
+		pbcopy(t, b) // at once, as soon as the first is in
+		if !waitTop(b) {
+			t.Fatalf("round %d: %q was not captured (top %q)", i, b, top())
+		}
+	}
+	if n := r.h.Len(); n != 80 {
+		t.Fatalf("%d items, want 80", n)
 	}
 }

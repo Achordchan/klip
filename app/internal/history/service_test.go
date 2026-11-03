@@ -464,3 +464,46 @@ func TestReplaceAllCancelledBeforeChangesNothing(t *testing.T) {
 		t.Fatal("nothing may change when it was cancelled before")
 	}
 }
+
+// RemoveSelected chooses and removes in one step: a copy made while it
+// chooses (the same content again, which keeps the id) waits, and stays.
+func TestRemoveSelectedIsOneStep(t *testing.T) {
+	r := newRig(t)
+	a, b := r.text("a", "ha"), r.text("b", "hb")
+	r.svc.Add(a)
+	r.svc.Add(b)
+	before := r.events.Load()
+	again := r.text("a", "ha") // copied again
+	added := make(chan struct{})
+	removed := r.svc.RemoveSelected(func(items []model.Item) []model.Item {
+		go func() { r.svc.Add(again); close(added) }()
+		select {
+		case <-added:
+			t.Error("the history changed while the items were chosen")
+		case <-time.After(50 * time.Millisecond):
+		}
+		for _, it := range items {
+			if it.ID == a.ID {
+				return []model.Item{it}
+			}
+		}
+		return nil
+	})
+	if len(removed) != 1 || removed[0].ID != a.ID {
+		t.Fatalf("removed %v", removed)
+	}
+	<-added
+	if n := r.events.Load() - before; n != 2 { // the removal, then the copy
+		t.Fatalf("%d changes", n)
+	}
+	found := false
+	for _, it := range r.svc.Items() {
+		found = found || model.Str(it.Text) == "a"
+	}
+	if !found {
+		t.Fatal("the copy made meanwhile was removed")
+	}
+	if got := r.svc.RemoveSelected(func([]model.Item) []model.Item { return nil }); got != nil || r.events.Load() != before+2 {
+		t.Fatalf("nothing chosen: %v, %d changes", got, r.events.Load()-before)
+	}
+}

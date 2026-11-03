@@ -28,6 +28,14 @@ type Watcher struct {
 	OnChange func()
 	// Fingerprint stands in for the counter when Seq is negative; may be nil.
 	Fingerprint func() string
+	// Retry, when set, is asked after each OnChange whether it took nothing.
+	// A program that fills the clipboard in two steps (declare, then write)
+	// moves the counter only for the first, and whoever looks in between sees
+	// nothing, or what was there before, and is never told about the data
+	// that follows. So a look that took nothing is repeated, at growing
+	// pauses, until one takes something, the counter moves (the regular tick
+	// takes it from there) or the delays are used up.
+	Retry func() bool
 
 	mu     sync.Mutex
 	last   int64
@@ -51,6 +59,20 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 	t := time.NewTicker(iv)
 	defer t.Stop()
+	// The repeated looks (see Retry) run beside the regular ticks, not instead
+	// of them: a tick that comes while one is waiting is looked at as usual.
+	var (
+		retryC <-chan time.Time
+		step   int
+		at     int64 = -1
+	)
+	arm := func() {
+		if step < len(retryDelays) {
+			retryC = time.After(retryDelays[step])
+		} else {
+			retryC = nil
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -65,6 +87,21 @@ func (w *Watcher) Run(ctx context.Context) {
 			}
 			if moved && w.OnChange != nil {
 				w.OnChange()
+				retryC = nil
+				if w.Retry != nil && s >= 0 && w.Retry() {
+					step, at = 0, s
+					arm()
+				}
+			}
+		case <-retryC:
+			retryC = nil
+			if seq() != at {
+				continue // a real change: the next tick handles it
+			}
+			w.OnChange()
+			step++
+			if w.Retry() {
+				arm()
 			}
 		}
 	}
@@ -115,6 +152,9 @@ func (w *Watcher) contentMoved(fp string) bool {
 	w.lastFP = fp
 	return true
 }
+
+// retryDelays are the pauses of the repeated looks: about a second in all.
+var retryDelays = []time.Duration{30 * time.Millisecond, 60 * time.Millisecond, 120 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond}
 
 // Acknowledge records the exact content captured, not a later clipboard read.
 func (w *Watcher) Acknowledge(fp string) { w.mu.Lock(); w.lastFP = fp; w.seen = true; w.mu.Unlock() }

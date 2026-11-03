@@ -50,3 +50,5 @@ build_tmp/
 .playwright-mcp/
 
 update.md
+installer/legacy-delete.iss
+dist/

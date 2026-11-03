@@ -1,0 +1,191 @@
+package update
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/fs"
+	"klip/internal/durable"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
+
+type recoveryEntry struct {
+	Path, Backup   string
+	Existed, Moved bool
+	Manifest       bool
+	OriginalDigest string
+}
+
+func recoveryPath(root string) string { return filepath.Join(root, ".klip-update-recovery.json") }
+func saveRecovery(root string, items []rollbackItem) error {
+	entries := make([]recoveryEntry, len(items))
+	for i, it := range items {
+		entries[i] = recoveryEntry{it.path, it.backup, it.existed, it.moved, it.manifest, it.originalDigest}
+	}
+	b, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(root, ".recovery-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return durable.Rename(f.Name(), recoveryPath(root))
+}
+
+// RecoverInterruptedUpdate restores a recorded transaction before normal startup.
+func RecoverInterruptedUpdate(root string) error {
+	b, err := os.ReadFile(recoveryPath(root))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var entries []recoveryEntry
+	if err = json.Unmarshal(b, &entries); err != nil {
+		return err
+	}
+	restored := map[string]bool{}
+	for _, e := range entries {
+		if e.Moved {
+			if _, err := os.Stat(e.Backup); os.IsNotExist(err) {
+				digest, verifyErr := transitionDigest(e.Path)
+				if verifyErr != nil || e.OriginalDigest == "" || digest != e.OriginalDigest {
+					return fmt.Errorf("cannot verify transition recovery for %s: backup missing", e.Path)
+				}
+				restored[e.Path] = true
+			}
+		}
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		skip := false
+		for path := range restored {
+			rel, err := filepath.Rel(path, e.Path)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				skip = true
+			}
+		}
+		if skip {
+			continue
+		}
+		rel, err := filepath.Rel(root, e.Path)
+		if err != nil {
+			return err
+		}
+		if _, err = insideRoot(root, rel); err != nil && !e.Manifest {
+			return err
+		}
+		if e.Moved {
+			if _, err := os.Stat(e.Backup); os.IsNotExist(err) {
+				continue
+			}
+			if err = os.RemoveAll(e.Path); err != nil {
+				return err
+			}
+			if err = os.Rename(e.Backup, e.Path); err != nil {
+				return err
+			}
+		} else if e.Existed {
+			if err = copyFile(e.Backup, e.Path); err != nil {
+				return err
+			}
+		} else {
+			if err = os.Remove(e.Path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	return os.Remove(recoveryPath(root))
+}
+
+// StartRecovery launches a separate executable so Windows can replace the installed binary.
+func StartRecovery(root string) (bool, error) {
+	if _, err := os.Stat(recoveryPath(root)); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return true, err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return true, err
+	}
+	dir, err := os.MkdirTemp("", "klip-recovery-")
+	if err != nil {
+		return true, err
+	}
+	helper := filepath.Join(dir, filepath.Base(exe))
+	if err = copyFile(exe, helper); err != nil {
+		return true, err
+	}
+	cmd := exec.Command(helper, "--recover-update", root, strconv.Itoa(os.Getpid()))
+	return true, cmd.Start()
+}
+
+// transitionDigest records file names, types and bytes before a path transition.
+// It lets a replay distinguish restored originals from missing backups.
+func transitionDigest(root string) (string, error) {
+	h := sha256.New()
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(h, "%d:%s:%d;", len(rel), rel, d.Type())
+		if d.IsDir() {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(h, "%d:%s", len(target), target)
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported transition entry: %s", path)
+		}
+		fmt.Fprintf(h, "%d:", info.Size())
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(h, f)
+		closeErr := f.Close()
+		if err != nil {
+			return err
+		}
+		return closeErr
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

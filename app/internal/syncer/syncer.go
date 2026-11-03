@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"klip/internal/durable"
@@ -31,7 +32,8 @@ type Syncer struct {
 	*rootLocks
 	// changed is told of a change of the history that the sync's own
 	// suppression may have hidden (mutateHistory); NewAuto sets it.
-	changed func()
+	changed    func()
+	unrepaired atomic.Pointer[string]
 }
 
 // rootLocks are the locks of a data folder. gate serializes the operations
@@ -368,6 +370,9 @@ func (s *Syncer) DecideItems(manifest ManifestInfo, items []model.Item) Decision
 // is ErrSessionChanged, not a success: the record it would have replaced is
 // still needed.
 func (s *Syncer) PersistSyncState(localFingerprint string, m ManifestInfo, account string) error {
+	if s.holdsState() {
+		return errors.New("sync: deletion repair is not durable")
+	}
 	skipped := false
 	err := s.cfg.Settings.Update(func(st *model.Settings) {
 		if account != "" {
@@ -735,6 +740,15 @@ func (s *Syncer) upload(ctx context.Context, progress func(Progress), reason, ac
 	defer tryDelete(path)
 
 	items := s.cfg.History.Items()
+	defer func() {
+		if err == nil && !s.accountChanged(account) {
+			s.repaired()
+			if s.cfg.Uploaded != nil {
+				s.cfg.Uploaded(items)
+			}
+		}
+	}()
+
 	fp = Fingerprint(items)
 	// The history is read under the account that started the upload: a sign-in
 	// while it is being read must not ship the new account's items with this
@@ -1017,7 +1031,7 @@ func (s *Syncer) downloadAndApply(ctx context.Context, progress func(Progress), 
 			return nil, ErrSessionChanged
 		}
 		before = append([]model.Item(nil), current...)
-		next := data.Items
+		next := s.withoutDeleted(data.Items)
 		if expectFingerprint != "" && Fingerprint(current) != expectFingerprint {
 			// A capture arrived while the snapshot was downloading: keep it
 			// and let the upload that follows publish both sides.
@@ -1392,9 +1406,27 @@ func (s *Syncer) mergeAndApply(ctx context.Context, basis ManifestInfo, preMerge
 		undo.identities = remote.Items
 		// What the user deleted while the snapshot was downloading is left out
 		// of it, or the merge would bring it back.
-		merged = MergeItems(withoutDeletedSince(remote.Items, local, current), current)
+		merge := MergeItems
+		if !localSettings.MergeDuplicates || (remote.Settings != nil && !remote.Settings.MergeDuplicates) {
+			merge = MergeItemsKeepingDuplicates
+		}
+		merged = merge(s.withoutDeleted(withoutDeletedSince(remote.Items, local, current)), s.withoutDeleted(current))
 		if model.Str(localSettings.SyncLastLocalFingerprint) == pendingUploadFingerprint {
-			recountMergedSides(merged, withoutDeletedSince(remote.Items, local, current), current)
+			if !localSettings.MergeDuplicates || (remote.Settings != nil && !remote.Settings.MergeDuplicates) {
+				counts := map[string]int32{}
+				for _, side := range [][]model.Item{remote.Items, current} {
+					for _, it := range side {
+						key := strings.ToLower(it.ID)
+						counts[key] = max(counts[key], it.CopyCount)
+					}
+				}
+				for i := range merged {
+					merged[i].CopyCount = max(1, counts[strings.ToLower(merged[i].ID)])
+				}
+
+			} else {
+				recountMergedSides(merged, s.withoutDeleted(withoutDeletedSince(remote.Items, local, current)), s.withoutDeleted(current))
+			}
 		}
 		applied, ap, err := snapshot.ApplyPayloads(s.cfg.Layout, importRoot, merged, before)
 		if err != nil {
