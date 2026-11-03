@@ -216,6 +216,10 @@ func RunPlan(p Plan, h Hooks) error {
 				rerr = nil
 				if it.moved {
 					if _, err := os.Stat(it.backup); os.IsNotExist(err) {
+						digest, verifyErr := transitionDigest(it.path)
+						if verifyErr != nil || it.originalDigest == "" || digest != it.originalDigest {
+							rerr = fmt.Errorf("cannot verify original transition path %s: backup missing", it.path)
+						}
 						break
 					}
 					rerr = os.RemoveAll(it.path)

@@ -1,9 +1,11 @@
 package update
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMissingTransitionBackupRequiresMatchingOriginal(t *testing.T) {
@@ -46,5 +48,35 @@ func TestMissingTransitionBackupRequiresMatchingOriginal(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLiveRollbackMissingTransitionBackupIsNotSuccess(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	target := filepath.Join(r.install, "res")
+	write(t, target, "original")
+	h := r.hooks()
+	copyHook := h.fill().Copy
+	h.Copy = func(src, dst string) error {
+		if dst == filepath.Join(target, "x.txt") {
+			backups, _ := filepath.Glob(filepath.Join(r.install, ".update-transition-*"))
+			for _, backup := range backups {
+				if err := os.RemoveAll(backup); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return errors.New("simulated missing backup")
+		}
+		return copyHook(src, dst)
+	}
+	h.Sleep = func(time.Duration) {}
+	if err := RunPlan(r.plan, h); err == nil {
+		t.Fatal("failed update succeeded")
+	}
+	if _, err := os.Stat(recoveryPath(r.install)); err != nil {
+		t.Fatal("incomplete rollback lost journal")
+	}
+	if len(r.launched) != 0 {
+		t.Fatal("incomplete installation restarted")
 	}
 }
