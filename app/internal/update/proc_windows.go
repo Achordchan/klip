@@ -51,9 +51,20 @@ func launch(path string) error {
 
 // StartHelper starts the helper program with the plan, hidden.
 func StartHelper(helperExe, planPath string) error {
+	cmd, err := startHelperProcess(helperExe, planPath)
+	if err == nil {
+		go cmd.Wait()
+	}
+	return err
+}
+
+func startHelperProcess(helperExe, planPath string) (*exec.Cmd, error) {
 	cmd := exec.Command(helperExe, "--apply-update", planPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow | detachedProcess}
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
 }
 
 func alert(title, msg string) {

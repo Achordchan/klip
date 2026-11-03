@@ -417,16 +417,22 @@ func (c *Coordinator) spawn(helper, plan string) error {
 	if err = WritePlan(plan, p); err != nil {
 		return err
 	}
-	if err = StartHelper(helper, plan); err != nil {
+	cmd, err := startHelperProcess(helper, plan)
+	if err != nil {
 		return err
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err = os.Stat(p.ReadyFile); err == nil {
+			go cmd.Wait()
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("cannot stop timed-out helper: %w", err)
+	}
+	_ = cmd.Wait()
 	return errors.New("update helper readiness timed out")
 }
 

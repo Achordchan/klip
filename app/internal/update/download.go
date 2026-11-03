@@ -32,7 +32,7 @@ var (
 func IsProtected(rel string) bool {
 	p := strings.ToLower(strings.TrimLeft(strings.ReplaceAll(rel, "\\", "/"), "/"))
 	for _, f := range ProtectedFiles {
-		if p == f {
+		if p == f || strings.HasPrefix(p, f+"/") {
 			return true
 		}
 	}
