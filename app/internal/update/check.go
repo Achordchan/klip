@@ -2,12 +2,15 @@ package update
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -81,6 +84,24 @@ type Client struct {
 	Current string
 	// Runtime is CurrentRuntime unless a test sets it.
 	Runtime string
+
+	// PublicKey, when set, is the release key: ManifestURL is then an
+	// Envelope (manifest.signed.json), and a manifest whose signature it does
+	// not accept is no manifest, whichever route brought it. The program
+	// always sets it; without it the manifest is read as it is (tests).
+	PublicKey ed25519.PublicKey
+	// Mirrors are the GitHub proxies tried beside GitHub (DefaultMirrors in
+	// the program), for an address on github.com only; MirrorsFile keeps the
+	// ones a signed manifest named instead.
+	Mirrors     []string
+	MirrorsFile string
+	// MirrorGrace is how long a check waits, once one route has answered,
+	// for the others (1.5 s unless set): the newest version among them wins.
+	MirrorGrace time.Duration
+
+	mu      sync.Mutex
+	learned []string // the mirrors a signed manifest named
+	order   []string // the routes, fastest first, as the last check found them
 
 	// Pauses, which tests shorten.
 	ManifestTimeout time.Duration // 8 s for each try
@@ -199,43 +220,157 @@ func (c *Client) Check(ctx context.Context, status func(string)) Result {
 		}
 	}
 	say("正在检查是否有新版本...")
-	manifest, err := retry(ctx, 3, c.manifestPause, func(attempt int) (*Manifest, error) {
-		if attempt > 1 {
-			say(fmt.Sprintf("更新服务器响应较慢，正在第 %d 次重试...", attempt))
-		}
-		actx, cancel := context.WithTimeout(ctx, c.manifestTimeout())
-		defer cancel()
-		req, err := http.NewRequestWithContext(actx, http.MethodGet, c.ManifestURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := c.http().Do(req)
-		if err != nil {
-			if actx.Err() != nil && ctx.Err() == nil {
-				return nil, errTimeout
+	addrs := c.addresses(c.ManifestURL)
+	var manifest *Manifest
+	var err error
+	if len(addrs) <= 1 {
+		manifest, err = retry(ctx, 3, c.manifestPause, func(attempt int) (*Manifest, error) {
+			if attempt > 1 {
+				say(fmt.Sprintf("更新服务器响应较慢，正在第 %d 次重试...", attempt))
 			}
-			return nil, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
-			return nil, &httpError{resp.StatusCode}
-		}
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			if actx.Err() != nil && ctx.Err() == nil {
-				return nil, errTimeout
+			return c.fetchManifest(ctx, c.ManifestURL)
+		}, func(err error) bool { return transient(err) || errors.Is(err, errTimeout) })
+	} else {
+		manifest, err = retry(ctx, 2, c.manifestPause, func(attempt int) (*Manifest, error) {
+			if attempt > 1 {
+				say(fmt.Sprintf("更新服务器响应较慢，正在第 %d 次重试...", attempt))
 			}
-			return nil, err
-		}
-		return ParseManifest(body)
-	}, func(err error) bool { return transient(err) || errors.Is(err, errTimeout) })
+			return c.race(ctx)
+		}, func(error) bool { return true })
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return Result{Status: Failed, Error: ctx.Err().Error()}
 		}
 		return Result{Status: Failed, Error: err.Error()}
 	}
+	if c.PublicKey != nil {
+		// Only a signed manifest, and only the one taken, names the mirrors.
+		c.learnMirrors(manifest.Mirrors)
+	}
 	return c.decide(manifest)
+}
+
+// fetchManifest is one try of one address: the manifest, its signature
+// checked when there is a key.
+func (c *Client) fetchManifest(ctx context.Context, addr string) (*Manifest, error) {
+	actx, cancel := context.WithTimeout(ctx, c.manifestTimeout())
+	defer cancel()
+	req, err := http.NewRequestWithContext(actx, http.MethodGet, addr, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		if actx.Err() != nil && ctx.Err() == nil {
+			return nil, errTimeout
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, &httpError{resp.StatusCode}
+	}
+	// A manifest is a few kilobytes; a proxy's page of something else may be
+	// anything.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		if actx.Err() != nil && ctx.Err() == nil {
+			return nil, errTimeout
+		}
+		return nil, err
+	}
+	if c.PublicKey != nil {
+		if body, err = OpenEnvelope(c.PublicKey, body); err != nil {
+			return nil, err
+		}
+	}
+	return ParseManifest(body)
+}
+
+// race asks every route at once. Once one has answered with a manifest the
+// others have MirrorGrace to answer too, and the newest version among them is
+// taken: a proxy that serves an old manifest (it may cache, or hold back)
+// does not hide a release that another route shows. The routes are kept in
+// the order they answered in, for the downloads; the ones that failed come
+// last.
+func (c *Client) race(ctx context.Context) (*Manifest, error) {
+	routes := c.routes()
+	type answer struct {
+		route string
+		m     *Manifest
+		err   error
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan answer, len(routes))
+	n := 0
+	for _, r := range routes {
+		addr, ok := viaRoute(r, c.ManifestURL)
+		if !ok {
+			continue
+		}
+		n++
+		go func() {
+			m, err := c.fetchManifest(rctx, addr)
+			ch <- answer{r, m, err}
+		}()
+	}
+	grace := c.MirrorGrace
+	if grace <= 0 {
+		grace = 1500 * time.Millisecond
+	}
+	var good []answer
+	var failed []string
+	var last error
+	var deadline <-chan time.Time
+wait:
+	for i := 0; i < n; i++ {
+		var a answer
+		select {
+		case a = <-ch:
+		case <-deadline:
+			break wait
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if a.err != nil {
+			failed = append(failed, a.route)
+			last = a.err
+			continue
+		}
+		good = append(good, a)
+		if deadline == nil {
+			deadline = time.After(grace)
+		}
+	}
+	if len(good) == 0 {
+		if last == nil {
+			last = errors.New("no route to the update server")
+		}
+		return nil, last
+	}
+	best := good[0]
+	bv, _ := ParseVersion(NormalizeVersion(best.m.Latest.Version))
+	for _, a := range good[1:] {
+		if v, ok := ParseVersion(NormalizeVersion(a.m.Latest.Version)); ok && v.Compare(bv) > 0 {
+			best, bv = a, v
+		}
+	}
+	// Fastest first among the routes that had the newest version, then the
+	// ones with an older one, then the ones that failed or did not answer.
+	order := make([]string, 0, len(routes))
+	sort.SliceStable(good, func(i, j int) bool {
+		return good[i].m.Latest.Version == best.m.Latest.Version && good[j].m.Latest.Version != best.m.Latest.Version
+	})
+	for _, a := range good {
+		order = append(order, a.route)
+	}
+	order = append(order, failed...)
+	c.mu.Lock()
+	c.order = order
+	c.mu.Unlock()
+	return best.m, nil
 }
 
 var errTimeout = errors.New("检查更新超时")

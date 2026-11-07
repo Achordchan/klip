@@ -59,6 +59,12 @@ def py(*args: str) -> None:
     subprocess.run([sys.executable, str(HERE / "release_go.py"), *args], check=True)
 
 
+def sign(*args: str) -> str:
+    """klip-sign, the release tool of the manifest's signature."""
+    return subprocess.run(["go", "run", "./cmd/klip-sign", *args], cwd=str(release_go.APP),
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
 def file_version(path: Path) -> str:
     out = subprocess.run(["powershell", "-NoProfile", "-Command", f"(Get-Item -LiteralPath '{path}').VersionInfo.ProductVersion"],
                          capture_output=True, text=True, check=True).stdout
@@ -202,9 +208,15 @@ def main() -> int:
     if a.installer:
         check_installer(Path(a.installer).resolve(), work)
 
-    print(f"[1/4] build {current} (reads the manifest from this machine) and {upcoming}")
-    manifest_url = f"http://127.0.0.1:{PORT}/manifest.json"
-    py("build", "--version", current, "--publish-dir", str(work / "current"), "--manifest-url", manifest_url)
+    print(f"[1/4] build {current} (reads the manifest from this machine, signed with a key of this test) and {upcoming}")
+    # A key of the test's own: the program takes only a signed manifest.
+    key = work / "e2e-signing-key.pem"
+    if not key.exists():
+        sign("genkey", "-out", str(key))
+    pub = sign("pubkey", "-key", str(key))
+    manifest_url = f"http://127.0.0.1:{PORT}/manifest.signed.json"
+    py("build", "--version", current, "--publish-dir", str(work / "current"), "--manifest-url", manifest_url,
+       "--release-key", pub)
     py("build", "--version", upcoming, "--publish-dir", str(work / "next"))
     serve = work / "serve"
     files = serve / f"v{upcoming}"
@@ -215,6 +227,7 @@ def main() -> int:
     setup.write_bytes(b"not used: the package is")
     release_go.write_manifest(serve / "manifest.json", version=upcoming, mandatory=False, notes="e2e",
                               base_url=f"http://127.0.0.1:{PORT}", installer=setup, package=package, runtime="win-x64")
+    sign("sign", "-key", str(key), "-pub", pub, "-in", str(serve / "manifest.json"), "-out", str(serve / "manifest.signed.json"))
 
     print("[2/4] install", current)
     install = work / "install"
