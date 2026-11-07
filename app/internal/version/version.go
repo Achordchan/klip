@@ -3,4 +3,4 @@
 package version
 
 // Version is the version of this build, as the manifest names versions.
-var Version = "1.0.11"
+var Version = "1.0.12"
