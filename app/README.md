@@ -26,7 +26,7 @@
 | `cmd/klip` | 程序入口：托盘、全局快捷键 `Ctrl+Alt+2`、面板窗口 |
 | `internal/capture` | 把剪贴板内容变成历史条目（`ClipboardCaptureService`）和把条目写回剪贴板（`ClipboardApplyService`）；剪贴板本身在接口后面，平台适配（MyGo）以后接 |
 | `internal/syncer` | 同步编排（C# `SyncService` 加上调用它的主窗口/偏好设置里的流程）：何时上传、本地与远端谁新、合并、冲突、`SyncLast*` 字段维护、指纹、错误文案、后台同步的触发时机 |
-| `internal/syncclient` | 同步服务器（nas-agent-py）的客户端：账号（登录/注册/刷新/改密码）、订阅状态与卡密、manifest、快照与 blob 的 gzip 上传下载、SSE 事件流，以及保存登录态并自动续期的 `Session`、断线重连的 `Watch` |
+| `internal/syncclient` | 同步服务器（`server/`）的客户端：账号（登录/注册/刷新/改密码）、订阅状态与卡密、manifest、快照与 blob 的 gzip 上传下载、SSE 事件流，以及保存登录态并自动续期的 `Session`、断线重连的 `Watch` |
 
 ## 对照测试
 
@@ -73,21 +73,19 @@ cd app && go test ./...
 ### 测试
 
 ```bash
-cd app && go test ./...                        # 不需要 Python：路由对照 + 假服务器
-# 对真实服务器的端到端测试：
-python3 -m venv /tmp/nasvenv && /tmp/nasvenv/bin/pip install -r ../nas-agent-py/requirements.txt
-KLIP_NAS_PYTHON=/tmp/nasvenv/bin/python go test -v -run TestAgainstTheRealServer ./internal/syncclient/
+cd app && go test ./...                        # 不需要服务器：路由对照 + 假服务器
+# 对真实服务器的端到端测试（本地启动 server/ 的 Worker，需要先在 server/ 里 npm install）：
+KLIP_TEST_SERVER=1 go test -v -run TestAgainstTheRealServer ./internal/syncclient/
 ```
 
-- `routes_test.go`：读 `nas-agent-py/app.py` 的路由装饰器，客户端用到的每条“方法 + 路径”都必须存在；服务器上新增的 `/sync`、`/auth`、`/subscription`、`/card` 路由也会提醒（说明客户端还没跟上）。
+- `routes_test.go`：读 `server/src/index.ts` 的路由表，客户端用到的每条“方法 + 路径”都必须存在；服务器上新增的 `/sync`、`/auth`、`/subscription`、`/card` 路由也会提醒（说明客户端还没跟上）。
 - `fake_test.go`：用假服务器覆盖真实服务器碰不到的情况：401/403/500 的处理、gzip 上传下载与服务器不压缩的情况、SSE 的各种写法（注释行、`\r\n`、多行 data、没有事件名）、`Watch` 的刷新/重连/退避/合并、`Session` 的续期和登出、GET 重试。
-- `integration_test.go`：启动真实的 nas-agent-py（临时数据目录），完整走一遍：注册、重复注册、错误密码、刷新令牌（旧的被撤销）、未订阅和未分配档位时的 403、卡密兑换、设置档位、设备 A 用 `snapshot.Export` 导出并上传、按哈希补传 blob（错误哈希被拒绝）、设备 B 下载并用 `snapshot.Read` 导入且文件字节一致、事件流收到 `connected` 和 `sync-updated`、过期令牌下 `Watch` 自动续期后收到更新。没有设置 `KLIP_NAS_PYTHON` 时自动跳过。
+- `integration_test.go`：启动真实的同步后端（`wrangler dev`，临时数据目录），完整走一遍：注册、重复注册、错误密码、刷新令牌（旧的被撤销）、未订阅和未分配档位时的 403、卡密兑换、设置档位、设备 A 用 `snapshot.Export` 导出并上传、按哈希补传 blob（错误哈希被拒绝）、设备 B 下载并用 `snapshot.Read` 导入且文件字节一致、事件流收到 `connected` 和 `sync-updated`、过期令牌下 `Watch` 自动续期后收到更新。没有设置 `KLIP_TEST_SERVER` 时自动跳过。
 
 ### 还没做
 
 - C# `SyncService`（974 行）里的**同步编排**：什么时候上传、怎么判断本地和远端谁新、冲突处理、`SyncLast*` 字段的维护。这次只做了它调用的客户端层。
-- 没有测的：服务器的 413（快照超过档位容量）和 409，需要 100MB 以上的数据；真实邮件验证码（服务器没配 SMTP）；对线上服务器 `maccy.baymaxgroup.com` 没有发过任何请求。
-- 对照的是仓库里这份 `app.py`，不保证和线上正在运行的版本完全一致。
+- 没有测的：服务器的 413（快照超过档位容量）和 409，需要 100MB 以上的数据；集成测试里的服务器没配 SMTP，验证码邮件只测到“邮件服务尚未配置”。
 
 ## 同步编排（internal/syncer）
 
@@ -114,8 +112,8 @@ KLIP_NAS_PYTHON=/tmp/nasvenv/bin/python go test -v -run TestAgainstTheRealServer
 ### 测试
 
 ```bash
-cd app && go test ./...      # 不需要 Python：指纹对照、决策表、合并、错误文案、后台触发
-KLIP_NAS_PYTHON=/tmp/nasvenv/bin/python go test ./...   # 加上对真实 nas-agent-py 的端到端
+cd app && go test ./...      # 不需要服务器：指纹对照、决策表、合并、错误文案、后台触发
+KLIP_TEST_SERVER=1 go test ./...   # 加上对真实同步后端的端到端
 ```
 
 - 指纹有两重对照：用 Python 独立按 C# 算法算出的金标准值（Unix 和 Windows 行尾各一个），以及直接读 `SyncService.cs` 比较写进指纹的字段表达式。
@@ -189,7 +187,7 @@ cd app && KLIP_REAL_CLIPBOARD=1 go test -count=1 -race ./internal/platform/
 
 **测试**
 - `internal/panel`：匹配和排序、预览和详情文字、空状态、搜索、点击/键盘/右键菜单、备注编辑和取消、新历史自动出现、重置后选第一行、搜索框焦点下的回车和方向键、键盘置顶和删除；变异检查（置顶顺序、备注保存、删除变成置顶、点击不应用）都能抓到。`KLIP_SHOT=out.png go test -run TestShot ./internal/panel`（加 `KLIP_DARK=1` 为深色）把面板渲染成图片，用来目视检查。
-- `internal/app`：捕获 → 重启后还在；启动前剪贴板里的不收；应用条目后到最前、自己写的不被再收；设置变化作用到限额和捕获；没登录时“立即同步”说“请先登录”；坏文件给默认值且不被覆盖；**两台设备经真实 nas-agent-py**：A 复制 → 同步 → B 启动后下载到；B 复制 → A 通过事件流收到。
+- `internal/app`：捕获 → 重启后还在；启动前剪贴板里的不收；应用条目后到最前、自己写的不被再收；设置变化作用到限额和捕获；没登录时“立即同步”说“请先登录”；坏文件给默认值且不被覆盖；**两台设备经真实同步后端**：A 复制 → 同步 → B 启动后下载到；B 复制 → A 通过事件流收到。
 - `internal/settings`：`Manager`（更新即保存、保留未知字段、并发）。
 
 **没有验证的**
@@ -213,7 +211,7 @@ cd app && KLIP_REAL_CLIPBOARD=1 go test -count=1 -race ./internal/platform/
 **账号**：错误提示沿用 C# 的对照（`邮箱或密码不正确`、`验证码错误或已过期`、`邮件服务尚未配置，请联系管理员` 等）；兑换卡密失败时服务器回的是 JSON，和 C# 一样只显示“兑换失败”；登录或注册成功后立即同步一次（`app.AccountChanged`）；一个服务器说不认的访问令牌会让账号退出登录，邮箱保留。
 
 **测试**：
-- `account`：对着真实 nas-agent-py 走完注册 → 订阅 → 兑换卡密 → 退出 → 登录；错误密码、已注册邮箱、验证码流程（测试服务器没有邮件服务：已知邮箱得到“邮件服务尚未配置”，未知邮箱按它的设计假装已发送）；令牌续期与被拒；输入检查；字节数格式；错误文字对照。
+- `account`：对着真实同步后端走完注册 → 订阅 → 兑换卡密 → 退出 → 登录；错误密码、已注册邮箱、验证码流程（测试服务器没有邮件服务：已知邮箱得到“邮件服务尚未配置”，未知邮箱按它的设计假装已发送）；令牌续期与被拒；输入检查；字节数格式；错误文字对照。
 - `autostart`：注册表值名和值的格式（逐字节与 1.0.10 相同）、读 1.0.10 留下的值、空值、XDG 条目。
 - `prefs`：每个设置的写入和校正、打开时的修复。
 - `prefswin`（无窗口渲染）：四页内容、勾选写设置并提示、数字校正和延迟提示、重开读设置、登录/注册/退出/错误密码/回车登录、卡密兑换后刷新订阅、两个密码对话框和倒计时、已登录打开即读订阅。变异检查：新密码确认、单文件上限校正、值名 `maccy`、延迟提示、以系统为准都能被抓到。

@@ -1,0 +1,31 @@
+// Klip 云同步后端：Cloudflare Workers（免费版）
+// 账号与订阅在 D1，快照与 blob 在 R2，每个用户一个 Durable Object
+// 负责重活（密码哈希、上传的解压与校验）和推送。
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "klip-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "routes": [{ "pattern": "klip.achord.cn", "custom_domain": true }],
+  "assets": { "directory": "./public", "html_handling": "drop-trailing-slash" },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "klip-sync", "database_id": "a19f3b9c-eaf2-4ae6-834c-ddc94b1cd7e4", "migrations_dir": "migrations" }
+  ],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "klip-sync" }],
+  "durable_objects": { "bindings": [{ "name": "USER", "class_name": "UserStore" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserStore"] }],
+  "vars": {
+    "AUTH_ISSUER": "maccy-self-hosted",
+    "AUTH_AUDIENCE": "maccy-client",
+    "ADMIN_EMAIL": "achordchan@gmail.com",
+    "SMTP_HOST": "",
+    "SMTP_PORT": "465",
+    "SMTP_USER": "",
+    "SMTP_FROM": "",
+    "SMTP_FROM_NAME": "Klip Cloud",
+    "SMTP_SSL": "true",
+    "SMTP_STARTTLS": "false"
+  }
+  // 机密用 `wrangler secret put` 设置：AUTH_SIGNING_KEY、ADMIN_KEY、ADMIN_PASSWORD、SMTP_PASSWORD
+}

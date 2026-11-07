@@ -1033,6 +1033,14 @@ func TestDeletionMergesASnapshotWithoutATime(t *testing.T) {
 		t.Fatal(err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	direct := proxy.Director
+	proxy.Director = func(r *http.Request) {
+		direct(r)
+		// The server may gzip JSON: without the client's Accept-Encoding the
+		// proxy's transport asks for gzip itself and unpacks it, so the
+		// manifest below is plain JSON to edit.
+		r.Header.Del("Accept-Encoding")
+	}
 	proxy.ModifyResponse = func(r *http.Response) error {
 		if r.Request.URL.Path != "/sync/manifest" || r.StatusCode != http.StatusOK {
 			return nil

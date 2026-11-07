@@ -7,18 +7,25 @@ import (
 	"testing"
 )
 
-// Every route the client calls is a route of nas-agent-py, with the method
-// the client uses. The check reads app.py, so a route renamed on either side
-// fails here without a server.
+// Every route the client calls is a route of the sync server (server/), with
+// the method the client uses. The check reads the server's route table in
+// src/index.ts, so a route renamed on either side fails here without a
+// server.
 func TestRoutesExistInServer(t *testing.T) {
-	b, err := os.ReadFile("../../../nas-agent-py/app.py")
+	b, err := os.ReadFile("../../../server/src/index.ts")
 	if err != nil {
 		t.Skipf("server source not available: %v", err)
 	}
-	re := regexp.MustCompile(`@app\.(get|post|put|delete)\("([^"]+)"\)`)
+	// ["PUT", /^\/sync\/blobs\/([^/]+)$/, syncBlobPut]
+	re := regexp.MustCompile(`\["(GET|POST|PUT|DELETE)", /\^(.+?)\$/,`)
 	have := map[string]bool{}
 	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
-		have[strings.ToUpper(m[1])+" "+m[2]] = true
+		path := strings.ReplaceAll(m[2], `\/`, "/")
+		path = strings.ReplaceAll(path, "([^/]+)", "{blob_sha256}")
+		have[m[1]+" "+path] = true
+	}
+	if len(have) == 0 {
+		t.Fatal("no routes found in server/src/index.ts")
 	}
 
 	want := []string{
@@ -52,11 +59,15 @@ func TestRoutesExistInServer(t *testing.T) {
 
 // The sync server's event names and the one the client reacts to.
 func TestServerEventNames(t *testing.T) {
-	b, err := os.ReadFile("../../../nas-agent-py/app.py")
-	if err != nil {
-		t.Skipf("server source not available: %v", err)
+	var src strings.Builder
+	for _, f := range []string{"index.ts", "user_store.ts"} {
+		b, err := os.ReadFile("../../../server/src/" + f)
+		if err != nil {
+			t.Skipf("server source not available: %v", err)
+		}
+		src.Write(b)
 	}
-	if !strings.Contains(string(b), `"sync-updated"`) || !strings.Contains(string(b), `"connected"`) {
+	if !strings.Contains(src.String(), `sseEvent("sync-updated"`) || !strings.Contains(src.String(), `sseEvent("connected"`) {
 		t.Error("the server no longer publishes sync-updated / connected")
 	}
 }
