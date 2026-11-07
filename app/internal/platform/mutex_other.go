@@ -8,3 +8,6 @@ func HoldAppMutex() (alreadyRunning bool) { return false }
 // ShowAlreadyRunning is the box of Windows, where a second start is refused
 // with a word. Elsewhere the running program shows itself instead.
 func ShowAlreadyRunning() {}
+
+// ReleaseAppMutex has nothing to let go of where there is no mutex.
+func ReleaseAppMutex() {}
