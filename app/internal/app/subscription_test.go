@@ -116,3 +116,56 @@ func TestOlderSubscriptionAnswerDoesNotUndoANewerOne(t *testing.T) {
 		t.Fatal("the newer renewal did not resume")
 	}
 }
+
+func signedIn(t *testing.T, email string) *App {
+	t.Helper()
+	a := newApp(t, t.TempDir(), &fakeClip{}, "http://127.0.0.1:1")
+	a.Auto.CanSync = func() bool { return false }
+	_ = a.Settings.Update(func(s *model.Settings) {
+		s.AuthRefreshToken = model.Ptr("token")
+		s.AuthUserEmail = model.Ptr(email)
+	})
+	a.runGen.Store(a.acctGen.Load()) // the run is for the account signed in
+	return a
+}
+
+func TestExpiryDuringTheRunPausesAfterAnActivePreflight(t *testing.T) {
+	a := signedIn(t, "d@example.com")
+	check := a.subscriptionCheck("d@example.com")
+	a.runSubCheck.Store(&check)
+	if err := a.afterPreflight("d@example.com", check, account.Subscription{Subscribed: true, Status: "已订阅"}); err != nil {
+		t.Fatal(err)
+	}
+	// The server says the subscription expired while the sync ran.
+	a.syncDone("auto", false, syncer.ErrSubscriptionExpired)
+	if !a.subscriptionPaused() {
+		t.Fatal("an expiry reported by the run was turned away as older than its own preflight")
+	}
+}
+
+func TestStaleExpiryStillEndsTheRun(t *testing.T) {
+	a := signedIn(t, "e@example.com")
+	older := a.subscriptionCheck("e@example.com")
+	a.runSubCheck.Store(&older)
+	a.syncBegin("auto", false)
+	// The preferences window confirmed the subscription meanwhile.
+	a.SubscriptionChanged(a.BeginSubscriptionCheck(), true)
+	a.syncDone("auto", false, syncer.ErrSubscriptionExpired)
+	if a.subscriptionPaused() {
+		t.Fatal("the out-of-date expiry paused sync")
+	}
+	if v := a.Sync(); v.Syncing || v.Progress {
+		t.Fatalf("the run is still shown as running: %+v", v)
+	}
+}
+
+func TestRunEndingWhilePausedEndsItsDisplay(t *testing.T) {
+	a := signedIn(t, "f@example.com")
+	a.syncBegin("manual", true)
+	a.SubscriptionChanged(a.BeginSubscriptionCheck(), false) // paused by another question
+	a.syncBegin("manual", true)                              // a run already under way shows
+	a.syncDone("manual", true, nil)
+	if v := a.Sync(); v.Syncing || v.Progress {
+		t.Fatalf("the run is still shown as running: %+v", v)
+	}
+}

@@ -262,17 +262,8 @@ func New(cfg Config) (*App, error) {
 		if gen != a.acctGen.Load() {
 			return syncer.ErrSessionChanged
 		}
-		if subscription.Status == "未订阅" {
-			return syncer.ErrSubscriptionExpired
-		}
-		if subscription.Status == "查询失败" {
-			return errors.New("无法确认订阅状态")
-		}
-		if subscription.Status == "未登录" {
-			return syncer.ErrNotLoggedIn
-		}
-		if subscription.Subscribed {
-			a.SubscriptionChanged(check, true) // newer than any answer still on its way
+		if err := a.afterPreflight(owner, check, subscription); err != nil {
+			return err
 		}
 
 		if err := a.pending.Ready(); err != nil {
@@ -858,9 +849,12 @@ func (a *App) syncDone(reason string, manual bool, err error) {
 		if c := a.runSubCheck.Load(); c != nil {
 			a.SubscriptionChanged(*c, false)
 		}
-		return
+		// Not paused now: a newer answer said the subscription is active, and
+		// this one was out of date. The run ends as any run that failed does
+		// (below), its display included.
 	}
 	if a.subscriptionPaused() {
+		a.endPausedRun()
 		return
 	}
 	a.syncMu.Lock()

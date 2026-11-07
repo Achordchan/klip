@@ -2,9 +2,11 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 
 	"klip/internal/account"
 	"klip/internal/model"
+	"klip/internal/syncer"
 )
 
 const subscriptionPauseKey = "LocalSyncSubscriptionPausedFor"
@@ -139,4 +141,41 @@ func uploadAfterUnconfirmed(s account.Subscription) unconfirmedAction {
 		return skipSync
 	}
 	return retrySync
+}
+
+// afterPreflight deals with the answer to the question a sync asks before it
+// runs. It returns the error the run ends with, or nil for the run to go on.
+// An active subscription is told (it is newer than any answer still on its
+// way), and the run then asks under a question of its own: an expiry the
+// server reports while it runs is newer than the preflight, which has just
+// been applied, and must not be turned away as out of date.
+func (a *App) afterPreflight(owner string, check account.SubscriptionCheck, s account.Subscription) error {
+	switch s.Status {
+	case "未订阅":
+		return syncer.ErrSubscriptionExpired
+	case "查询失败":
+		return errors.New("无法确认订阅状态")
+	case "未登录":
+		return syncer.ErrNotLoggedIn
+	}
+	if s.Subscribed {
+		a.SubscriptionChanged(check, true)
+		run := a.subscriptionCheck(owner)
+		a.runSubCheck.Store(&run)
+	}
+	return nil
+}
+
+// endPausedRun ends the display of a run that is over while sync is paused:
+// the pause may have come from another question, which found the run's
+// "syncing" in place, or before the run began.
+func (a *App) endPausedRun() {
+	a.mu.Lock()
+	a.status = "云同步已暂停（未订阅或已到期）"
+	a.mu.Unlock()
+	a.update(func(v *SyncView) {
+		v.Syncing = false
+		v.Progress, v.Text, v.Percent = false, "", 0
+		v.LastStatus = "云同步已暂停（未订阅或已到期）"
+	})
 }
