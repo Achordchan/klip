@@ -183,3 +183,47 @@ func TestQuietMarkerExpires(t *testing.T) {
 		t.Fatal("an old marker stays")
 	}
 }
+
+func TestCleanOldAfterPrepareDoesNotLeaveAPreparationWithoutFiles(t *testing.T) {
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	if err := r.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.c.CleanOld() // ran second, at the same start
+	if r.c.Ready() {
+		t.Fatal("a preparation whose files were cleaned counts as ready")
+	}
+	if err := r.c.InstallPrepared(); err == nil || len(r.spawn) != 0 {
+		t.Fatalf("a helper was started for files that are gone: %v %v", err, r.spawn)
+	}
+	// Made ready again from the kept zip, without a download.
+	hits := r.s.hits.Load()
+	if err := r.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !r.c.Ready() || r.s.hits.Load() != hits {
+		t.Fatalf("ready %v, downloaded again %v", r.c.Ready(), r.s.hits.Load() != hits)
+	}
+}
+
+func TestUnwritableInstallFolderIsNotPreparedForAQuietInstall(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root writes anywhere")
+	}
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	dir := filepath.Dir(r.exe)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o755)
+	if err := r.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r.c.Ready() {
+		t.Fatal("an install folder that needs rights is made ready for a quiet install")
+	}
+}

@@ -506,6 +506,13 @@ func (c *Coordinator) CleanOld() {
 	// helper and the staged files are for the update that is about to run.
 	c.mu.Lock()
 	applying := c.applying
+	if !applying {
+		// The staging goes, and with it what Prepare unpacked there (it may
+		// have run first, both start with the program): forgotten, so that
+		// it is unpacked again from the kept zip, not handed to a helper that
+		// would find it gone.
+		c.prepared = nil
+	}
 	c.mu.Unlock()
 	if applying {
 		return
