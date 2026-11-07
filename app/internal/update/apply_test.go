@@ -1078,3 +1078,42 @@ func TestCommittedJournalThatCannotBeRemovedDoesNotBlockStartup(t *testing.T) {
 		t.Fatalf("the new version was touched: %q", got)
 	}
 }
+
+func TestFailedLaunchIsUndoneEvenWhenTheCommittedJournalIsStuck(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	// Once committed, the journal can be neither removed nor replaced (a
+	// scanner holds it).
+	committed := false
+	prevWrite, prevRemove := writeJournal, removeJournal
+	defer func() { writeJournal, removeJournal = prevWrite, prevRemove }()
+	writeJournal = func(root string, b []byte) error {
+		if committed {
+			return errors.New("journal held")
+		}
+		committed = strings.Contains(string(b), `"committed":true`)
+		return prevWrite(root, b)
+	}
+	removeJournal = func(string) error { return errors.New("journal held") }
+	h := r.hooks()
+	starts := 0
+	h.Launch = func(p string) error {
+		starts++
+		if starts == 1 {
+			return errors.New("the new program will not start")
+		}
+		r.launched = append(r.launched, p)
+		return nil
+	}
+	if err := RunPlan(r.plan, h); err == nil {
+		t.Fatal("a program that cannot start is a failed update")
+	}
+	if !committed {
+		t.Fatal("the test did not reach the committed journal")
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+		t.Fatalf("the version that does not start was kept: %q", got)
+	}
+	if len(r.launched) != 1 {
+		t.Fatalf("the old program was not started again: %v", r.launched)
+	}
+}

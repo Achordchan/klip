@@ -363,8 +363,14 @@ func RunPlan(p Plan, h Hooks) error {
 			// it): that is a failed update, and the old files come back.
 			lg.say("failed to start the new program: " + lerr.Error())
 			err = lerr
+			// The journal says "undo" again before anything is undone, so that a
+			// stop half way is finished at the next start. If it cannot be
+			// written (the committed one may be stuck), the undo goes ahead all
+			// the same, from what is in memory: stopping here would leave a
+			// committed journal, which startup passes over, on a version that
+			// does not start.
 			if jerr := saveRecovery(p.InstallDir, rollback); jerr != nil {
-				return jerr
+				lg.say("cannot write the journal again: " + jerr.Error())
 			}
 			if uerr := undo(); uerr != nil {
 				h.Alert("Klip 更新失败", "新版本无法启动："+lerr.Error()+"\n\n旧版本没能完全恢复（"+uerr.Error()+"），Klip 可能无法使用，请重新下载安装包安装。日志："+p.LogPath)
@@ -763,7 +769,7 @@ func HelperMain(args []string, h Hooks) (handled bool, code int) {
 func removeRecoveryJournal(root string, sleep func(time.Duration)) error {
 	var err error
 	for i := 0; i < 5; i++ {
-		err = durable.Remove(recoveryPath(root))
+		err = removeJournal(recoveryPath(root))
 		if err == nil || os.IsNotExist(err) {
 			return nil
 		}

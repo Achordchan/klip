@@ -46,8 +46,15 @@ func saveRecovery(root string, items []rollbackItem) error {
 	if err != nil {
 		return err
 	}
-	return saveJournal(root, b)
+	return writeJournal(root, b)
 }
+
+// writeJournal and removeJournal are saveJournal and durable.Remove; tests
+// make them fail.
+var (
+	writeJournal  = saveJournal
+	removeJournal = durable.Remove
+)
 
 // saveCommitted marks the update in the journal as done, durably.
 func saveCommitted(root string, items []rollbackItem) error {
@@ -55,7 +62,7 @@ func saveCommitted(root string, items []rollbackItem) error {
 	if err != nil {
 		return err
 	}
-	return saveJournal(root, b)
+	return writeJournal(root, b)
 }
 
 func saveJournal(root string, b []byte) error {
