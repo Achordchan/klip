@@ -57,9 +57,10 @@ type program struct {
 	about   *aboutwin.Manager
 	preview *previewwin.Manager
 
-	shelves *shelfwin.Manager
-	shelf   *shelf.Service
-	layout  paths.Layout
+	shelves      *shelfwin.Manager
+	shelf        *shelf.Service
+	layout       paths.Layout
+	themePreview atomic.Pointer[string]
 
 	lastTrayClick time.Time
 
@@ -148,7 +149,11 @@ func (p *program) ready() {
 	p.layout = layout
 	applyTheme(p.app.Settings.Get().Theme)
 	p.app.Settings.OnChange(func(st model.Settings) {
-		applyTheme(st.Theme)
+		if preview := p.themePreview.Load(); preview != nil {
+			applyTheme(*preview)
+		} else {
+			applyTheme(st.Theme)
+		}
 		p.redraw() // a window shows the settings (the login among them)
 	})
 	p.model = panel.New(p.app.History, host{p})
@@ -395,6 +400,16 @@ func (p *program) showPrefs() {
 		p.prefs.Post = func(f func()) { p.prefsWin.Update(f) }
 		p.prefs.Redraw = p.redraw
 		p.prefs.SyncStatus = p.app.SyncStatus
+		p.prefs.SubscriptionChanged = p.app.SubscriptionChanged
+		p.prefs.PreviewTheme = func(value *string) {
+			p.themePreview.Store(value)
+			if value != nil {
+				applyTheme(*value)
+			} else {
+				applyTheme(p.app.Settings.Get().Theme)
+			}
+			p.redraw()
+		}
 		p.prefsWin = mygo.NewWindow(mygo.WindowOptions{
 			Title:         "设置",
 			Width:         prefswin.Width,
@@ -407,7 +422,7 @@ func (p *program) showPrefs() {
 				return
 			}
 			e.PreventDefault()
-			p.prefsWin.Hide()
+			p.prefs.RequestClose()
 		})
 	}
 	p.hide()

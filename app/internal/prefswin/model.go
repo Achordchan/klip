@@ -18,6 +18,8 @@ import (
 type Host interface {
 	// OpenStorage shows the data folder in the file manager.
 	OpenStorage()
+	ChangeStorage()
+	StorageLocation() string
 	// CheckUpdates starts the update check (may be nil).
 	CheckUpdates() func()
 	// SyncNow starts a sync the user asked for.
@@ -39,13 +41,19 @@ type Model struct {
 	// Redraw asks for a frame (any goroutine); may be nil.
 	Redraw func()
 	// SyncStatus is the sync's last result, for the page (may be nil).
-	SyncStatus func() string
+	SyncStatus          func() string
+	SubscriptionChanged func(bool)
+	// PreviewTheme applies a temporary appearance; nil restores saved settings.
+	PreviewTheme  func(*string)
+	previewValue  string
+	previewActive bool
 	// Now is time.Now unless a test sets it.
 	Now func() time.Time
 
-	tab      int
-	v        prefs.View
-	observed prefs.View
+	tab          int
+	v            prefs.View
+	observed     prefs.View
+	confirmClose bool
 
 	// account page
 	email, password string
@@ -65,7 +73,6 @@ type Model struct {
 
 	mu     sync.Mutex
 	toasts []string
-	later  time.Time // when the debounced "设置已生效" is due; zero: none
 
 	toastMsg   string
 	toastUntil time.Time
@@ -104,8 +111,10 @@ func (m *Model) takeToasts() []string {
 // Open is for each time the window is shown: it reads the settings again,
 // and, when signed in, asks the server about the plan.
 func (m *Model) Open() {
-	m.v = m.Prefs.Open()
+	m.v = m.Prefs.CurrentView()
 	m.observed = m.v
+	m.syncThemePreview()
+	m.confirmClose = false
 	m.refreshAccount()
 	m.closeDialogs()
 	m.sub = account.None("未登录")
@@ -167,6 +176,9 @@ func (m *Model) loadSubscription() {
 				return
 			}
 			m.sub = s
+			if m.SubscriptionChanged != nil && (s.Subscribed || s.Status == "未订阅") {
+				m.SubscriptionChanged(s.Subscribed)
+			}
 			m.refreshAccount() // a token the server refused signs the user out
 		}
 	})
@@ -338,6 +350,9 @@ func (m *Model) redeemCard() {
 				m.redeem = ""
 				if gen == m.subGen { // still the account the card was redeemed for
 					m.sub = s
+					if m.SubscriptionChanged != nil && s.Subscribed {
+						m.SubscriptionChanged(true)
+					}
 				}
 				// A card may be what the sign-in's first sync was waiting
 				// for (no subscription): sync now, as after a sign-in.
@@ -357,4 +372,5 @@ func (m *Model) followSettings() {
 		}
 	}
 	m.observed = next
+	m.syncThemePreview()
 }

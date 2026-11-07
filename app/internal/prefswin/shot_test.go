@@ -22,7 +22,7 @@ func TestShots(t *testing.T) {
 		r.tt.SetDark(true)
 	}
 	r.host.updates = func() {}
-	r.m.sub = account.Subscription{Status: "订阅至 2026-11-19", Tier: "Mini", Storage: "12.5 MB / 1 GB", Retention: "30 天", Limit: "正常"}
+	r.m.sub = account.Subscription{Subscribed: true, Status: "订阅至 2026-11-19", Tier: "Mini", Storage: "12.5 MB / 1 GB", Retention: "30 天", Limit: "正常"}
 	save := func(name string) {
 		r.tt.Frame()
 		f, err := os.Create(filepath.Join(dir, name+".png"))
@@ -44,10 +44,18 @@ func TestShots(t *testing.T) {
 		s.AuthUserEmail = model.Ptr("me@example.com")
 	})
 	r.m.Open()
-	r.m.sub = account.Subscription{Status: "订阅至 2026-11-19", Tier: "Mini", Storage: "12.5 MB / 1 GB", Retention: "30 天", Limit: "正常"}
+	r.m.sub = account.Subscription{Subscribed: true, Status: "订阅至 2026-11-19", Tier: "Mini", Storage: "12.5 MB / 1 GB", Retention: "30 天", Limit: "正常"}
 	r.tt.Frame()
 	r.click("云同步")
 	save("cloud-in")
+	r.m.sub = account.None("未订阅")
+	save("cloud-unsubscribed")
+	r.m.v.CaptureText = !r.m.v.CaptureText
+	save("cloud-dirty")
+	r.m.RequestClose()
+	save("unsaved")
+	r.m.confirmClose = false
+	r.m.v = r.m.observed
 	_ = r.set.Update(func(s *model.Settings) { s.AuthRefreshToken = nil; s.AuthUserEmail = nil; s.AuthAccessToken = nil })
 	r.m.Open()
 	r.tt.Frame()
