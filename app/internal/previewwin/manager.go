@@ -142,7 +142,12 @@ func (mg *Manager) present(it model.Item, bm *ui.Bitmap, pw, ph int, meta string
 			return
 		}
 		if mg.model == nil {
-			mg.model = &Model{Left: mg.Left, Open: func(p string) { _ = mygo.Shell.OpenPath(p) }}
+			mg.model = &Model{
+				Left:   mg.Left,
+				Open:   func(p string) { _ = mygo.Shell.OpenPath(p) },
+				Reveal: mygo.Shell.ShowItemInFolder,
+				SaveAs: mg.saveImageAs,
+			}
 		}
 		mg.model.Item, mg.model.Bitmap, mg.model.Width, mg.model.Height = it, bm, pw, ph
 		mg.model.MetaLine = meta

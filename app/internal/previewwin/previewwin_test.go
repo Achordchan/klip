@@ -188,6 +188,10 @@ func TestImageButtonOpens(t *testing.T) {
 	m.MetaLine = m.Meta()
 	var opened string
 	m.Open = func(path string) { opened = path }
+	var revealed string
+	m.Reveal = func(path string) { revealed = path }
+	var saved string
+	m.SaveAs = func(path string) { saved = path }
 	tt := ui.NewTester(m.View, 324, 260)
 	if !tt.HasText("复制次数：3 · 40×20 · 1 KB") {
 		t.Fatalf("texts: %q", tt.Texts())
@@ -197,6 +201,23 @@ func TestImageButtonOpens(t *testing.T) {
 	}
 	if opened != p {
 		t.Fatalf("opened %q", opened)
+	}
+	if err := tt.Click("定位文件"); err != nil {
+		t.Fatal(err)
+	}
+	if revealed != p {
+		t.Fatalf("revealed %q, want %q", revealed, p)
+	}
+	if err := tt.Click("另存为"); err != nil {
+		t.Fatal(err)
+	}
+	if saved != p {
+		t.Fatal("save-as path mismatch")
+	}
+	openRect, _ := tt.Find("查看原图")
+	revealRect, _ := tt.Find("定位文件")
+	if revealRect.X < openRect.X+openRect.W || revealRect.Y != openRect.Y || revealRect.X+revealRect.W > 324 {
+		t.Fatalf("image actions do not fit side by side: %+v %+v", openRect, revealRect)
 	}
 }
 
