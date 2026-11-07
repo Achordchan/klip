@@ -210,8 +210,10 @@ func TestCleanOldAfterPrepareDoesNotLeaveAPreparationWithoutFiles(t *testing.T) 
 }
 
 func TestUnwritableInstallFolderIsNotPreparedForAQuietInstall(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("root writes anywhere")
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		// Windows: a mode only sets the read-only attribute, which does not
+		// keep files from being made inside; root writes anywhere.
+		t.Skip("needs a folder this user cannot write to")
 	}
 	r := newCoord(t, "1.0.10")
 	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
@@ -322,5 +324,31 @@ func TestStopHelperEndsARealWaitingHelper(t *testing.T) {
 	}
 	if c.stopHelper() != nil {
 		t.Fatal("a second stop fails")
+	}
+}
+
+func TestPrepareStandsBackForAnInstallThatTookTheFolders(t *testing.T) {
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	// The user's own install holds the folders, and is under way, when the
+	// quiet preparation, which passed its first look, comes to them.
+	r.c.fsMu.Lock()
+	done := make(chan error)
+	go func() { done <- r.c.Prepare(context.Background()) }()
+	time.Sleep(50 * time.Millisecond) // past its first look, waiting for the folders
+	r.c.mu.Lock()
+	r.c.applying = true // the user's install, which has them
+	r.c.mu.Unlock()
+	hits := r.s.hits.Load()
+	r.c.fsMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if r.s.hits.Load() != hits {
+		t.Fatal("the package was downloaded while an install had it")
+	}
+	if entries, _ := os.ReadDir(filepath.Join(r.c.Root, "staging")); len(entries) != 0 {
+		t.Fatalf("unpacked beside the install: %v", entries)
 	}
 }

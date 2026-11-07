@@ -59,6 +59,12 @@ func (c *Coordinator) Prepare(ctx context.Context) error {
 	// its files and leave a preparation that points at nothing.
 	c.fsMu.Lock()
 	defer c.fsMu.Unlock()
+	// Looked at again now that the folders are ours: an install that began
+	// while this waited for them (the user's own, which holds the lock while
+	// it hands its files to the helper) is not to see its package touched.
+	if !c.stillWanted(want.Version) {
+		return nil
+	}
 	prep, err := c.Client.DownloadPackage(ctx, want, c.Root, nil)
 	if c.afterDownload != nil {
 		c.afterDownload()
@@ -75,6 +81,15 @@ func (c *Coordinator) Prepare(ctx context.Context) error {
 	}
 	c.prepared = prep
 	return nil
+}
+
+// stillWanted says that version is still the one to prepare: the newest
+// known, with no install under way.
+func (c *Coordinator) stillWanted(version string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cur := c.state.Info
+	return cur != nil && cur.Version == version && !c.applying
 }
 
 // Ready says whether an update is downloaded, unpacked and waiting to be
