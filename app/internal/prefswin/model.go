@@ -54,6 +54,9 @@ type Model struct {
 	v            prefs.View
 	observed     prefs.View
 	confirmClose bool
+	// quitAfter, while the unsaved dialog is up for a quit, finishes the quit
+	// once the edits are saved or discarded (RequestQuit).
+	quitAfter func()
 
 	// account page
 	email, password string

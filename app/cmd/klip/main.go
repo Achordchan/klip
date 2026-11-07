@@ -69,6 +69,7 @@ type program struct {
 	mandatoryShown atomic.Bool // the window for a mandatory update was put up
 	storageMoving  atomic.Bool
 	quitting       atomic.Bool // set when the program is quitting, see OnBeforeQuit
+	quitConfirmed  atomic.Bool // unsaved preferences were dealt with, see beforeQuit
 }
 
 func main() {
@@ -109,7 +110,7 @@ func main() {
 			p.show()
 		}
 	})
-	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { p.quitting.Store(true) })
+	mygo.App.OnBeforeQuit(p.beforeQuit)
 	mygo.App.WhenReady(p.ready)
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
@@ -127,7 +128,7 @@ func (p *program) ready() {
 		Foreground: platform.ForegroundApp,
 		ChangeSeq:  platform.ChangeSeq,
 		Autostart:  platform.Autostart(),
-		Quit:       func() { mygo.App.Quit() },
+		Quit:       p.quitForUpdate,
 		Changed: func() {
 			p.redraw()
 			p.gateMandatory()
@@ -540,3 +541,29 @@ func (h updHost) Quit() { mygo.App.Quit() }
 
 func (h prefsHost) ChangeStorage()          { h.p.changeStorage() }
 func (h prefsHost) StorageLocation() string { return h.p.layout.Root }
+
+// beforeQuit holds a quit while the preferences window has unsaved edits: the
+// window asks to save or discard them, and quits once that is done (or not at
+// all, for "继续编辑"). Once quitting is set, the windows close without asking.
+func (p *program) beforeQuit(e *mygo.QuitEvent) {
+	if !p.quitConfirmed.Load() && p.prefs != nil && p.prefsWin != nil && p.prefsWin.IsVisible() {
+		if p.prefs.RequestQuit(func() {
+			p.quitConfirmed.Store(true)
+			mygo.App.Quit()
+		}) {
+			e.PreventDefault()
+			p.prefsWin.Show()
+			p.prefsWin.Focus()
+			return
+		}
+	}
+	p.quitting.Store(true)
+}
+
+// quitForUpdate is the quit an update needs to be installed. It does not wait
+// for unsaved preferences: the update helper is already waiting for this
+// process to end, and the user started the install.
+func (p *program) quitForUpdate() {
+	p.quitConfirmed.Store(true)
+	mygo.App.Quit()
+}

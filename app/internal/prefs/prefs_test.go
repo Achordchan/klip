@@ -257,3 +257,59 @@ func TestFailedSaveRollsBackOnlyItsOwnFields(t *testing.T) {
 		t.Fatalf("rollback undid a concurrent change: MaxItems %d", got.MaxItems)
 	}
 }
+
+func TestSaveValidatesLimitsMergedWithNewerSettings(t *testing.T) {
+	c, m, _, _ := newCtl(t)
+	base := c.CurrentView()
+	// A sync lowers the total limit after the window read the settings.
+	_ = m.Update(func(s *model.Settings) { s.MaxMegabytes = 50 })
+	draft := base
+	draft.CaptureFileMaxMegabytes = "100"
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("a file limit above the newer total limit was saved")
+	}
+	if got := m.Get(); got.CaptureFileMaxMegabytes != 20 || got.MaxMegabytes != 50 {
+		t.Fatalf("settings changed: %d / %d", got.CaptureFileMaxMegabytes, got.MaxMegabytes)
+	}
+	// An unrelated edit still saves while the limits stay as they are.
+	draft = c.CurrentView()
+	next := draft
+	next.CaptureText = !draft.CaptureText
+	if err := c.Save(draft, next); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSaveRechecksLimitsUnderTheLock(t *testing.T) {
+	c, m, a, _ := newCtl(t)
+	base := c.CurrentView()
+	// The total limit is lowered between the first check and the update: the
+	// autostart change, which comes in between, does it.
+	a2 := &raceAuto{fakeAuto: a, race: func() { _ = m.Update(func(s *model.Settings) { s.MaxMegabytes = 50 }) }}
+	c.Autostart = a2
+	draft := base
+	draft.StartWithWindows = !base.StartWithWindows
+	draft.CaptureFileMaxMegabytes = "100"
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("a file limit above the newer total limit was saved")
+	}
+	if got := m.Get(); got.CaptureFileMaxMegabytes != 20 || got.StartWithWindows != base.StartWithWindows {
+		t.Fatalf("settings changed: %+v", got)
+	}
+	if a.on != base.StartWithWindows {
+		t.Fatal("autostart not rolled back")
+	}
+}
+
+type raceAuto struct {
+	*fakeAuto
+	race func()
+}
+
+func (r *raceAuto) SetEnabled(on bool) error {
+	if r.race != nil {
+		r.race()
+		r.race = nil
+	}
+	return r.fakeAuto.SetEnabled(on)
+}

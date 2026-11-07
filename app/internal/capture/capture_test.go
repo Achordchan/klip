@@ -37,6 +37,7 @@ type fakeClip struct {
 	wroteFiles []string
 	wroteImage []byte
 	wroteWith  string
+	writeErr   error
 	reads      int
 	filesErr   error
 	onRead     func() // runs inside ReadText, as a write that comes during a read
@@ -55,6 +56,9 @@ func (c *fakeClip) ReadImage() []byte            { c.reads++; return c.image }
 func (c *fakeClip) WriteText(s string) error     { c.wroteText = &s; return nil }
 func (c *fakeClip) WriteFiles(p []string) error  { c.wroteFiles = p; return nil }
 func (c *fakeClip) WriteImage(b []byte, f string) error {
+	if c.writeErr != nil {
+		return c.writeErr
+	}
 	c.wroteImage, c.wroteWith = b, f
 	return nil
 }
@@ -1214,5 +1218,40 @@ func TestClipboardPNGCopiesDoNotAccumulate(t *testing.T) {
 		if len(ents) != 1 || filepath.Join(r.s.ClipboardDir, ents[0].Name()) != r.clip.wroteWith {
 			t.Fatalf("clipboard copies: %v, current %s", ents, r.clip.wroteWith)
 		}
+	}
+}
+
+func TestFailedClipboardWriteKeepsTheCopyInUse(t *testing.T) {
+	r := newRig(t)
+	var items []model.Item
+	for i := 0; i < 2; i++ {
+		img := image.NewNRGBA(image.Rect(0, 0, 3, 3))
+		img.Pix[0] = uint8(i + 1)
+		var b bytes.Buffer
+		if err := png.Encode(&b, img); err != nil {
+			t.Fatal(err)
+		}
+		r.clip.formats, r.clip.image = []string{"image/png"}, b.Bytes()
+		r.now = r.now.Add(time.Minute)
+		r.capture()
+		items = append(items, r.h.Items()[0])
+	}
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	inUse := r.clip.wroteWith
+	r.clip.writeErr = errors.New("the clipboard is held by another program")
+	if err := r.s.Apply(items[1]); err == nil {
+		t.Fatal("a failed write succeeded")
+	}
+	if _, err := os.Stat(inUse); err != nil {
+		t.Fatalf("the copy the clipboard still offers went: %v", err)
+	}
+	r.clip.writeErr = nil
+	if err := r.s.Apply(items[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inUse); !os.IsNotExist(err) {
+		t.Fatal("the copy no longer offered stayed")
 	}
 }

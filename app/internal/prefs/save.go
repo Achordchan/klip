@@ -7,7 +7,10 @@ import (
 )
 
 // Save applies only fields edited by this window, preserving concurrent sync
-// and account changes. Validation precedes all persistent and OS mutations.
+// and account changes. The edits are merged into the settings and the result
+// is validated under the settings lock, so a limit changed meanwhile by a
+// sync is checked too. The same check runs first on the settings as they are
+// now, so that the usual failure comes before any persistent or OS change.
 func (c *Controller) Save(base, draft View) error {
 	number := func(label, value string) (int, error) {
 		n, err := strconv.Atoi(value)
@@ -28,22 +31,7 @@ func (c *Controller) Save(base, draft View) error {
 	if err != nil {
 		return err
 	}
-	if fileMB > mb {
-		return fmt.Errorf("单文件上限不能超过最大容量")
-	}
-	oldAuto := c.Autostart.IsEnabled()
-	// before and after are taken inside the update, under the settings lock:
-	// a rollback then puts back only what this save changed, and leaves a
-	// change made by somebody else since (a sync, the account) alone.
-	var before, after model.Settings
-	if draft.StartWithWindows != base.StartWithWindows {
-		if err = c.Autostart.SetEnabled(draft.StartWithWindows); err != nil {
-			return err
-		}
-	}
-	err = c.Settings.Update(func(s *model.Settings) {
-		before = *s
-		defer func() { after = *s }()
+	apply := func(s *model.Settings) {
 		if draft.StartWithWindows != base.StartWithWindows {
 			s.StartWithWindows = draft.StartWithWindows
 		}
@@ -86,7 +74,51 @@ func (c *Controller) Save(base, draft View) error {
 		if draft.ShelfModifier != base.ShelfModifier {
 			s.ShelfTriggerModifier = draft.ShelfModifier.Value
 		}
+	}
+	// The limits are checked against each other only when this save changes
+	// one of them: a pair made inconsistent elsewhere does not block saving
+	// an unrelated setting.
+	limitsEdited := draft.MaxMegabytes != base.MaxMegabytes || draft.CaptureFileMaxMegabytes != base.CaptureFileMaxMegabytes
+	validate := func(merged model.Settings) error {
+		if limitsEdited && merged.CaptureFileMaxMegabytes > merged.MaxMegabytes {
+			return fmt.Errorf("单文件上限不能超过最大容量")
+		}
+		return nil
+	}
+	now := c.Settings.Get()
+	apply(&now)
+	if err := validate(now); err != nil {
+		return err
+	}
+
+	oldAuto := c.Autostart.IsEnabled()
+	if draft.StartWithWindows != base.StartWithWindows {
+		if err = c.Autostart.SetEnabled(draft.StartWithWindows); err != nil {
+			return err
+		}
+	}
+	// before and after are taken inside the update, under the settings lock:
+	// a rollback then puts back only what this save changed, and leaves a
+	// change made by somebody else since (a sync, the account) alone.
+	var before, after model.Settings
+	var invalid error
+	err = c.Settings.Update(func(s *model.Settings) {
+		before = *s
+		merged := *s
+		apply(&merged)
+		if invalid = validate(merged); invalid != nil {
+			after = *s // nothing is changed
+			return
+		}
+		*s = merged
+		after = *s
 	})
+	if invalid != nil {
+		if draft.StartWithWindows != base.StartWithWindows {
+			_ = c.Autostart.SetEnabled(oldAuto)
+		}
+		return invalid
+	}
 	if err != nil {
 		_ = c.Settings.Update(func(s *model.Settings) {
 			// A field this save did not change has the same value in before

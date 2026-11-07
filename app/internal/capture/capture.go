@@ -697,21 +697,17 @@ func (s *Service) knownImageHash(fallback string, candidates ...string) string {
 // paste as a file gets a PNG as before. It returns "" when it cannot: the
 // picture then goes without a file.
 //
-// Only the copy just written is kept: the clipboard holds one picture, and
-// the copies of the ones before it are needed by nobody, so the folder never
-// holds more than one.
+// Once the picture is on the clipboard, the copies of the ones before it are
+// needed by nobody and go (pruneClipboardPNGs): the folder holds the copy the
+// clipboard offers, and at most one more after a write that failed.
 func (s *Service) clipboardPNG(stored string, data []byte) string {
-	dir := s.ClipboardDir
-	if dir == "" {
-		dir = filepath.Join(os.TempDir(), "klip-clipboard")
-	}
+	dir := s.clipboardDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return ""
 	}
 	base := filepath.Base(stored)
 	path := filepath.Join(dir, strings.TrimSuffix(base, filepath.Ext(base))+".png")
 	if got, err := os.ReadFile(path); err == nil && bytes.Equal(got, data) {
-		s.pruneClipboardPNGs(dir, path)
 		return path
 	}
 	f, err := os.CreateTemp(dir, ".klip-png-*")
@@ -727,20 +723,28 @@ func (s *Service) clipboardPNG(stored string, data []byte) string {
 		os.Remove(tmp)
 		return ""
 	}
-	s.pruneClipboardPNGs(dir, path)
 	return path
 }
 
-// pruneClipboardPNGs removes from dir the copies other than keep, and side
-// files left by a write that stopped.
-func (s *Service) pruneClipboardPNGs(dir, keep string) {
+func (s *Service) clipboardDir() string {
+	if s.ClipboardDir != "" {
+		return s.ClipboardDir
+	}
+	return filepath.Join(os.TempDir(), "klip-clipboard")
+}
+
+// pruneClipboardPNGs removes the copies other than keep ("" for none), and
+// side files left by a write that stopped. It is called once a picture is on
+// the clipboard: until then, the clipboard may still offer the copy before.
+func (s *Service) pruneClipboardPNGs(keep string) {
+	dir := s.clipboardDir()
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range ents {
 		p := filepath.Join(dir, e.Name())
-		if e.IsDir() || samePath(p, keep) {
+		if e.IsDir() || (keep != "" && samePath(p, keep)) {
 			continue
 		}
 		if strings.EqualFold(filepath.Ext(e.Name()), ".png") || strings.HasPrefix(e.Name(), ".klip-png-") {
@@ -1201,7 +1205,14 @@ func (s *Service) write(it model.Item) (bool, written, error) {
 			// one is not, and a folder or a chat would get a WebP.
 			file = s.clipboardPNG(p, data)
 		}
-		return true, written{image: data}, s.Clipboard.WriteImage(data, file)
+		if err := s.Clipboard.WriteImage(data, file); err != nil {
+			return true, written{image: data}, err
+		}
+		if file == p {
+			file = "" // a stored PNG is offered: no copy is in use
+		}
+		s.pruneClipboardPNGs(file)
+		return true, written{image: data}, nil
 	}
 	return false, written{}, errors.New("capture: unknown item kind")
 }

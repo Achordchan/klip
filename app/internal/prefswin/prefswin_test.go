@@ -559,3 +559,34 @@ func TestProfessionalSettingsFooterFits(t *testing.T) {
 		}
 	}
 }
+
+func TestQuitWaitsForUnsavedEdits(t *testing.T) {
+	r := newRig(t, "")
+	quits := 0
+	if r.m.RequestQuit(func() { quits++ }) {
+		t.Fatal("a clean window held the quit")
+	}
+	r.click("内容")
+	r.click("捕获文本")
+	if !r.m.RequestQuit(func() { quits++ }) || quits != 0 {
+		t.Fatal("unsaved edits did not hold the quit")
+	}
+	r.tt.Frame()
+	r.click("继续编辑")
+	if quits != 0 || !r.m.Dirty() || r.m.quitAfter != nil {
+		t.Fatal("continue editing did not call the quit off")
+	}
+	r.m.RequestQuit(func() { quits++ })
+	r.tt.Frame()
+	r.click("保存并退出")
+	if quits != 1 || r.set.Get().CaptureText || r.host.closed != 0 {
+		t.Fatalf("save and quit: quits %d, saved %v", quits, !r.set.Get().CaptureText)
+	}
+	r.click("捕获文本")
+	r.m.RequestQuit(func() { quits++ })
+	r.tt.Frame()
+	r.click("放弃修改")
+	if quits != 2 || r.set.Get().CaptureText || r.m.Dirty() {
+		t.Fatal("discard and quit")
+	}
+}

@@ -88,3 +88,38 @@ func TestInvalidHistoryNeverChangesSelection(t *testing.T) {
 		t.Fatal("failed copies retained")
 	}
 }
+
+func TestRecoveryRecordsAreMatchedByTheirPlace(t *testing.T) {
+	for rel, want := range map[string]bool{
+		"sync/payload-journal.json":            true,
+		"files/12.capture-backup/a.txt":        true,
+		"files/12.capture-backup":              true,
+		"files/12.capture-backup.capture-time": true,
+		"files/12/payload-journal.pdf":         false,
+		"files/12/payload-replacement.txt":     false,
+		"files/12/report.capture-backup":       false,
+		"images/payload-journal.png":           false,
+		"sync/state.json":                      false,
+	} {
+		if got := recoveryRecord(filepath.FromSlash(rel)); got != want {
+			t.Errorf("%s: %v, want %v", rel, got, want)
+		}
+	}
+}
+
+func TestUserFileNamedLikeAJournalDoesNotBlockMigration(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	selection := filepath.Join(t.TempDir(), "location.json")
+	dir := filepath.Join(src, "files", "12")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dir, "payload-journal.pdf"), []byte("user"), 0600)
+	os.WriteFile(filepath.Join(src, "history.json"), []byte("[]"), 0600)
+	if err := Migrate(src, dst, selection, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "files", "12", "payload-journal.pdf")); err != nil {
+		t.Fatal(err)
+	}
+}

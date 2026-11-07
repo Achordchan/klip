@@ -76,6 +76,10 @@ func Migrate(source, target, selection string, progress func(int, int)) error {
 		if d.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("存储目录包含符号链接，不能迁移：%s", p)
 		}
+		rel, _ := filepath.Rel(src, p)
+		if recoveryRecord(rel) {
+			return errors.New("存在未完成的文件恢复记录，请重启后再迁移")
+		}
 		if d.IsDir() {
 			return nil
 		}
@@ -85,10 +89,6 @@ func Migrate(source, target, selection string, progress func(int, int)) error {
 		}
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("不支持的存储文件：%s", p)
-		}
-		rel, _ := filepath.Rel(src, p)
-		if strings.Contains(rel, ".capture-backup") || strings.Contains(rel, "payload-journal") || strings.Contains(rel, "payload-replacement") {
-			return errors.New("存在未完成的文件恢复记录，请重启后再迁移")
 		}
 		if rel == "storage-location.json" {
 			return nil
@@ -237,4 +237,22 @@ func copyChecked(src, dst string) (err error) {
 		return errors.New("迁移文件校验失败")
 	}
 	return nil
+}
+
+// recoveryRecord says whether rel (relative to the data folder) is a record
+// of an interrupted change that a restart finishes: the journal of a payload
+// replacement (sync/payload-journal.json), or the backup of a captured file
+// folder and its marker (files/<id>.capture-backup[.capture-time]) with what
+// is inside. Only those places are looked at: a captured file of the user may
+// have any name.
+func recoveryRecord(rel string) bool {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) == 2 && parts[0] == "sync" && strings.HasPrefix(parts[1], "payload-journal") {
+		return true
+	}
+	if len(parts) >= 2 && parts[0] == "files" {
+		name := parts[1]
+		return strings.HasSuffix(name, ".capture-backup") || strings.HasSuffix(name, ".capture-backup.capture-time")
+	}
+	return false
 }
