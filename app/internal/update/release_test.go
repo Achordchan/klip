@@ -326,4 +326,16 @@ else:
 	if check(build) != "ALLOWED" || check(filepath.Join(build, "none")) != "ALLOWED" {
 		t.Error("the leftover of a build, or an empty folder, should be fine")
 	}
+	// What a build made before the program was called Klip.exe.
+	before := t.TempDir()
+	write(t, filepath.Join(before, "maccy.exe"), "EXE")
+	write(t, filepath.Join(before, "mygo-sqlite3.dll"), "DLL")
+	write(t, filepath.Join(before, "maccy-1.0.11-win-x64.zip"), "ZIP")
+	if check(before) != "ALLOWED" {
+		t.Error("the leftover of a build from before the rename should be fine")
+	}
+	write(t, filepath.Join(before, "settings.json"), "{}")
+	if check(before) != "REFUSED" {
+		t.Error("an old build folder with user data was offered for clearing")
+	}
 }

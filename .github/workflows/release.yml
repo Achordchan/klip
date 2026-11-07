@@ -51,11 +51,13 @@ jobs:
           "version=$v" >> $env:GITHUB_OUTPUT
           Write-Host "version $v"
 
+      - name: Go vet (Windows)
+        working-directory: app
+        run: go vet ./...
+
       - name: Go tests (Windows)
         working-directory: app
-        run: |
-          go vet ./...
-          go test ./... -count=1
+        run: go test ./... -count=1
 
       - name: Release tool tests
         working-directory: tools
@@ -63,6 +65,7 @@ jobs:
 
       - name: Inno Setup
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $iscc = Get-Command iscc -ErrorAction SilentlyContinue
           if (-not $iscc -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
             choco install innosetup --no-progress -y
@@ -70,6 +73,7 @@ jobs:
 
       - name: Release files
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true # a failed command fails the step
           python tools/release_go.py release --version ${{ steps.version.outputs.version }} --notes-file docs/release-notes/v${{ steps.version.outputs.version }}.md
           Get-ChildItem artifacts/release | Format-Table Name, Length
 

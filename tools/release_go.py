@@ -104,7 +104,9 @@ def fetch_sqlite(runtime: str, dest_dir: Path, cache: Path) -> Path:
 
 GENERATED_PACKAGE = re.compile(r"(?:maccy|Klip)-[^/]+-(?:" + "|".join(re.escape(r) for r in GO_ARCH) + r")\.zip")
 
-BUILD_OUTPUT = re.compile(r"Klip\.exe|maccy-package\.json|mygo-sqlite3[^/]*\.dll|" + GENERATED_PACKAGE.pattern)
+# The program as built before 1.0.11 (maccy.exe) counts too: a folder an
+# earlier build of this checkout left is cleared as well.
+BUILD_OUTPUT = re.compile(r"Klip\.exe|maccy\.exe|maccy-package\.json|mygo-sqlite3[^/]*\.dll|" + GENERATED_PACKAGE.pattern)
 
 
 def check_disposable(publish_dir: Path) -> None:
@@ -121,8 +123,8 @@ def check_disposable(publish_dir: Path) -> None:
     entries = list(pub.rglob("*"))
     if not entries:
         return
-    if not (pub / EXE).is_file():
-        raise RuntimeError(f"refusing to clear {pub}: it holds files but no {EXE} from an earlier build")
+    if not any((pub / name).is_file() for name in (EXE, "maccy.exe")):
+        raise RuntimeError(f"refusing to clear {pub}: it holds files but no {EXE} (or maccy.exe) from an earlier build")
     # Only what a build puts there, nothing else: the program, the SQLite
     # library, a package made from it. A folder with anything more is somebody's.
     for path in entries:
