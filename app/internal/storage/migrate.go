@@ -1,0 +1,240 @@
+// Package storage migrates a stopped application's data without deleting its source.
+package storage
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"klip/internal/durable"
+	"klip/internal/paths"
+)
+
+func Validate(source, target string) (string, error) {
+	src, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return "", err
+	}
+	src, err = filepath.Abs(src)
+	if err != nil {
+		return "", err
+	}
+	dst, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", err
+	}
+	dst, err = filepath.Abs(dst)
+	if err != nil {
+		return "", err
+	}
+	if inside(src, dst) || inside(dst, src) {
+		return "", errors.New("新目录不能与旧目录相同或互相包含")
+	}
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		return "", err
+	}
+	if len(entries) != 0 {
+		return "", errors.New("请选择空文件夹，避免覆盖已有文件")
+	}
+	return dst, nil
+}
+func inside(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && !filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// Migrate requires all source writers to be stopped. Selection changes last;
+// failed attempts remove only files created by this invocation.
+func Migrate(source, target, selection string, progress func(int, int)) error {
+	dst, err := Validate(source, target)
+	if err != nil {
+		return err
+	}
+	src, err := filepath.Abs(source)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"pending-merge.json", "upload-intent.json"} {
+		if _, err := os.Stat(filepath.Join(src, "sync", name)); err == nil {
+			return errors.New("存在未完成的同步恢复记录，请先完成同步再迁移")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	var files []string
+	err = filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("存储目录包含符号链接，不能迁移：%s", p)
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("不支持的存储文件：%s", p)
+		}
+		rel, _ := filepath.Rel(src, p)
+		if strings.Contains(rel, ".capture-backup") || strings.Contains(rel, "payload-journal") || strings.Contains(rel, "payload-replacement") {
+			return errors.New("存在未完成的文件恢复记录，请重启后再迁移")
+		}
+		if rel == "storage-location.json" {
+			return nil
+		}
+		files = append(files, rel)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	var created []string
+	committed := false
+	defer func() {
+		if !committed {
+			for i := len(created) - 1; i >= 0; i-- {
+				_ = os.Remove(created[i])
+			}
+		}
+	}()
+	for i, rel := range files {
+		out := filepath.Join(dst, rel)
+		dir := filepath.Dir(out)
+		var missing []string
+		for p := dir; p != dst; p = filepath.Dir(p) {
+			if _, err := os.Lstat(p); os.IsNotExist(err) {
+				missing = append(missing, p)
+			} else if err != nil {
+				return err
+			}
+		}
+		for j := len(missing) - 1; j >= 0; j-- {
+			if err := os.Mkdir(missing[j], 0700); err != nil {
+				return err
+			}
+			created = append(created, missing[j])
+		}
+		if err := copyChecked(filepath.Join(src, rel), out); err != nil {
+			return err
+		}
+		created = append(created, out)
+		if progress != nil {
+			progress(i+1, len(files))
+		}
+	}
+	// Keep arbitrary JSON fields; rewrite only image/file payload paths in history.
+	hp := filepath.Join(dst, "history.json")
+	if b, err := os.ReadFile(hp); err == nil {
+		var items []map[string]json.RawMessage
+		if err = json.Unmarshal(b, &items); err != nil {
+			return fmt.Errorf("历史记录无法解析：%w", err)
+		}
+		remap := func(p string) string {
+			if p != "" && inside(src, p) {
+				rel, _ := filepath.Rel(src, p)
+				return filepath.Join(dst, rel)
+			}
+			return p
+		}
+		for _, it := range items {
+			var image string
+			if json.Unmarshal(it["ImageFilePath"], &image) == nil && image != "" {
+				it["ImageFilePath"], _ = json.Marshal(remap(image))
+			}
+			var list []string
+			if json.Unmarshal(it["FilePaths"], &list) == nil && list != nil {
+				for i := range list {
+					list[i] = remap(list[i])
+				}
+				it["FilePaths"], _ = json.Marshal(list)
+			}
+		}
+		b, err = json.Marshal(items)
+		if err != nil {
+			return err
+		}
+		// A successful quiescence has already resolved normal history writes. Preserve
+		// the saved local mutation suffix rather than silently discarding its evidence.
+		original, _ := os.ReadFile(hp)
+		end := len(original)
+		for end > 0 && strings.ContainsRune(" \t\r\n", rune(original[end-1])) {
+			end--
+		}
+		b = append(b, original[end:]...)
+		if err = os.WriteFile(hp, b, 0600); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := durable.SyncTree(dst); err != nil {
+		return err
+	}
+	if err := durable.SyncParent(dst); err != nil {
+		return err
+	}
+	if err := paths.SaveSelection(selection, dst); err != nil {
+		// Rename may have succeeded before directory sync failed. Never delete a
+		// destination that the selector may already reference.
+		if b, readErr := os.ReadFile(selection); readErr == nil {
+			var selected struct{ Root string }
+			if json.Unmarshal(b, &selected) == nil && selected.Root == dst {
+				committed = true
+			}
+		}
+		return err
+	}
+	committed = true
+	return nil
+}
+func copyChecked(src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		out.Close()
+		if err != nil {
+			os.Remove(dst)
+		}
+	}()
+	h := sha256.New()
+	if _, err = io.Copy(io.MultiWriter(out, h), in); err != nil {
+		return err
+	}
+	if err = out.Sync(); err != nil {
+		return err
+	}
+	if err = out.Close(); err != nil {
+		return err
+	}
+	f, err := os.Open(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	verify := sha256.New()
+	if _, err = io.Copy(verify, f); err != nil {
+		return err
+	}
+	if string(h.Sum(nil)) != string(verify.Sum(nil)) {
+		return errors.New("迁移文件校验失败")
+	}
+	return nil
+}

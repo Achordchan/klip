@@ -66,6 +66,7 @@ type program struct {
 	redrawPending  atomic.Bool // a redraw is queued for the UI thread
 	followShelf    func()      // starts or stops the shelf as the settings say
 	mandatoryShown atomic.Bool // the window for a mandatory update was put up
+	storageMoving  atomic.Bool
 	quitting       atomic.Bool // set when the program is quitting, see OnBeforeQuit
 }
 
@@ -115,7 +116,7 @@ func main() {
 }
 
 func (p *program) ready() {
-	layout, err := paths.Default()
+	layout, err := paths.Current()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -373,6 +374,9 @@ func (p *program) showUpdate() {
 // checkUpdates is the user asking (the tray, the preferences): the windows
 // show the check and what it finds.
 func (p *program) checkUpdates() {
+	if p.storageMoving.Load() {
+		return
+	}
 	p.updates().CheckNow()
 	p.updWins.Reshow() // asked for: a window closed while a download goes on comes back
 }
@@ -380,6 +384,9 @@ func (p *program) checkUpdates() {
 // showPrefs opens the preferences window, made on first use and then only
 // hidden when closed.
 func (p *program) showPrefs() {
+	if p.storageMoving.Load() {
+		return
+	}
 	if p.mandatoryPending() {
 		return
 	}
@@ -412,6 +419,9 @@ func (p *program) showPrefs() {
 // show opens the window near the cursor (the shortcut), a little below and
 // to the right of it, kept inside the work area of its display.
 func (p *program) show() {
+	if p.storageMoving.Load() {
+		return
+	}
 	if p.mandatoryPending() {
 		return // the update window is up: nothing else until it is dealt with
 	}
@@ -426,6 +436,9 @@ func (p *program) show() {
 // showCentered opens the window in the middle of the display the cursor is on
 // (the tray).
 func (p *program) showCentered() {
+	if p.storageMoving.Load() {
+		return
+	}
 	if p.mandatoryPending() {
 		return // the update window is up: nothing else until it is dealt with
 	}
@@ -504,3 +517,6 @@ func (h prefsHost) Close()                 { h.p.prefsWin.Hide() }
 type updHost struct{ p *program }
 
 func (h updHost) Quit() { mygo.App.Quit() }
+
+func (h prefsHost) ChangeStorage()          { h.p.changeStorage() }
+func (h prefsHost) StorageLocation() string { return h.p.layout.Root }
