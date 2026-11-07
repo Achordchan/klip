@@ -33,7 +33,7 @@ func Validate(source, target string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if inside(src, dst) || inside(dst, src) {
+	if inside(src, dst) || inside(dst, src) || sameOrWithin(src, dst) || sameOrWithin(dst, src) {
 		return "", errors.New("新目录不能与旧目录相同或互相包含")
 	}
 	entries, err := os.ReadDir(dst)
@@ -45,6 +45,28 @@ func Validate(source, target string) (string, error) {
 	}
 	return dst, nil
 }
+
+// sameOrWithin says whether path is root or below it by what the file system
+// says, not by the spelling: on a volume that ignores case (macOS, Windows),
+// /data/Klip and /data/klip/new are one inside the other while their names
+// differ. path and each folder above it are compared with root by identity.
+func sameOrWithin(root, path string) bool {
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	for p := path; ; {
+		if info, err := os.Stat(p); err == nil && os.SameFile(info, rootInfo) {
+			return true
+		}
+		up := filepath.Dir(p)
+		if up == p {
+			return false
+		}
+		p = up
+	}
+}
+
 func inside(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	return err == nil && !filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))

@@ -146,3 +146,27 @@ func TestMigrationMakesTheTargetPrivate(t *testing.T) {
 		t.Fatalf("target mode %v", st.Mode().Perm())
 	}
 }
+
+func TestRejectsTargetInsideSourceSpelledInAnotherCase(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "Klip")
+	if err := os.Mkdir(src, 0700); err != nil {
+		t.Fatal(err)
+	}
+	lower := filepath.Join(base, "klip")
+	a, errA := os.Stat(src)
+	b, errB := os.Stat(lower)
+	if errA != nil || errB != nil || !os.SameFile(a, b) {
+		t.Skip("this volume tells case apart")
+	}
+	dst := filepath.Join(lower, "new")
+	if err := os.Mkdir(dst, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Validate(src, dst); err == nil {
+		t.Fatal("a target inside the source, spelled in another case, was accepted")
+	}
+	if _, err := Validate(dst, src); err == nil {
+		t.Fatal("a source inside the target, spelled in another case, was accepted")
+	}
+}

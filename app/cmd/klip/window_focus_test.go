@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/egoist/mygo"
+)
 
 func TestVisibleAuxiliaryWindowsKeepMainPanel(t *testing.T) {
 	for _, tc := range []struct {
@@ -18,5 +22,21 @@ func TestVisibleAuxiliaryWindowsKeepMainPanel(t *testing.T) {
 				t.Fatalf("hide = %v, want %v", got, tc.hide)
 			}
 		})
+	}
+}
+
+func TestNoQuitWhileMigrating(t *testing.T) {
+	p := &program{}
+	p.migrating.Store(true)
+	e := &mygo.QuitEvent{}
+	p.beforeQuit(e)
+	if !e.DefaultPrevented() || p.quitting.Load() {
+		t.Fatal("a quit went on while the data was being copied")
+	}
+	p.migrating.Store(false) // the relaunch at the end
+	e = &mygo.QuitEvent{}
+	p.beforeQuit(e)
+	if e.DefaultPrevented() || !p.quitting.Load() {
+		t.Fatal("the quit after the migration was held")
 	}
 }

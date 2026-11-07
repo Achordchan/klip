@@ -68,8 +68,10 @@ type program struct {
 	followShelf    func()      // starts or stops the shelf as the settings say
 	mandatoryShown atomic.Bool // the window for a mandatory update was put up
 	storageMoving  atomic.Bool
-	quitting       atomic.Bool // set when the program is quitting, see OnBeforeQuit
-	quitConfirmed  atomic.Bool // unsaved preferences were dealt with, see beforeQuit
+	migrating      atomic.Bool  // the data is being copied, see changeStorage
+	migrationWin   *mygo.Window // its progress window
+	quitting       atomic.Bool  // set when the program is quitting, see OnBeforeQuit
+	quitConfirmed  atomic.Bool  // unsaved preferences were dealt with, see beforeQuit
 }
 
 func main() {
@@ -543,10 +545,20 @@ func (h updHost) Quit() { mygo.App.Quit() }
 func (h prefsHost) ChangeStorage()          { h.p.changeStorage() }
 func (h prefsHost) StorageLocation() string { return h.p.layout.Root }
 
-// beforeQuit holds a quit while the preferences window has unsaved edits: the
-// window asks to save or discard them, and quits once that is done (or not at
-// all, for "继续编辑"). Once quitting is set, the windows close without asking.
+// beforeQuit holds a quit while the data is being migrated (the migration
+// relaunches the program when it is done), and while the preferences window
+// has unsaved edits: the window asks to save or discard them, and quits once
+// that is done (or not at all, for "继续编辑"). Once quitting is set, the
+// windows close without asking.
 func (p *program) beforeQuit(e *mygo.QuitEvent) {
+	if p.migrating.Load() {
+		e.PreventDefault() // the migration relaunches the program when it is done
+		if p.migrationWin != nil {
+			p.migrationWin.Show()
+			p.migrationWin.Focus()
+		}
+		return
+	}
 	if !p.quitConfirmed.Load() && p.prefs != nil && p.prefsWin != nil && p.prefsWin.IsVisible() {
 		if p.prefs.RequestQuit(func() {
 			p.quitConfirmed.Store(true)

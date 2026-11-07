@@ -59,6 +59,11 @@ func (p *program) changeStorage() {
 			e.PreventDefault()
 		}
 	})
+	// No quit while the copy runs (beforeQuit): a process that ended half way
+	// would leave a half-filled target behind, which the next attempt refuses
+	// as not empty. The relaunch at the end is let through.
+	p.migrationWin = progress
+	p.migrating.Store(true)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -70,6 +75,7 @@ func (p *program) changeStorage() {
 			})
 		}
 		mygo.RunOnMain(func() {
+			p.migrating.Store(false)
 			progress.Hide()
 			if err != nil {
 				mygo.Dialog.Message(mygo.MessageOptions{Type: mygo.MessageError, Title: "迁移未完成", Message: err.Error(), Detail: "旧目录和数据已保留，Klip 将重新启动。"})

@@ -1307,3 +1307,36 @@ func TestFailedClipboardWriteKeepsTheCopyInUse(t *testing.T) {
 		t.Fatal("the copy no longer offered stayed")
 	}
 }
+
+func TestSeparateWebPItemIsFoundAgainOnceMergingIsOn(t *testing.T) {
+	r := newRig(t)
+	limits := r.h.Limits()
+	limits.MergeDuplicates = false
+	r.h.SetLimits(limits)
+	data := noncanonicalPNG(t)
+	st := model.DefaultSettings()
+	st.SetStoreImagesAsWebP(false)
+	r.s.ApplySettings(st)
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture() // a PNG item, under the hash of its bytes
+	st.SetStoreImagesAsWebP(true)
+	r.s.ApplySettings(st)
+	r.now = r.now.Add(time.Minute)
+	r.capture() // the same picture again, an item of its own, as WebP
+	if r.h.Len() != 2 {
+		t.Fatalf("%d items without merging", r.h.Len())
+	}
+	webp := r.h.Items()[0]
+	if filepath.Ext(model.Str(webp.ImageFilePath)) != ".webp" {
+		t.Fatal("the second capture is not WebP")
+	}
+	limits.MergeDuplicates = true
+	r.h.SetLimits(limits)
+	if err := r.s.Apply(webp); err != nil {
+		t.Fatal(err)
+	}
+	r.copyBack()
+	if r.h.Len() != 2 {
+		t.Fatalf("the WebP item copied back made a third item: %d", r.h.Len())
+	}
+}

@@ -677,13 +677,19 @@ func (s *Service) saveImage(data []byte) (path, hash string, size int64, err err
 
 // knownImageHash is the fingerprint of an image item of the history that has
 // one of the candidates, or fallback when none has.
+//
+// It is taken over only for the capture to be merged into that item, whose
+// picture file then stays. Without merging the capture is an item of its own
+// and keeps fallback, the fingerprint its own file gives back on the
+// clipboard: a WebP item given the PNG-bytes hash of an older item could not
+// be found again from its canonical PNG once merging is turned on.
 func (s *Service) knownImageHash(fallback string, candidates ...string) string {
-	if s.History == nil {
+	if s.History == nil || !s.History.Limits().MergeDuplicates {
 		return fallback
 	}
 	for _, it := range s.History.Items() {
-		if it.Kind != model.KindImage {
-			continue
+		if it.Kind != model.KindImage || !isFile(model.Str(it.ImageFilePath)) {
+			continue // a picture that is gone is replaced by the new file: fallback fits that
 		}
 		for _, c := range candidates {
 			if strings.EqualFold(model.Str(it.ContentHash), c) {
