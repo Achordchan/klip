@@ -4,24 +4,31 @@ import (
 	"testing"
 
 	"github.com/egoist/mygo"
+
+	"klip/internal/previewwin"
 )
 
 func TestVisibleAuxiliaryWindowsKeepMainPanel(t *testing.T) {
 	for _, tc := range []struct {
-		name                     string
-		main, prefs, about, hide bool
+		name            string
+		main, aux, hide bool
 	}{
-		{"main", true, false, false, false},
-		{"preferences open while another application has focus", false, true, false, false},
-		{"about open while another application has focus", false, false, true, false},
-		{"both auxiliary windows open", false, true, true, false},
-		{"another application with auxiliary windows closed", false, false, false, true},
+		{"main", true, false, false},
+		{"an auxiliary window (preferences, About, the preview being used) is up", false, true, false},
+		{"another application with auxiliary windows closed", false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hideAfterFocusTransfer(tc.main, tc.prefs, tc.about); got != tc.hide {
+			if got := hideAfterFocusTransfer(tc.main, tc.aux); got != tc.hide {
 				t.Fatalf("hide = %v, want %v", got, tc.hide)
 			}
 		})
+	}
+}
+
+func TestPreviewCountsAsAnAuxiliaryWindow(t *testing.T) {
+	p := &program{preview: &previewwin.Manager{}}
+	if p.auxiliaryWindowVisible() {
+		t.Fatal("a preview never shown counts as up")
 	}
 }
 

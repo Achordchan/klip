@@ -258,7 +258,9 @@ func (m *Model) View(c *ui.Context) {
 					}
 				default:
 					ui.Scroll(c).Fill().Children(func() {
-						ui.Text(c, m.Text()).FontSize(13).TextColor(p.Text).Wrap().FillWidth()
+						// Selectable: the user may click in, select part of the text
+						// and copy it (the context menu, or the copy shortcut).
+						ui.Text(c, m.Text()).FontSize(13).TextColor(p.Text).Wrap().FillWidth().Selectable()
 					})
 				}
 			})
@@ -293,15 +295,15 @@ func (m *Model) View(c *ui.Context) {
 					if m.icon != nil {
 						ui.Image(c, m.icon).Size(18, 18).Fit(ui.Cover)
 					}
-					ui.Text(c, src).FontSize(11).TextColor(p.Muted).Wrap()
+					ui.Text(c, src).FontSize(11).TextColor(p.Muted).Wrap().Selectable()
 				})
 			}
-			ui.Text(c, m.MetaLine).FontSize(11).TextColor(p.Muted).Wrap()
-			ui.Text(c, m.Times()).FontSize(11).TextColor(p.Muted2).Wrap()
+			ui.Text(c, m.MetaLine).FontSize(11).TextColor(p.Muted).Wrap().Selectable()
+			ui.Text(c, m.Times()).FontSize(11).TextColor(p.Muted2).Wrap().Selectable()
 			// A note may run to many lines: it scrolls past a few, so that the
 			// item stays in view.
 			ui.Scroll(c).FillWidth().MaxHeight(noteMaxH).Children(func() {
-				ui.Text(c, m.NoteLine()).FontSize(12).TextColor(p.Text).Wrap().FillWidth()
+				ui.Text(c, m.NoteLine()).FontSize(12).TextColor(p.Text).Wrap().FillWidth().Selectable()
 			})
 		})
 	})
