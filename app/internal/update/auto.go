@@ -162,6 +162,11 @@ func (c *Coordinator) InstallPrepared(decide func(commit func())) error {
 	}
 	committed := false
 	decide(func() {
+		// The helper installs only if this exists when the program is gone:
+		// written now, at the one moment the program quits for the update.
+		if err := writeJSON(c.commitPath(), quietMarker{Version: prep.Version, At: c.now()}); err != nil {
+			return // not committed: the helper will not install, and is stopped
+		}
 		committed = true
 		// The helper waits for this process: the new one is told to keep quiet.
 		if err := writeJSON(c.quietMarkerPath(), quietMarker{Version: prep.Version, At: c.now()}); err != nil {
@@ -228,6 +233,10 @@ type quietMarker struct {
 }
 
 func (c *Coordinator) quietMarkerPath() string { return filepath.Join(c.Root, "quiet-relaunch.json") }
+
+// commitPath is the program's leave to the helper of a quiet install
+// (Plan.CommitFile).
+func (c *Coordinator) commitPath() string { return filepath.Join(c.Root, "quiet-install-commit.json") }
 
 // QuietRelaunch says whether this start is the one an update made after the
 // program quit for it without the user (the new version, or the old one put

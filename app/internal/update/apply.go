@@ -45,7 +45,17 @@ type Plan struct {
 	// ResultPath, when set, is where the helper writes how the update went
 	// (InstallResult).
 	ResultPath string `json:"resultPath,omitempty"`
+	// CommitFile, when set, must exist once the program has exited, or the
+	// helper does nothing: the program writes it at the moment it quits for
+	// the update. A quiet install is set up before that moment is final, and
+	// the program may exit for another reason meanwhile (the user quits it, a
+	// migration restarts it): that exit is no leave to install.
+	CommitFile string `json:"commitFile,omitempty"`
 }
+
+// errNotCommitted is the helper of a quiet install whose program exited
+// without having decided to quit for it.
+var errNotCommitted = errors.New("the program exited without committing to the update; nothing was changed")
 
 // InstallResult is how an update went, as the helper writes it
 // (Plan.ResultPath).
@@ -250,6 +260,14 @@ func RunPlan(p Plan, h Hooks) error {
 		return errAppDidNotExit
 	}
 	h.Sleep(300 * time.Millisecond)
+	if p.CommitFile != "" {
+		if !fileExists(p.CommitFile) {
+			lg.say("failed: " + errNotCommitted.Error())
+			report(errNotCommitted, true)
+			return errNotCommitted
+		}
+		_ = os.Remove(p.CommitFile) // used once
+	}
 
 	if p.Installer != "" {
 		unlock()

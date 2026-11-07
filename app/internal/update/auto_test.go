@@ -352,3 +352,53 @@ func TestPrepareStandsBackForAnInstallThatTookTheFolders(t *testing.T) {
 		t.Fatalf("unpacked beside the install: %v", entries)
 	}
 }
+
+func TestQuietHelperDoesNothingWhenTheProgramExitsWithoutCommitting(t *testing.T) {
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	if err := r.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var plan Plan
+	// The user quit Klip while the helper was being made ready: decide never
+	// commits; the program is gone all the same.
+	_ = r.c.InstallPrepared(func(func()) {
+		p, err := ReadPlan(r.spawn[0][1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan = p
+	})
+	if plan.CommitFile == "" {
+		t.Fatal("a quiet plan carries no commit file")
+	}
+	rr := &rig{t: t}
+	if err := RunPlan(plan, rr.hooks()); err == nil {
+		t.Fatal("the helper installed without the program's leave")
+	}
+	if read(t, r.exe) != "RUNNING PROGRAM" {
+		t.Fatalf("files were changed: %q", read(t, r.exe))
+	}
+	if len(rr.launched) != 0 || len(rr.alerts) != 0 {
+		t.Fatalf("launched %v alerts %v", rr.launched, rr.alerts)
+	}
+	// With the leave, it installs, once.
+	r2 := newCoord(t, "1.0.10")
+	r2.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r2.c.Refresh(context.Background())
+	if err := r2.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r2.c.InstallPrepared(commitAlways); err != nil {
+		t.Fatal(err)
+	}
+	plan2, _ := ReadPlan(r2.spawn[0][1])
+	rr2 := &rig{t: t}
+	if err := RunPlan(plan2, rr2.hooks()); err != nil || read(t, r2.exe) != "NEW EXE" {
+		t.Fatalf("a committed install did not go in: %v %q", err, read(t, r2.exe))
+	}
+	if _, err := os.Stat(plan2.CommitFile); !os.IsNotExist(err) {
+		t.Fatal("the commit file stays for another time")
+	}
+}

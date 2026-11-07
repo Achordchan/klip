@@ -519,6 +519,10 @@ func (c *Coordinator) startPackage(p *Prepared, quiet bool) error {
 		ResultPath:        c.ResultPath(),
 		Quiet:             quiet,
 	}
+	if quiet {
+		plan.CommitFile = c.commitPath()
+		_ = os.Remove(plan.CommitFile) // one left by an install called off
+	}
 	return c.launchPlan(plan, p.Version)
 }
 
