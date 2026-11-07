@@ -120,3 +120,34 @@ func TestPNGColorInfo(t *testing.T) {
 		}
 	}
 }
+
+func TestExportKeepsTheColourOfAColourManagedPNG(t *testing.T) {
+	plain, err := Encode(image.NewNRGBA(image.Rect(0, 0, 2, 2)), "png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagged := withChunk(t, plain, "iCCP", []byte("Display P3\x00\x00xyz"))
+	dir := t.TempDir()
+	src := filepath.Join(dir, "p3.png")
+	if err := os.WriteFile(src, tagged, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "copy.png")
+	if err := Export(src, out); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(out); !bytes.Equal(got, tagged) {
+		t.Fatal("the PNG was encoded again and lost its profile")
+	}
+	for _, ext := range []string{".jpg", ".webp"} {
+		if err := Export(src, filepath.Join(dir, "copy"+ext)); err == nil {
+			t.Errorf("%s: a colour-managed picture was exported without its profile", ext)
+		}
+	}
+	// A picture without colour information still converts.
+	plainSrc := filepath.Join(dir, "plain.png")
+	os.WriteFile(plainSrc, plain, 0o600)
+	if err := Export(plainSrc, filepath.Join(dir, "plain.webp")); err != nil {
+		t.Fatal(err)
+	}
+}

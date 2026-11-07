@@ -87,13 +87,24 @@ func Export(source, target string) error {
 	if err != nil {
 		return err
 	}
-	im, err := Decode(data)
+	im, err := Decode(data) // also what tells a picture from a damaged file
 	if err != nil {
 		return err
 	}
-	data, err = Encode(im, filepath.Ext(dst))
-	if err != nil {
-		return err
+	format := strings.ToLower(strings.TrimPrefix(filepath.Ext(dst), "."))
+	isPNG := bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n"))
+	switch {
+	case isPNG && format == "png":
+		// A PNG saved as PNG is the file as it is: decoding and encoding again
+		// would drop its ICC profile or gamma.
+	case PNGColorInfo(data):
+		// Encoders here write no colour information: the picture would be
+		// shown in other colours. It goes out as PNG only.
+		return errors.New("这张图片带有色彩配置，只能另存为 PNG，以免颜色改变")
+	default:
+		if data, err = Encode(im, format); err != nil {
+			return err
+		}
 	}
 	f, err := os.CreateTemp(filepath.Dir(dst), ".klip-export-*")
 	if err != nil {

@@ -642,7 +642,10 @@ func (s *Service) saveImage(data []byte) (path, hash string, size int64, err err
 	webp := s.storeWebP && !deep && !colour && imagecodec.FitsWebP(img.Bounds())
 	s.setMu.RUnlock()
 	hash = legacy
-	if !deep {
+	// A picture with colour information has no canonical form: its pixels
+	// without the profile are another picture, which may look different. It
+	// is known by its bytes alone.
+	if !deep && !colour {
 		canonical, err := imagecodec.CanonicalPNG(img)
 		if err != nil {
 			return "", "", 0, err

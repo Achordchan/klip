@@ -1443,3 +1443,27 @@ func TestPictureWithAColourProfileStaysPNG(t *testing.T) {
 		t.Fatal("the PNG with its profile was not kept as it came")
 	}
 }
+
+func TestColourManagedPictureIsNotMergedIntoAnUntaggedOne(t *testing.T) {
+	r := newRig(t)
+	plain := tinyPNG(t)
+	r.clip.formats, r.clip.image = []string{"image/png"}, plain
+	r.capture() // untagged: WebP, under its canonical hash
+	const ihdrEnd = 8 + 8 + 13 + 4
+	body := []byte("Display P3\x00\x00profile")
+	var chunk bytes.Buffer
+	binary.Write(&chunk, binary.BigEndian, uint32(len(body)))
+	chunk.WriteString("iCCP")
+	chunk.Write(body)
+	binary.Write(&chunk, binary.BigEndian, crc32.ChecksumIEEE(append([]byte("iCCP"), body...)))
+	tagged := append(append(append([]byte(nil), plain[:ihdrEnd]...), chunk.Bytes()...), plain[ihdrEnd:]...)
+	r.clip.image = tagged
+	r.now = r.now.Add(time.Minute)
+	r.capture() // the same values, another colour space
+	if r.h.Len() != 2 {
+		t.Fatalf("the colour-managed picture was merged into the untagged one: %d items", r.h.Len())
+	}
+	if got, _ := os.ReadFile(model.Str(r.h.Items()[0].ImageFilePath)); !bytes.Equal(got, tagged) {
+		t.Fatal("the colour-managed picture was not kept")
+	}
+}
