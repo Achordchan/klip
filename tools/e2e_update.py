@@ -187,7 +187,9 @@ def main() -> int:
         raise SystemExit("this test changes this Windows user's sign-in entry and installed programs: "
                          "run it in GitHub Actions, or pass --disposable-machine on a machine made for it")
     current, upcoming = a.version, next_version(a.version)
-    work = Path(a.work) if a.work else Path(tempfile.mkdtemp(prefix="klip-e2e-"))
+    # Absolute: the program runs in its install folder, and its LOCALAPPDATA
+    # (a folder in here) must name the same place for it as for this test.
+    work = (Path(a.work) if a.work else Path(tempfile.mkdtemp(prefix="klip-e2e-"))).resolve()
     work.mkdir(parents=True, exist_ok=True)
     # The program's data, and the helper it starts, in the test's folder.
     local = work / "localappdata"
