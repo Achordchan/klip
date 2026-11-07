@@ -58,7 +58,13 @@ python3 tools/release_go.py build --version 1.0.11 --publish-dir /path/to/out
 
 1. 修改 `app/internal/version/version.go` 里的版本号，写好 `docs/release-notes/v<版本>.md`，合并到 `main`。
 2. 推送 tag：`git tag v<版本> && git push origin v<版本>`。
-3. GitHub Actions 在 Windows 和 macOS 上跑全部测试，构建 Windows 安装包、更新包和两个 Mac 包，在 Windows 上跑端到端更新测试、在 macOS 上把应用启动一次，全部通过后一起发布 Release。已安装的 Klip 从最新 Release 的 `manifest.json` 得知新版本，清单里每个系统各有自己的包。
+3. GitHub Actions 在 Windows 和 macOS 上跑全部测试（发布需要仓库 Secret `KLIP_MANIFEST_KEY`，即更新清单的签名私钥，见下文），构建 Windows 安装包、更新包和两个 Mac 包，在 Windows 上跑端到端更新测试、在 macOS 上把应用启动一次，全部通过后一起发布 Release。已安装的 Klip 从最新 Release 的 `manifest.json` 得知新版本，清单里每个系统各有自己的包。
+
+### 更新清单的签名与国内线路
+
+- 已安装的 Klip（1.0.12 起）读取最新 Release 里的 `manifest.signed.json`，只接受用发布私钥签名、能被程序内置公钥（`app/internal/update/signing.go` 的 `ReleaseKey`）验证的清单；`manifest.json` 原样保留给 1.0.11。
+- 检查和下载同时走 GitHub 直连和国内中转镜像（`app/internal/update/routes.go` 的 `DefaultMirrors`），按速度选线路，失败自动换下一条。镜像只用于 `github.com` 的地址，由于有签名和 SHA-256 校验，镜像无法篡改内容。
+- 签名私钥只保存在仓库 Secret `KLIP_MANIFEST_KEY` 和发布者自己的备份里。丢失后，已安装的 Klip 将无法再接受任何新版本；泄露后，他人可以向所有用户推送任意程序。工具：`cd app && go run ./cmd/klip-sign`（`genkey` / `pubkey` / `sign` / `verify`）。
 
 ## 同步后端
 

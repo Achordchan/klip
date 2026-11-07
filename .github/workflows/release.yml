@@ -137,8 +137,10 @@ jobs:
           path: artifacts/mac/*.zip
           if-no-files-found: error
 
+  # On a tag: the manifest of every system's package, signed with the release
+  # key, and the release. Elsewhere the same steps run with a key made for the
+  # run, so that a mistake here shows before a tag, and nothing is published.
   release:
-    if: github.ref_type == 'tag'
     needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
@@ -150,6 +152,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
       - uses: actions/download-artifact@v4
         with:
           path: release
@@ -158,17 +165,42 @@ jobs:
       - name: Manifest with every system's package
         run: |
           v="${{ needs.windows.outputs.version }}"
-          rm -f release/manifest.json
+          rm -f release/manifest.json release/manifest.signed.json
           python tools/release_go.py manifest --version "$v" --dir release --notes-file "docs/release-notes/v$v.md"
           ls -l release
 
+      - name: Sign the manifest
+        working-directory: app
+        env:
+          KLIP_MANIFEST_KEY: ${{ github.ref_type == 'tag' && secrets.KLIP_MANIFEST_KEY || '' }}
+        run: |
+          go build -o "$RUNNER_TEMP/klip-sign" ./cmd/klip-sign
+          sign="$RUNNER_TEMP/klip-sign"
+          if [ "${{ github.ref_type }}" = tag ]; then
+            # The release key: the program's own public key must accept the
+            # signature (sign checks it), or no installed copy would take it.
+            [ -n "$KLIP_MANIFEST_KEY" ] || { echo "the secret KLIP_MANIFEST_KEY is missing: no release without it"; exit 1; }
+            "$sign" sign -in ../release/manifest.json -out ../release/manifest.signed.json
+            "$sign" verify -in ../release/manifest.signed.json
+          else
+            key="$RUNNER_TEMP/run-key.pem"
+            "$sign" genkey -out "$key"
+            pub=$("$sign" pubkey -key "$key")
+            "$sign" sign -key "$key" -pub "$pub" -in ../release/manifest.json -out ../release/manifest.signed.json
+            "$sign" verify -pub "$pub" -in ../release/manifest.signed.json
+          fi
+
       - name: Publish the release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           v="${{ needs.windows.outputs.version }}"
           # All files in one call: the release is published only once they are
-          # all there, so "latest" never points at a release without its manifest.
+          # all there, so "latest" never points at a release without its
+          # manifests. manifest.signed.json is what 1.0.12 and later read;
+          # manifest.json is for 1.0.11.
           gh release create "v$v" --verify-tag --title "Klip $v" --notes-file "docs/release-notes/v$v.md" \
             "release/Klip-$v-setup.exe" "release/Klip-$v-win-x64.zip" \
-            "release/Klip-$v-mac-arm64.zip" "release/Klip-$v-mac-x64.zip" "release/manifest.json"
+            "release/Klip-$v-mac-arm64.zip" "release/Klip-$v-mac-x64.zip" \
+            "release/manifest.json" "release/manifest.signed.json"
