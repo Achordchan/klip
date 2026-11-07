@@ -173,6 +173,9 @@ export class UserStore extends DurableObject<Env> {
   private commitChain: Promise<unknown> = Promise.resolve();
   // 正在进行的上传各自已经收到的字节数：并发上传一起占额度。
   private inflight = new Map<symbol, number>();
+  // 正在从 R2 删除的 blob（按哈希）：同一个哈希的新上传要等删除结束再开始，
+  // 免得删除落在新文件写入之后。
+  private blobDeletions = new Map<string, Promise<void>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -265,25 +268,38 @@ export class UserStore extends DurableObject<Env> {
    */
   private async drainCleanup(): Promise<void> {
     this.sql.exec("DELETE FROM cleanup WHERE blob_sha IS NOT NULL AND EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = cleanup.blob_sha)");
-    const keys = this.sql
-      .exec<{ r2_key: string }>(
-        "SELECT r2_key FROM cleanup c WHERE c.blob_sha IS NULL OR NOT EXISTS (SELECT 1 FROM blob_uploads u WHERE u.sha256 = c.blob_sha) LIMIT ?",
+    const rows = this.sql
+      .exec<{ r2_key: string; blob_sha: string | null }>(
+        "SELECT r2_key, blob_sha FROM cleanup c WHERE c.blob_sha IS NULL OR NOT EXISTS (SELECT 1 FROM blob_uploads u WHERE u.sha256 = c.blob_sha) LIMIT ?",
         R2_DELETE_BATCH,
       )
-      .toArray()
-      .map((r) => r.r2_key);
-    if (keys.length === 0) return;
+      .toArray();
+    if (rows.length === 0) return;
+    const keys = rows.map((r) => r.r2_key);
+    // 查询和登记之间没有 await：登记之后，同一哈希的新上传都会等这次删除结束。
+    const deletion = this.env.BUCKET.delete(keys);
+    const settled = deletion.then(() => {}, () => {});
+    const shas = rows.map((r) => r.blob_sha).filter((x): x is string => x !== null);
+    for (const sha of shas) this.blobDeletions.set(sha, settled);
     try {
-      await this.env.BUCKET.delete(keys);
+      await deletion;
       for (const k of keys) this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", k);
     } catch (e) {
       console.error("r2 cleanup failed, will retry", String(e));
+    } finally {
+      for (const sha of shas) if (this.blobDeletions.get(sha) === settled) this.blobDeletions.delete(sha);
     }
+  }
+
+  /** 账目变了、D1 里的用量需要重写。和改账目放在同一个事务里调用，重启也不会丢。 */
+  private markUsageDirty(): void {
+    this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('usage_dirty','1')");
   }
 
   /** 把一份待发布的快照变成当前快照，原来的当前快照变成备份。 */
   private promote(version: string): void {
     this.ctx.storage.transactionSync(() => {
+      this.markUsageDirty();
       this.sql.exec("UPDATE snapshots SET current=? WHERE current=?", BACKUP, CURRENT);
       this.sql.exec("UPDATE snapshots SET current=? WHERE version=?", CURRENT, version);
     });
@@ -312,8 +328,9 @@ export class UserStore extends DurableObject<Env> {
 
   // ---- 账目 ----
 
+  /** 已提交的用量：当前快照、备份和 blob。正在发布的快照不算，它还可能被撤销。 */
   private usageBytes(): number {
-    const s = this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM snapshots").one().n;
+    const s = this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM snapshots WHERE current IN (?,?)", BACKUP, CURRENT).one().n;
     return s + this.blobBytes();
   }
 
@@ -367,7 +384,6 @@ export class UserStore extends DurableObject<Env> {
     } catch (e) {
       console.error("prune backups failed", String(e));
     }
-    this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('usage_dirty','1')");
     await this.flushUsage(userId);
     return { pruned, storageBytes: this.usageBytes() };
   }
@@ -434,6 +450,9 @@ export class UserStore extends DurableObject<Env> {
   }
 
   private async uploadBlob(request: Request, userId: string, sha: string, tier: TierPolicy): Promise<Response> {
+    // 同一个哈希的文件正在被清理就先等删完；等完之后到登记上传意图之间没有 await，
+    // 之后的清理会因为这条意图而跳过它。
+    for (let pending = this.blobDeletions.get(sha); pending; pending = this.blobDeletions.get(sha)) await pending;
     const existing = this.sql.exec<{ size: number }>("SELECT size FROM blobs WHERE sha256=?", sha).toArray()[0];
     if (existing) {
       await request.body?.cancel();
@@ -462,6 +481,7 @@ export class UserStore extends DurableObject<Env> {
       await this.withCommit(async () => {
         this.ctx.storage.transactionSync(() => {
           this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
+          this.markUsageDirty();
           this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
           this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", key);
         });
@@ -577,8 +597,11 @@ export class UserStore extends DurableObject<Env> {
     for (let i = 0; i < doomed.length; i += R2_DELETE_BATCH) {
       const batch = doomed.slice(i, i + R2_DELETE_BATCH);
       await this.env.BUCKET.delete(batch.map((b) => b.r2_key ?? snapshotKey(userId, b.version)));
+      this.ctx.storage.transactionSync(() => {
+        for (const b of batch) this.sql.exec("DELETE FROM snapshots WHERE version=?", b.version);
+        this.markUsageDirty();
+      });
       for (const b of batch) {
-        this.sql.exec("DELETE FROM snapshots WHERE version=?", b.version);
         removed.count++;
         removed.bytes += b.size;
       }
