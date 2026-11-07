@@ -142,6 +142,16 @@ func (c *Client) download(ctx context.Context, url, target, wantSHA string, want
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return err
 	}
+	// Already here and whole (an earlier download, kept across a restart
+	// for the update that is waiting to be installed): nothing to fetch.
+	if verified(target, wantSHA, wantSize) {
+		if progress != nil {
+			if st, err := os.Stat(target); err == nil {
+				progress(st.Size(), st.Size())
+			}
+		}
+		return nil
+	}
 	temp := target + ".download"
 	_ = os.Remove(temp)
 	_, err := retry(ctx, 3, c.downloadPause, func(int) (struct{}, error) {
@@ -445,4 +455,18 @@ func validateInstaller(info Info) error {
 	}
 
 	return nil
+}
+
+// verified says that path is a file of the expected size and checksum. A
+// file with no checksum to check it against is never taken as it is.
+func verified(path, wantSHA string, wantSize int64) bool {
+	if strings.TrimSpace(wantSHA) == "" {
+		return false
+	}
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() || (wantSize > 0 && st.Size() != wantSize) {
+		return false
+	}
+	got, err := SHA256File(path)
+	return err == nil && strings.EqualFold(got, strings.TrimSpace(wantSHA))
 }

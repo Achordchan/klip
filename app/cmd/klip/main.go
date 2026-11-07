@@ -234,7 +234,12 @@ func (p *program) ready() {
 	mygo.App.OnQuit(p.stopShelf)
 	mygo.App.OnQuit(p.app.Stop)
 	p.app.Start()
-	p.showCentered()
+	p.watchAutoInstall()
+	// Started by an update that quit Klip while the user was away: the user
+	// is not there to see a window, and should find Klip as they left it.
+	if !p.app.Updates.QuietRelaunch() {
+		p.showCentered()
+	}
 }
 
 // startShelf makes the shelf follow the settings. It is a Windows feature: it

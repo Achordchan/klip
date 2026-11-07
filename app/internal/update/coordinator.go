@@ -72,6 +72,12 @@ type Coordinator struct {
 	state    State
 	busy     bool
 	applying bool
+	// prepared is the package of the newer version, downloaded and unpacked
+	// in the background (Prepare) and waiting to be installed; preparing says
+	// that Prepare is at work. Neither is part of State: nobody asked, and
+	// the windows must not show it.
+	prepared  *Prepared
+	preparing bool
 }
 
 // NewCoordinator returns a Coordinator for the running program.
@@ -280,9 +286,14 @@ func (c *Coordinator) Apply(ctx context.Context) {
 		notice = "安装目录需要管理员权限，将改用完整安装包更新。"
 	}
 	if info.HasSupportedPackage(c.Client.runtime()) && canWrite {
-		prep, err := c.Client.DownloadPackage(ctx, *info, c.Root, progress)
+		// The package made ready in the background, if it is this version's:
+		// no need to download it again.
+		prep, err := c.takePrepared(info.Version), error(nil)
+		if prep == nil {
+			prep, err = c.Client.DownloadPackage(ctx, *info, c.Root, progress)
+		}
 		if err == nil {
-			err = c.startPackage(prep)
+			err = c.startPackage(prep, false)
 			if err == nil {
 				c.done()
 				return
@@ -437,7 +448,7 @@ func (c *Coordinator) spawn(helper, plan string) error {
 	return errors.New("update helper readiness timed out")
 }
 
-func (c *Coordinator) startPackage(p *Prepared) error {
+func (c *Coordinator) startPackage(p *Prepared, quiet bool) error {
 	for _, f := range p.Manifest.Files {
 		target, err := insideRoot(filepath.Dir(c.Exe), f.Path)
 		if err != nil {
@@ -461,6 +472,7 @@ func (c *Coordinator) startPackage(p *Prepared) error {
 		LogPath:           filepath.Join(c.Root, "last_light_update.log"),
 		Version:           p.Version,
 		ResultPath:        c.ResultPath(),
+		Quiet:             quiet,
 	}
 	return c.launchPlan(plan, p.Version)
 }
