@@ -22,6 +22,7 @@ import (
 	"golang.org/x/image/bmp"
 
 	"klip/internal/history"
+	"klip/internal/imagecodec"
 	"klip/internal/model"
 	"klip/internal/paths"
 )
@@ -72,6 +73,7 @@ func newRig(t *testing.T) *rig {
 	r := &rig{t: t, l: paths.Layout{Root: t.TempDir()}, clip: &fakeClip{}, now: time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)}
 	r.h = history.NewService(r.l)
 	r.s = New(r.l, r.h, r.clip)
+	r.s.ClipboardDir = filepath.Join(r.l.Root, "clipboard-png")
 	r.s.Now = func() time.Time { return r.now }
 	r.s.NewID = func() string {
 		r.n++
@@ -1051,5 +1053,115 @@ func TestWebPStorageCanBeDisabledAndClipboardRemainsPNG(t *testing.T) {
 	}
 	if !bytes.HasPrefix(r2.clip.wroteImage, []byte("\x89PNG\r\n\x1a\n")) {
 		t.Fatal("clipboard not PNG")
+	}
+}
+
+// noncanonicalPNG is a picture with translucent pixels, encoded otherwise
+// than Klip encodes it (another compression level and a palette), as another
+// program might.
+func noncanonicalPNG(t *testing.T) []byte {
+	t.Helper()
+	pal := color.Palette{color.NRGBA{0, 0, 0, 0}, color.NRGBA{200, 10, 10, 128}, color.NRGBA{10, 200, 10, 255}}
+	img := image.NewPaletted(image.Rect(0, 0, 8, 8), pal)
+	for i := range img.Pix {
+		img.Pix[i] = uint8(i % 3)
+	}
+	var b bytes.Buffer
+	if err := (&png.Encoder{CompressionLevel: png.BestSpeed}).Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	if canonical, _ := imagecodec.CanonicalPNG(img); bytes.Equal(canonical, b.Bytes()) {
+		t.Fatal("the test picture is canonical")
+	}
+	return b.Bytes()
+}
+
+// copyBack puts what Klip wrote on the clipboard as if another program had
+// copied it, after Klip's own write is no longer ignored.
+func (r *rig) copyBack() {
+	r.t.Helper()
+	r.clip.formats, r.clip.image = []string{"image/png"}, append([]byte(nil), r.clip.wroteImage...)
+	r.s.setOwn(0, 0, 0, nil) // another program copied it: the write is no longer ours
+	r.now = r.now.Add(time.Minute)
+	r.capture()
+}
+
+func TestWebPItemCopiedBackIsTheSameItem(t *testing.T) {
+	r := newRig(t)
+	r.clip.formats, r.clip.image = []string{"image/png"}, noncanonicalPNG(t)
+	r.capture()
+	it := r.h.Items()[0]
+	if filepath.Ext(model.Str(it.ImageFilePath)) != ".webp" {
+		t.Fatalf("not stored as WebP: %s", model.Str(it.ImageFilePath))
+	}
+	if err := r.s.Apply(it); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(r.clip.wroteImage, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("clipboard not PNG")
+	}
+	// The file offered with the picture is a PNG of the same bytes.
+	if filepath.Ext(r.clip.wroteWith) != ".png" {
+		t.Fatalf("file offered: %q", r.clip.wroteWith)
+	}
+	if got, err := os.ReadFile(r.clip.wroteWith); err != nil || !bytes.Equal(got, r.clip.wroteImage) {
+		t.Fatalf("offered file differs from the clipboard picture: %v", err)
+	}
+	r.copyBack()
+	if r.h.Len() != 1 || r.h.Items()[0].CopyCount != 2 {
+		t.Fatalf("copied back: %d items, copy count %d", r.h.Len(), r.h.Items()[0].CopyCount)
+	}
+}
+
+func TestChangingImageFormatKeepsExistingItem(t *testing.T) {
+	for _, webpFirst := range []bool{false, true} {
+		r := newRig(t)
+		data := noncanonicalPNG(t)
+		st := model.DefaultSettings()
+		st.SetStoreImagesAsWebP(webpFirst)
+		r.s.ApplySettings(st)
+		r.clip.formats, r.clip.image = []string{"image/png"}, data
+		r.capture()
+		st.SetStoreImagesAsWebP(!webpFirst)
+		r.s.ApplySettings(st)
+		r.now = r.now.Add(time.Minute)
+		r.capture()
+		if r.h.Len() != 1 || r.h.Items()[0].CopyCount != 2 {
+			t.Fatalf("webp first %v: %d items", webpFirst, r.h.Len())
+		}
+		// And the item, written and copied back, is still that item.
+		if err := r.s.Apply(r.h.Items()[0]); err != nil {
+			t.Fatal(err)
+		}
+		r.copyBack()
+		if r.h.Len() != 1 {
+			t.Fatalf("webp first %v: copied back made %d items", webpFirst, r.h.Len())
+		}
+	}
+}
+
+func TestHighBitDepthImageStaysPNG(t *testing.T) {
+	r := newRig(t)
+	img := image.NewRGBA64(image.Rect(0, 0, 4, 4))
+	for i := 0; i < 16; i++ {
+		img.SetRGBA64(i%4, i/4, color.RGBA64{uint16(i*4099 + 1), 0x1234, 0xFEDC, 0xFFFF})
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	data := b.Bytes()
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture()
+	it := r.h.Items()[0]
+	p := model.Str(it.ImageFilePath)
+	if filepath.Ext(p) != ".png" {
+		t.Fatalf("16-bit picture stored as %s", p)
+	}
+	if got, _ := os.ReadFile(p); !bytes.Equal(got, data) {
+		t.Fatal("16-bit PNG not kept as it came")
+	}
+	if model.Str(it.ContentHash) != "img:"+upperSHA(data) {
+		t.Fatalf("hash %s", model.Str(it.ContentHash))
 	}
 }

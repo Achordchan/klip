@@ -2,6 +2,8 @@ package app
 
 import (
 	"encoding/json"
+
+	"klip/internal/account"
 	"klip/internal/model"
 )
 
@@ -67,4 +69,25 @@ func (a *App) SubscriptionChanged(active bool) {
 		}
 		a.Auto.Trigger(a.acct(), "subscription", false)
 	}
+}
+
+type unconfirmedAction int
+
+const (
+	skipSync  unconfirmedAction = iota // signed out: nothing is owed to this account
+	pauseSync                          // the server says there is no subscription
+	retrySync                          // the answer is unknown: try again later
+)
+
+// uploadAfterUnconfirmed decides what an upload after a local change does when
+// the subscription was not confirmed. Only a confirmed "未订阅" pauses sync; an
+// unknown answer must not drop the owed upload.
+func uploadAfterUnconfirmed(s account.Subscription) unconfirmedAction {
+	switch s.Status {
+	case "未订阅":
+		return pauseSync
+	case "未登录":
+		return skipSync
+	}
+	return retrySync
 }

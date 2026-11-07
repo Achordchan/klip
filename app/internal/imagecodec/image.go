@@ -111,3 +111,37 @@ func Export(source, target string) error {
 	}
 	return durable.Rename(f.Name(), dst)
 }
+
+// HighDepth reports more than 8 bits per channel, which lossless WebP cannot
+// keep.
+func HighDepth(im image.Image) bool {
+	switch im.(type) {
+	case *image.RGBA64, *image.NRGBA64, *image.Gray16:
+		return true
+	}
+	switch im.ColorModel() {
+	case color.RGBA64Model, color.NRGBA64Model, color.Gray16Model:
+		return true
+	}
+	return false
+}
+
+// Normalize returns the 8-bit non-premultiplied pixels of im, starting at 0,0.
+// Lossless WebP stores exactly these, so a picture normalized, stored as WebP
+// and decoded again gives the same pixels back.
+func Normalize(im image.Image) *image.NRGBA {
+	if n, ok := im.(*image.NRGBA); ok && n.Rect.Min == (image.Point{}) {
+		return n
+	}
+	b := im.Bounds()
+	n := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(n, n.Rect, im, b.Min, draw.Src)
+	return n
+}
+
+// CanonicalPNG is the PNG of the normalized pixels: the bytes Klip puts on the
+// clipboard for a picture it does not keep as PNG, and so the identity of such
+// a picture when it is copied back.
+func CanonicalPNG(im image.Image) ([]byte, error) {
+	return Encode(Normalize(im), "png")
+}

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"klip/internal/account"
 	"klip/internal/model"
 	"klip/internal/syncer"
 	"testing"
@@ -43,5 +44,21 @@ func TestConfirmedRenewalReenablesSync(t *testing.T) {
 	a.SubscriptionChanged(true)
 	if a.subscriptionPaused() {
 		t.Fatal("confirmed renewal did not clear pause")
+	}
+}
+
+func TestUnconfirmedSubscriptionRetriesOwedUpload(t *testing.T) {
+	for _, tc := range []struct {
+		sub  account.Subscription
+		want unconfirmedAction
+	}{
+		{account.None("未订阅"), pauseSync},
+		{account.None("未登录"), skipSync},
+		{account.None("查询失败"), retrySync},
+		{account.Loading(), retrySync},
+	} {
+		if got := uploadAfterUnconfirmed(tc.sub); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.sub.Status, got, tc.want)
+		}
 	}
 }

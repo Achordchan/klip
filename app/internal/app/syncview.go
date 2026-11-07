@@ -349,8 +349,14 @@ func (a *App) remove(pick func(items []model.Item) []model.Item) {
 				return
 			}
 			if !subscription.Subscribed {
-				if subscription.Status == "未订阅" {
+				switch uploadAfterUnconfirmed(subscription) {
+				case pauseSync:
 					a.SubscriptionChanged(false)
+				case retrySync:
+					// Unknown (a network failure, a server error): the deletion is
+					// still owed, as after a failed upload.
+					a.cfg.Logf("upload after change: subscription %s", subscription.Status)
+					a.retryLater()
 				}
 				return
 			}
