@@ -124,8 +124,10 @@ export async function sendMail(env: Env, to: string, message: string): Promise<v
     { secureTransport: ssl ? "on" : starttls ? "starttls" : "off", allowHalfOpen: false },
   );
   const conn = new SmtpConnection(socket);
-  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("smtp timeout")), 15_000));
-  const run = async () => {
+  const within = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
+    Promise.race([p, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`smtp ${what} timeout`)), ms))]);
+  // 到服务器回 250 收下邮件为止；之后的 QUIT 只是礼貌，不影响结果。
+  const deliver = async () => {
     const greeting = await conn.reply();
     if (greeting.code !== 220) throw new Error(`smtp greeting: ${greeting.text}`);
     await conn.command("EHLO klip-sync", [250], "EHLO");
@@ -144,15 +146,14 @@ export async function sendMail(env: Env, to: string, message: string): Promise<v
     await conn.command(`RCPT TO:<${to}>`, [250, 251], "RCPT TO");
     await conn.command("DATA", [354], "DATA");
     await conn.command(`${message}\r\n.`, [250], "message");
-    try {
-      await conn.command("QUIT", [221], "QUIT");
-    } catch {
-      /* 邮件已经交出去了 */
-    }
   };
   try {
-    await Promise.race([run(), timeout]);
-  } finally {
-    await conn.close();
+    await within(deliver(), 15_000, "delivery");
+  } catch (e) {
+    await within(conn.close(), 2_000, "close").catch(() => {});
+    throw e;
   }
+  // 邮件已经被收下：从这里起不再报错，QUIT 和关连接卡住或失败都无所谓。
+  await within(conn.command("QUIT", [221], "QUIT"), 2_000, "QUIT").catch(() => {});
+  await within(conn.close(), 2_000, "close").catch(() => {});
 }

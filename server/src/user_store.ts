@@ -285,6 +285,8 @@ export class UserStore extends DurableObject<Env> {
    * blob 的 key 由哈希决定，同一个 blob 可能已经被重新传上来：已经记账的不删（只去掉记录），
    * 正在上传的先跳过，免得删掉刚写进去的文件。
    */
+  // 只能在提交锁（withCommit）里或 DO 启动恢复（blockConcurrencyWhile）时调用：
+  // 两次清理不能重叠，否则同一个哈希的删除登记会互相覆盖。
   private async drainCleanup(): Promise<void> {
     this.sql.exec("DELETE FROM cleanup WHERE blob_sha IS NOT NULL AND EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = cleanup.blob_sha)");
     const rows = this.sql
@@ -445,8 +447,17 @@ export class UserStore extends DurableObject<Env> {
       this.sql.exec("DELETE FROM meta WHERE k='usage_dirty'");
     } catch (e) {
       console.error("update storage_bytes failed, will retry", String(e));
-      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+      const at = Date.now() + 60_000;
+      const current = await this.ctx.storage.getAlarm();
+      if (current === null || current > at) await this.ctx.storage.setAlarm(at);
     }
+  }
+
+  /** 一秒后用 alarm 在提交锁里做一次清理和用量补写（已经有更早的 alarm 就不动）。 */
+  private async scheduleMaintenance(): Promise<void> {
+    const at = Date.now() + 1_000;
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > at) await this.ctx.storage.setAlarm(at);
   }
 
   async alarm(): Promise<void> {
@@ -570,9 +581,11 @@ export class UserStore extends DurableObject<Env> {
     const version = this.nextVersion();
     const key = snapshotKey(userId, version);
     this.sql.exec("INSERT INTO snapshots (version,created_ms,size,sha256,current,r2_key) VALUES (?,?,0,'',?,?)", version, Number(version), PENDING, key);
+    // 撤销只登记待清理（同步、和删记录同一事务），真正删 R2 留给提交锁里的 drainCleanup：
+    // 所有清理都排在同一条队列上，同一个哈希不会有两次删除同时在进行。
     const discard = async () => {
       this.dropPending(version, key);
-      await this.drainCleanup();
+      await this.scheduleMaintenance();
     };
 
     const quota = this.quota(tier, false);
