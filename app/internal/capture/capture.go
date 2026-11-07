@@ -66,7 +66,8 @@ type Service struct {
 	storeWebP bool
 	// ClipboardDir holds the PNG copies offered as files when a picture kept
 	// in another format is put on the clipboard; empty is a folder in the
-	// system's temporary directory.
+	// user's own cache directory (never the shared temporary directory, where
+	// another user could put a link of their choosing in its place).
 	ClipboardDir string
 	Layout       paths.Layout
 	History      *history.Service
@@ -708,8 +709,8 @@ func (s *Service) knownImageHash(fallback string, candidates ...string) string {
 // needed by nobody and go (pruneClipboardPNGs): the folder holds the copy the
 // clipboard offers, and at most one more after a write that failed.
 func (s *Service) clipboardPNG(stored string, data []byte) string {
-	dir := s.clipboardDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	dir, err := s.clipboardDir()
+	if err != nil {
 		return ""
 	}
 	base := filepath.Base(stored)
@@ -751,11 +752,41 @@ func (s *Service) offered(path string) {
 	_ = os.Chtimes(path, now, now)
 }
 
-func (s *Service) clipboardDir() string {
-	if s.ClipboardDir != "" {
-		return s.ClipboardDir
+// clipboardDir is the folder of the PNG copies, made if need be. It must be a
+// folder of this user's that only they can enter: a link, or a folder of
+// somebody else, is refused, as writing into it, and pruning it, would act on
+// files that are not Klip's.
+func (s *Service) clipboardDir() (string, error) {
+	dir := s.ClipboardDir
+	if dir == "" {
+		base, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(base, "Klip", "clipboard-png")
 	}
-	return filepath.Join(os.TempDir(), "klip-clipboard")
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
+		return "", err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("capture: the clipboard folder is not a plain folder")
+	}
+	if !ownedByMe(info) {
+		return "", errors.New("capture: the clipboard folder belongs to another user")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
 }
 
 // pruneClipboardPNGs removes the copies, other than keep ("" for none), last
@@ -764,7 +795,10 @@ func (s *Service) clipboardDir() string {
 // newest. It is called once a picture is on the clipboard: until then, the
 // clipboard may still offer the copy before.
 func (s *Service) pruneClipboardPNGs(keep string) {
-	dir := s.clipboardDir()
+	dir, err := s.clipboardDir()
+	if err != nil {
+		return
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -777,8 +811,8 @@ func (s *Service) pruneClipboardPNGs(keep string) {
 	now := s.Now()
 	for _, e := range ents {
 		p := filepath.Join(dir, e.Name())
-		if e.IsDir() || (keep != "" && samePath(p, keep)) {
-			continue
+		if !e.Type().IsRegular() || (keep != "" && samePath(p, keep)) {
+			continue // a folder or a link is not a copy Klip made
 		}
 		if !strings.EqualFold(filepath.Ext(e.Name()), ".png") && !strings.HasPrefix(e.Name(), ".klip-png-") {
 			continue

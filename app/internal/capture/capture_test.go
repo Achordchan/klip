@@ -1340,3 +1340,78 @@ func TestSeparateWebPItemIsFoundAgainOnceMergingIsOn(t *testing.T) {
 		t.Fatalf("the WebP item copied back made a third item: %d", r.h.Len())
 	}
 }
+
+func TestClipboardFolderThatIsALinkIsNotUsed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("links need privileges there")
+	}
+	r := newRig(t)
+	items := distinctImages(t, r, 1)
+	// Somebody put a link to the user's pictures where the folder goes.
+	victim := t.TempDir()
+	photo := write(t, filepath.Join(victim, "holiday.png"), []byte("photo"))
+	old := r.now.Add(-24 * time.Hour)
+	os.Chtimes(photo, old, old)
+	link := filepath.Join(t.TempDir(), "clipboard-png")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	r.s.ClipboardDir = link
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if r.clip.wroteWith != "" {
+		t.Fatalf("a copy was written through the link: %s", r.clip.wroteWith)
+	}
+	if _, err := os.Stat(photo); err != nil {
+		t.Fatal("a file behind the link was deleted")
+	}
+	if ents, _ := os.ReadDir(victim); len(ents) != 1 {
+		t.Fatalf("files written behind the link: %v", ents)
+	}
+}
+
+func TestPruneLeavesLinksInTheFolderAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("links need privileges there")
+	}
+	r := newRig(t)
+	items := distinctImages(t, r, 1)
+	if err := r.s.Apply(items[0]); err != nil { // makes the folder
+		t.Fatal(err)
+	}
+	victim := write(t, filepath.Join(t.TempDir(), "holiday.png"), []byte("photo"))
+	planted := filepath.Join(r.s.ClipboardDir, "planted.png")
+	if err := os.Symlink(victim, planted); err != nil {
+		t.Fatal(err)
+	}
+	// The link was made just now, by the clock of the system: look at it from
+	// a day later, when it is long past the time a copy is kept.
+	r.now = time.Now().Add(24 * time.Hour)
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(planted); err != nil {
+		t.Fatal("a link in the folder was removed")
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatal("the file a link points to was removed")
+	}
+}
+
+func TestClipboardFolderIsMadePrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits")
+	}
+	r := newRig(t)
+	if err := os.Mkdir(r.s.ClipboardDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(r.s.ClipboardDir, 0o777)
+	if err := r.s.Apply(distinctImages(t, r, 1)[0]); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(r.s.ClipboardDir); st.Mode().Perm() != 0o700 {
+		t.Fatalf("mode %v", st.Mode().Perm())
+	}
+}
