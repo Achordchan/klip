@@ -376,6 +376,9 @@ func (p *program) updates() *updatewin.Model {
 // showUpdate is the update button of the main window: the new version is
 // downloaded at once (with a window for the progress).
 func (p *program) showUpdate() {
+	if p.storageMoving.Load() {
+		return // an update quits the program, which a migration must not see
+	}
 	p.hide()
 	p.updates().ApplyNow()
 	p.updWins.Reshow() // asked for: its window comes back if it was closed

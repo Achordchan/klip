@@ -22,16 +22,43 @@ type recoveryEntry struct {
 	OriginalDigest string
 }
 
+// committedJournal is the journal of an update whose files are all in place
+// and checked: what is left to do is to forget it, not to undo it. An
+// uncommitted journal stays the bare list of entries that earlier versions
+// write and read.
+type committedJournal struct {
+	Committed bool            `json:"committed"`
+	Entries   []recoveryEntry `json:"entries"`
+}
+
 func recoveryPath(root string) string { return filepath.Join(root, ".klip-update-recovery.json") }
-func saveRecovery(root string, items []rollbackItem) error {
+
+func recoveryEntries(items []rollbackItem) []recoveryEntry {
 	entries := make([]recoveryEntry, len(items))
 	for i, it := range items {
 		entries[i] = recoveryEntry{it.path, it.backup, it.existed, it.moved, it.manifest, it.originalDigest}
 	}
-	b, err := json.Marshal(entries)
+	return entries
+}
+
+func saveRecovery(root string, items []rollbackItem) error {
+	b, err := json.Marshal(recoveryEntries(items))
 	if err != nil {
 		return err
 	}
+	return saveJournal(root, b)
+}
+
+// saveCommitted marks the update in the journal as done, durably.
+func saveCommitted(root string, items []rollbackItem) error {
+	b, err := json.Marshal(committedJournal{Committed: true, Entries: recoveryEntries(items)})
+	if err != nil {
+		return err
+	}
+	return saveJournal(root, b)
+}
+
+func saveJournal(root string, b []byte) error {
 	f, err := os.CreateTemp(root, ".recovery-*")
 	if err != nil {
 		return err
@@ -61,7 +88,20 @@ func RecoverInterruptedUpdate(root string) error {
 		return err
 	}
 	var entries []recoveryEntry
-	if err = json.Unmarshal(b, &entries); err != nil {
+	if trimmed := strings.TrimSpace(string(b)); strings.HasPrefix(trimmed, "{") {
+		var j committedJournal
+		if err = json.Unmarshal(b, &j); err != nil {
+			return err
+		}
+		if j.Committed {
+			// The new version is whole: keep it, forget the journal.
+			if err := durable.Remove(recoveryPath(root)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		}
+		entries = j.Entries
+	} else if err = json.Unmarshal(b, &entries); err != nil {
 		return err
 	}
 	restored := map[string]bool{}

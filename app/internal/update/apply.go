@@ -35,12 +35,61 @@ type Plan struct {
 	// Installer, when set, is a full installer to start instead of copying
 	// files.
 	Installer string `json:"installer,omitempty"`
+	// Version is the version being installed, for the result.
+	Version string `json:"version,omitempty"`
+	// Quiet says that nobody asked for this update (it was put in place while
+	// the user was away): no message box is shown; how it went is written to
+	// ResultPath, which the program reads when it starts. A helper of an
+	// earlier version ignores both.
+	Quiet bool `json:"quiet,omitempty"`
+	// ResultPath, when set, is where the helper writes how the update went
+	// (InstallResult).
+	ResultPath string `json:"resultPath,omitempty"`
 }
+
+// InstallResult is how an update went, as the helper writes it
+// (Plan.ResultPath).
+type InstallResult struct {
+	Version string    `json:"version"`
+	OK      bool      `json:"ok"`
+	Error   string    `json:"error,omitempty"`
+	At      time.Time `json:"at"`
+	// RolledBack says that the old version was put back whole.
+	RolledBack bool `json:"rolledBack,omitempty"`
+}
+
+// ReadResult reads what the helper wrote at path; a missing file is no
+// result (nil, nil).
+func ReadResult(path string) (*InstallResult, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var r InstallResult
+	if err := json.Unmarshal(b, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// exitWait is how long the helper waits for the program to exit. A program
+// that does not (its quit was held, as during a data migration) keeps its
+// files, and the helper gives up without touching them: waiting for ever
+// would hold the update mutex, and every later start of Klip, which sees it,
+// would exit at once.
+const exitWait = 2 * time.Minute
+
+// errAppDidNotExit is the helper giving up on a program that did not exit.
+var errAppDidNotExit = errors.New("the program did not exit; nothing was changed")
 
 // Hooks are the parts of Apply that touch the system, for tests.
 type Hooks struct {
-	// WaitExit blocks until the process is gone.
-	WaitExit func(pid int)
+	// WaitExit blocks until the process is gone, or for timeout at most; it
+	// says whether the process is gone.
+	WaitExit func(pid int, timeout time.Duration) bool
 	// Sleep is time.Sleep.
 	Sleep func(time.Duration)
 	// Launch starts a program and does not wait for it.
@@ -95,16 +144,13 @@ func ReadPlan(path string) (Plan, error) {
 	return p, json.Unmarshal(b, &p)
 }
 
-// WritePlan stores a plan file.
+// WritePlan stores a plan file, durably: the helper reads it after the
+// program has gone, and a plan cut short by a power cut must not be half one.
 func WritePlan(path string, p Plan) error {
-	b, err := json.MarshalIndent(p, "", "  ")
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return writeJSON(path, p)
 }
 
 type logger struct {
@@ -166,14 +212,32 @@ func RunPlan(p Plan, h Hooks) error {
 	}
 	lg := logger{p.LogPath, h.Now}
 	_ = os.Remove(p.LogPath)
+	if p.Quiet {
+		// Nobody is there to read a message box: the log and the result say it.
+		h.Alert = func(title, msg string) { lg.say("not shown (quiet): " + title + ": " + msg) }
+	}
+	report := func(err error, rolledBack bool) {
+		if p.ResultPath == "" {
+			return
+		}
+		r := InstallResult{Version: p.Version, OK: err == nil, At: h.Now(), RolledBack: rolledBack}
+		if err != nil {
+			r.Error = err.Error()
+		}
+		if werr := writeJSON(p.ResultPath, r); werr != nil {
+			lg.say("cannot write the result: " + werr.Error())
+		}
+	}
 	if p.ReadyFile != "" {
 		if err := os.WriteFile(p.ReadyFile, []byte("ready"), 0600); err != nil {
 			return err
 		}
 	}
 	lg.say("waiting for app exit")
-	if p.PID > 0 {
-		h.WaitExit(p.PID)
+	if p.PID > 0 && !h.WaitExit(p.PID, exitWait) {
+		lg.say("failed: " + errAppDidNotExit.Error())
+		report(errAppDidNotExit, true)
+		return errAppDidNotExit
 	}
 	h.Sleep(300 * time.Millisecond)
 
@@ -187,8 +251,10 @@ func RunPlan(p Plan, h Hooks) error {
 			if p.RestartExe != "" && fileExists(p.RestartExe) {
 				_ = h.Launch(p.RestartExe)
 			}
+			report(err, true)
 			return err
 		}
+		report(nil, false)
 		return nil
 	}
 
@@ -264,9 +330,22 @@ func RunPlan(p Plan, h Hooks) error {
 	err := applyFiles(p, h, lg, &rollback)
 	if err == nil {
 		lg.say("light update applied")
+		// Committed first, durably: a power cut from here on must keep the new
+		// version, which is whole, not roll it back (RecoverInterruptedUpdate
+		// drops a committed journal). Then the journal goes.
+		commitErr := saveCommitted(p.InstallDir, rollback)
+		if commitErr != nil {
+			lg.say("cannot mark the update committed: " + commitErr.Error())
+		}
 		if err := removeRecoveryJournal(p.InstallDir, h.Sleep); err != nil {
-			h.Alert("Klip 更新未完成", "无法清理恢复记录，请关闭占用程序后重新启动Klip以恢复："+err.Error())
-			return err
+			if commitErr != nil {
+				// Neither: the next start would roll the new version back.
+				h.Alert("Klip 更新未完成", "无法清理恢复记录，请关闭占用程序后重新启动Klip以恢复："+err.Error())
+				report(err, false)
+				return err
+			}
+			// A committed journal left behind is dropped at the next start.
+			lg.say("journal left committed: " + err.Error())
 		}
 		if lerr := h.Launch(filepath.Join(p.InstallDir, ExeName)); lerr != nil {
 			// The new program will not start (a virus scanner may have taken
@@ -278,8 +357,10 @@ func RunPlan(p Plan, h Hooks) error {
 			}
 			if uerr := undo(); uerr != nil {
 				h.Alert("Klip 更新失败", "新版本无法启动："+lerr.Error()+"\n\n旧版本没能完全恢复（"+uerr.Error()+"），Klip 可能无法使用，请重新下载安装包安装。日志："+p.LogPath)
+				report(err, false)
 				return err
 			}
+			report(err, true)
 			if exe := filepath.Join(p.InstallDir, ExeName); fileExists(exe) {
 				if oerr := h.Launch(exe); oerr != nil {
 					lg.say("failed to start the old program: " + oerr.Error())
@@ -291,15 +372,17 @@ func RunPlan(p Plan, h Hooks) error {
 			return err
 		}
 		// Transition backups are retained: ownership of pre-existing paths is unknown.
-
+		report(nil, false)
 		return nil
 	}
 	lg.say("failed: " + err.Error())
 	if uerr := undo(); uerr != nil {
 		lg.say("rollback incomplete: " + uerr.Error())
 		h.Alert("Klip 更新失败", "轻量更新失败，回滚也没能完成（"+uerr.Error()+"），Klip 可能无法使用，请重新下载安装包安装。日志："+p.LogPath)
+		report(err, false)
 		return err
 	}
+	report(err, true)
 	h.Alert("Klip 更新失败", "轻量更新失败，已回滚。日志："+p.LogPath)
 	if exe := filepath.Join(p.InstallDir, ExeName); fileExists(exe) {
 		_ = h.Launch(exe)
@@ -635,7 +718,12 @@ func HelperMain(args []string, h Hooks) (handled bool, code int) {
 		}
 		defer release()
 		pid, _ := strconv.Atoi(args[3])
-		waitExit(pid)
+		if !waitExit(pid, exitWait) {
+			// The program that asked did not go: its files are in use, and
+			// nothing is restored now. Its next start asks again.
+			fmt.Fprintln(os.Stderr, "recover-update:", errAppDidNotExit)
+			return true, 1
+		}
 		if err := RecoverInterruptedUpdate(args[2]); err != nil {
 			h = h.fill()
 			h.Alert("Klip 恢复失败", "自动恢复未完成："+err.Error()+"\n请关闭占用文件的程序后重试；若仍失败，请重新安装。请保留恢复日志和备份。")

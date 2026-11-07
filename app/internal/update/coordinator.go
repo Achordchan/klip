@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -458,12 +459,15 @@ func (c *Coordinator) startPackage(p *Prepared) error {
 		InstalledManifest: filepath.Join(c.Root, "installed-package-files.json"),
 		BackupDir:         filepath.Join(c.Root, "backups", p.Version+"-"+c.now().Format("20060102-150405")),
 		LogPath:           filepath.Join(c.Root, "last_light_update.log"),
+		Version:           p.Version,
+		ResultPath:        c.ResultPath(),
 	}
 	return c.launchPlan(plan, p.Version)
 }
 
 func (c *Coordinator) startInstaller(path, version string) error {
-	return c.launchPlan(Plan{PID: c.pid(), Installer: path, RestartExe: c.Exe, LogPath: filepath.Join(c.Root, "last_light_update.log")}, version)
+	return c.launchPlan(Plan{PID: c.pid(), Installer: path, RestartExe: c.Exe, LogPath: filepath.Join(c.Root, "last_light_update.log"),
+		Version: version, ResultPath: c.ResultPath()}, version)
 }
 
 func (c *Coordinator) launchPlan(plan Plan, version string) error {
@@ -479,7 +483,10 @@ func (c *Coordinator) launchPlan(plan Plan, version string) error {
 }
 
 // CleanOld removes what earlier updates left that is of no more use: the
-// helper copies of the program and the unpacked packages. Backups stay.
+// helper copies of the program, the unpacked packages, the downloaded
+// packages and installers of this version or older (what is installed, or
+// was passed), and the backups of updates but the newest one (kept for a
+// rollback by hand).
 func (c *Coordinator) CleanOld() {
 	c.fsMu.Lock()
 	defer c.fsMu.Unlock()
@@ -493,4 +500,67 @@ func (c *Coordinator) CleanOld() {
 	}
 	_ = os.RemoveAll(filepath.Join(c.Root, "helper"))
 	_ = os.RemoveAll(filepath.Join(c.Root, "staging"))
+	c.removeOldDownloads(filepath.Join(c.Root, "packages"))
+	c.removeOldDownloads(c.Root)
+	keepNewestBackup(filepath.Join(c.Root, "backups"))
 }
+
+// removeOldDownloads removes from dir the packages and installers
+// (maccy-<version>-...) of this version or older. A file whose version
+// cannot be read is left: it is not known to be one of ours.
+func (c *Coordinator) removeOldDownloads(dir string) {
+	current, ok := ParseVersion(NormalizeVersion(c.Client.Current))
+	if !ok {
+		return
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		name := e.Name()
+		if !e.Type().IsRegular() || !strings.HasPrefix(name, "maccy-") ||
+			!(strings.HasSuffix(name, ".zip") || strings.HasSuffix(name, "-setup.exe")) {
+			continue
+		}
+		ver, _, _ := strings.Cut(strings.TrimPrefix(name, "maccy-"), "-")
+		v, ok := ParseVersion(ver)
+		if !ok || v.Compare(current) > 0 {
+			continue // newer: an update not yet installed
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
+// keepNewestBackup removes the backup folders in dir but the newest one.
+func keepNewestBackup(dir string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type backup struct {
+		name string
+		at   time.Time
+	}
+	var all []backup
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		all = append(all, backup{e.Name(), info.ModTime()})
+	}
+	if len(all) < 2 {
+		return
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.After(all[j].at) })
+	for _, b := range all[1:] {
+		_ = os.RemoveAll(filepath.Join(dir, b.name))
+	}
+}
+
+// ResultPath is where the helper writes how the last update went.
+func (c *Coordinator) ResultPath() string { return filepath.Join(c.Root, "last-update-result.json") }
