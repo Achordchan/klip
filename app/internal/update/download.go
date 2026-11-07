@@ -71,7 +71,9 @@ func NormalizePath(p string) (string, error) {
 		return "", errors.New("package path is empty")
 	}
 	n := strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(p), "/", string(filepath.Separator)), "\\", string(filepath.Separator))
-	if filepath.IsAbs(n) || filepath.VolumeName(n) != "" {
+	// A rooted path (\x on Windows is not "absolute", it is on the current
+	// drive) is no relative one either, on any system.
+	if filepath.IsAbs(n) || filepath.VolumeName(n) != "" || strings.HasPrefix(n, string(filepath.Separator)) {
 		return "", errors.New("package path must be relative: " + p)
 	}
 	var parts []string

@@ -14,8 +14,9 @@ itself, and took in the helper's result.
 
 With --installer it first installs that setup silently into a folder where a
 C# version seemed to be installed (maccy.exe, maccy.dll, the user's
-settings.json), and checks that the old program files are gone and the data
-is not.
+settings.json, a sign-in entry naming maccy.exe), and checks that the old
+program files are gone, the sign-in entry names Klip.exe and the data is
+still there.
 
 It uses this user's real data folder (%LOCALAPPDATA%\\maccy): run it on a
 machine made for tests (CI), never on one with a Klip in use.
@@ -78,6 +79,33 @@ def show(path: Path) -> None:
         print(path.read_text(encoding="utf-8", errors="replace")[-6000:])
 
 
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def run_value() -> str | None:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return winreg.QueryValueEx(k, "maccy")[0]
+    except FileNotFoundError:
+        return None
+
+
+def set_run_value(value: str) -> None:
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+        winreg.SetValueEx(k, "maccy", 0, winreg.REG_SZ, value)
+
+
+def delete_run_value() -> None:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, "maccy")
+    except FileNotFoundError:
+        pass
+
+
 def check_installer(installer: Path, work: Path) -> None:
     """The installer over a folder of the C# program: the old program files
     go, the user's data stays, Klip.exe is there."""
@@ -88,6 +116,8 @@ def check_installer(installer: Path, work: Path) -> None:
     (target / "settings.json").write_text('{"MaxItems": 7}', encoding="utf-8")
     (target / "images").mkdir()
     (target / "images" / "a.png").write_bytes(b"PNG")
+    # The C# program's sign-in entry, naming its program file.
+    set_run_value(f'"{target / "maccy.exe"}"')
     log = work / "setup.log"
     res = subprocess.run([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER",
                           f"/DIR={target}", f"/LOG={log}"])
@@ -102,10 +132,14 @@ def check_installer(installer: Path, work: Path) -> None:
             problems.append(f"{gone} of the C# program is still there")
     if (target / "settings.json").read_text(encoding="utf-8") != '{"MaxItems": 7}' or not (target / "images" / "a.png").exists():
         problems.append("the user's data was touched")
+    entry = run_value()
+    if (entry or "").lower() != f'"{target / release_go.EXE}"'.lower():
+        problems.append(f"the sign-in entry is {entry!r}, not the program installed")
+    delete_run_value()
     if problems:
         show(log)
         raise SystemExit("installer: " + "; ".join(problems))
-    print("installer: Klip.exe installed, the C# program files removed, the data kept")
+    print("installer: Klip.exe installed, the C# program files removed, the sign-in entry moved to it, the data kept")
     stop_klip()
     uninstaller = target / "unins000.exe"
     if uninstaller.exists():

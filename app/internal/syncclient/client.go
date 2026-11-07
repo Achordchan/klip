@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -374,11 +375,26 @@ func saveBody(resp *http.Response, target string) error {
 		os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, target); err != nil {
+	if err := replaceFile(tmp, target); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return nil
+}
+
+// replaceFile puts tmp in target's place. On Windows the replacement is
+// refused (access denied) while target is being replaced at the same moment
+// by another download of the same blob, or held open for a moment by a
+// scanner: it is tried again for up to about two seconds.
+func replaceFile(tmp, target string) error {
+	var err error
+	for i := range 20 {
+		if err = os.Rename(tmp, target); err == nil || runtime.GOOS != "windows" {
+			return err
+		}
+		time.Sleep(time.Duration(i+1) * 10 * time.Millisecond)
+	}
+	return err
 }
 
 // ClearAuthSession forgets the tokens, as AppSettingsService.ClearAuthSession

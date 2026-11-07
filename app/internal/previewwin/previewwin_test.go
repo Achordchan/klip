@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -216,7 +217,8 @@ func TestImageButtonOpens(t *testing.T) {
 	}
 	openRect, _ := tt.Find("查看原图")
 	revealRect, _ := tt.Find("定位文件")
-	if revealRect.X < openRect.X+openRect.W || revealRect.Y != openRect.Y || revealRect.X+revealRect.W > 324 {
+	// On one row: the tops differ by the fonts' rounding only (0.02 on Windows).
+	if revealRect.X < openRect.X+openRect.W || math.Abs(float64(revealRect.Y-openRect.Y)) > 1 || revealRect.X+revealRect.W > 324 {
 		t.Fatalf("image actions do not fit side by side: %+v %+v", openRect, revealRect)
 	}
 }

@@ -78,6 +78,7 @@ func TestDDLIsTheCSharpOne(t *testing.T) {
 	if err != nil {
 		t.Skipf("C# source not available: %v", err)
 	}
+	b = []byte(strings.ReplaceAll(string(b), "\r\n", "\n")) // a Windows checkout has CRLF
 	m := regexp.MustCompile("(?s)cmd\\.CommandText = @\"\n(PRAGMA journal_mode=MEMORY;.*?)\";").FindStringSubmatch(string(b))
 	if m == nil {
 		t.Fatal("DDL not found in the C# source")

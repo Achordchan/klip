@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -515,6 +516,12 @@ func TestSignOutThatCannotBeSavedDoesNotRelabelTheCheckpoints(t *testing.T) {
 }
 
 func TestSignOutWithARecordThatCannotBeChangedLeavesNoCheckpoints(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Permissions do not keep a file from being removed there (os.Remove
+		// clears the read-only flag): the record goes, which is what the code
+		// falls back to, and the case cannot be set up.
+		t.Skip("a file cannot be made unremovable by its mode on Windows")
+	}
 	dir := t.TempDir()
 	m, _ := settings.Open(filepath.Join(dir, "settings.json"))
 	s := &Service{Client: syncclient.New("http://127.0.0.1:1"), Store: m, AccountFile: filepath.Join(dir, "sync", "account.txt")}
