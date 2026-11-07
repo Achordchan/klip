@@ -143,6 +143,11 @@ func TestRepairPointsTheOldEntryAtThisProgram(t *testing.T) {
 	if k["maccy"] != `"`+exe+`"` {
 		t.Fatalf("value %q", k["maccy"])
 	}
+	// The same folder in another spelling (case, slashes) is the same.
+	k = fakeKey{"maccy": `"c:/users/me/appdata/local/klip/MACCY.EXE"`}
+	if err := (Registry{Key: k, Exe: exe}).Repair(); err != nil || k["maccy"] != `"`+exe+`"` {
+		t.Fatalf("value %q (%v)", k["maccy"], err)
+	}
 	// Any entry that is not the old program file stays: this one, in another
 	// spelling of the case, the Klip.exe the user installed while this is a
 	// build run from a temporary folder (go run), another program the user
@@ -151,6 +156,10 @@ func TestRepairPointsTheOldEntryAtThisProgram(t *testing.T) {
 		`"c:\users\me\appdata\local\klip\klip.exe"`,
 		`"C:\Users\me\AppData\Local\Klip\Klip.exe"`,
 		`"D:\tools\other.exe"`,
+		// The C# program of another folder: an installation that is still
+		// there, while this is a build of go run.
+		`"C:\Users\me\AppData\Local\Klip\maccy.exe"`,
+		`"maccy.exe"`,
 	} {
 		k := fakeKey{"maccy": v}
 		if err := (Registry{Key: k, Exe: `C:\Users\me\AppData\Local\Temp\go-build1\exe\klip.exe`}).Repair(); err != nil || k["maccy"] != v {

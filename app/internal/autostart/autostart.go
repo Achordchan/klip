@@ -73,9 +73,11 @@ type Repairer interface {
 // the versions before 1.0.11, maccy.exe, which the installer of 1.0.11
 // removes: a value left as it was would start nothing, or, while the file is
 // still there, the old program, which would take the single-instance mutex
-// before Klip. A value naming any other file is left alone: it is a Klip.exe
-// the user installed (this program may be a copy run from elsewhere, a build
-// of go run in a temporary folder, which would be gone at the next sign-in).
+// before Klip. Only the maccy.exe of this program's own folder is: that is
+// the installation this program replaced. A value naming any other file is
+// left alone, whatever this program is (a copy run from elsewhere, a build of
+// go run in a temporary folder, which would be gone at the next sign-in):
+// the installer moves the entry of the installation it replaces itself.
 func (r Registry) Repair() error {
 	v, ok := r.Key.Get(ValueName)
 	if !ok || strings.TrimSpace(v) == "" {
@@ -92,12 +94,25 @@ func (r Registry) Repair() error {
 		return nil
 	}
 	named := strings.Trim(strings.TrimSpace(v), `"`)
-	// Base, not filepath.Base: the value is a Windows path, whatever this is.
-	base := named[strings.LastIndexAny(named, `\/`)+1:]
-	if !strings.EqualFold(base, "maccy.exe") || strings.EqualFold(filepath.Clean(named), filepath.Clean(exe)) {
+	// Split by hand, not by filepath: the value is a Windows path, whatever this is.
+	dir, base, ok := splitPath(named)
+	exeDir, _, exeOK := splitPath(exe)
+	if !ok || !exeOK || !strings.EqualFold(base, "maccy.exe") || !strings.EqualFold(dir, exeDir) {
 		return nil
 	}
 	return r.Key.Set(ValueName, `"`+exe+`"`)
+}
+
+// splitPath splits a Windows path (either slash, whatever system this is)
+// into its folder, without a trailing slash and with backslashes, and its
+// last name. ok is false for a bare name.
+func splitPath(p string) (dir, base string, ok bool) {
+	p = strings.ReplaceAll(p, "/", `\`)
+	cut := strings.LastIndex(p, `\`)
+	if cut < 0 {
+		return "", p, false
+	}
+	return strings.TrimRight(p[:cut], `\`), p[cut+1:], true
 }
 
 // Desktop is an XDG autostart entry (Linux): a .desktop file in the user's

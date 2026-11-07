@@ -1,6 +1,14 @@
 #define MyAppName "Klip"
 #define MyAppPublisher "Achord Chan"
-#define MyAppExeName "Klip.exe"
+; The Go program (release_go.py passes /DGoBuild) is Klip.exe, its installer
+; Klip-<version>-setup.exe; a build of the C# program keeps its names.
+#ifdef GoBuild
+  #define MyAppExeName "Klip.exe"
+  #define MyOutputPrefix "Klip"
+#else
+  #define MyAppExeName "maccy.exe"
+  #define MyOutputPrefix "maccy"
+#endif
 #ifndef MyPublishDir
   #define MyPublishDir SourcePath + "..\artifacts\publish\win-x64"
 #endif
@@ -22,7 +30,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=..\artifacts\installer
-OutputBaseFilename=Klip-{#MyAppVersionShort}-setup
+OutputBaseFilename={#MyOutputPrefix}-{#MyAppVersionShort}-setup
 SetupIconFile=..\klip\Assets\avalonia-logo.ico
 Compression=lzma
 SolidCompression=yes
