@@ -270,9 +270,14 @@ const syncManifest: Handler = async (req, env) => {
 
 const syncSnapshotGet: Handler = async (req, env) => {
   const { user } = await requireSync(req, env);
-  const head = await env.BUCKET.head(manifestKey(user.id));
-  const key = head?.customMetadata?.snapshotKey;
-  const obj = key ? await env.BUCKET.get(key) : null;
+  // 读到 manifest 之后、取文件之前，可能正好有新快照发布并把旧的清掉了：
+  // 文件不见了就重新读 manifest 再取。
+  let obj: R2ObjectBody | null = null;
+  for (let attempt = 0; attempt < 3 && !obj; attempt++) {
+    const key = (await env.BUCKET.head(manifestKey(user.id)))?.customMetadata?.snapshotKey;
+    if (!key) return httpError(404);
+    obj = await env.BUCKET.get(key);
+  }
   if (!obj) return httpError(404);
   return new Response(obj.body, {
     headers: { "Content-Type": "application/octet-stream", "Content-Length": String(obj.size), "Content-Disposition": 'attachment; filename="snapshot.sqlite"' },
