@@ -25,6 +25,9 @@ type Manager struct {
 	// away; hadFocus says it had the keyboard (the user clicked into it to
 	// select or copy text). May be nil.
 	Hidden func(hadFocus bool)
+	// Blurred is called when the window, having had the keyboard, lost it:
+	// the focus went back to the panel, or out of Klip. May be nil.
+	Blurred func()
 
 	// decode reads a picture cut down to a size (panel.ScaledBitmap when
 	// nil), and onMain runs on the UI thread (mygo.RunOnMain when nil).
@@ -184,6 +187,11 @@ func (mg *Manager) present(it model.Item, bm *ui.Bitmap, pw, ph int, meta string
 				e.PreventDefault()
 				mg.win.Hide()
 			})
+			mg.win.OnBlur(func() {
+				if mg.Blurred != nil {
+					mg.Blurred()
+				}
+			})
 		}
 		mg.win.SetSize(w, h)
 		mg.win.SetPosition(x, y)
@@ -230,11 +238,13 @@ func (mg *Manager) hide(seq int) {
 	})
 }
 
-// Visible says whether the window is up. Call it on the UI thread.
-func (mg *Manager) Visible() bool {
+// Focused says whether the window is up and has the keyboard: the user
+// clicked into it (on Windows that takes the focus). Call it on the UI
+// thread.
+func (mg *Manager) Focused() bool {
 	mg.mu.Lock()
 	defer mg.mu.Unlock()
-	return mg.win != nil && mg.win.IsVisible()
+	return mg.win != nil && mg.win.IsVisible() && mg.win.IsFocused()
 }
 
 // Close destroys the window (when the program quits). A picture or the files

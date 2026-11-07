@@ -6,14 +6,14 @@ import (
 	"github.com/egoist/mygo"
 )
 
-// Auxiliary windows keep the panel visible for their entire visible lifetime:
-// the preferences, About, and the preview, which the user may click into to
-// select and copy text (on Windows that takes the focus from the panel).
+// The preferences and About keep the panel visible for their entire visible
+// lifetime. The preview keeps it only while it has the focus: the user may
+// click into it to select and copy text (on Windows that takes the focus
+// from the panel), but a preview merely showing under the pointer must not
+// keep the panel up when the user switches to another program (Alt+Tab).
 // Delay inspection because native blur can precede showing the destination.
 func (p *program) onWindowBlur() {
-	// A blur while an auxiliary window is open is not acted on then; the
-	// preview, which goes away on its own, looks again when it does
-	// (previewHidden).
+	// A blur while the preferences or About are open is not acted on then.
 	if p.auxiliaryWindowVisible() {
 		return
 	}
@@ -21,7 +21,10 @@ func (p *program) onWindowBlur() {
 }
 
 // checkFocusSoon hides the panel a moment later if by then the focus is in
-// none of Klip's windows and no auxiliary window is up.
+// none of Klip's windows (the panel, the preview) and neither the
+// preferences nor About is up. It serves the panel's blur, the preview's
+// blur (the focus left the preview: back to the panel, or out of Klip) and
+// the preview going away.
 func (p *program) checkFocusSoon() {
 	time.AfterFunc(100*time.Millisecond, func() {
 		if p.quitting.Load() {
@@ -31,8 +34,8 @@ func (p *program) checkFocusSoon() {
 			if p.quitting.Load() || p.win == nil || !p.win.IsVisible() {
 				return
 			}
-			mainFocused := p.win.IsFocused()
-			if hideAfterFocusTransfer(mainFocused, p.auxiliaryWindowVisible()) {
+			previewFocused := p.preview != nil && p.preview.Focused()
+			if hideAfterFocusTransfer(p.win.IsFocused(), previewFocused, p.auxiliaryWindowVisible()) {
 				p.hide()
 			}
 		})
@@ -41,9 +44,7 @@ func (p *program) checkFocusSoon() {
 
 // previewHidden is the preview gone away. If it had the focus (the user was
 // selecting text in it), the panel takes it back, so typing goes on there;
-// otherwise the panel goes too, unless the focus is still in Klip: the click
-// that left the preview may have been into another program, whose blur the
-// panel had already been told of while the preview was up.
+// otherwise the focus is looked at again.
 func (p *program) previewHidden(hadFocus bool) {
 	if p.quitting.Load() || p.win == nil || !p.win.IsVisible() {
 		return
@@ -55,13 +56,12 @@ func (p *program) previewHidden(hadFocus bool) {
 	p.checkFocusSoon()
 }
 
-func hideAfterFocusTransfer(mainFocused, auxiliaryVisible bool) bool {
-	return !mainFocused && !auxiliaryVisible
+func hideAfterFocusTransfer(mainFocused, previewFocused, auxiliaryVisible bool) bool {
+	return !mainFocused && !previewFocused && !auxiliaryVisible
 }
 
 func (p *program) auxiliaryWindowVisible() bool {
-	return (p.prefsWin != nil && p.prefsWin.IsVisible()) || (p.about != nil && p.about.Visible()) ||
-		(p.preview != nil && p.preview.Visible())
+	return (p.prefsWin != nil && p.prefsWin.IsVisible()) || (p.about != nil && p.about.Visible())
 }
 
 func (p *program) closePreferences() {

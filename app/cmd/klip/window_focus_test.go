@@ -8,27 +8,28 @@ import (
 	"klip/internal/previewwin"
 )
 
-func TestVisibleAuxiliaryWindowsKeepMainPanel(t *testing.T) {
+func TestWhatKeepsTheMainPanel(t *testing.T) {
 	for _, tc := range []struct {
-		name            string
-		main, aux, hide bool
+		name                     string
+		main, preview, aux, hide bool
 	}{
-		{"main", true, false, false},
-		{"an auxiliary window (preferences, About, the preview being used) is up", false, true, false},
-		{"another application with auxiliary windows closed", false, false, true},
+		{"main", true, false, false, false},
+		{"clicked into the preview to select text", false, true, false, false},
+		{"preferences or About open", false, false, true, false},
+		{"another program (Alt+Tab) while a preview shows under the pointer", false, false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hideAfterFocusTransfer(tc.main, tc.aux); got != tc.hide {
+			if got := hideAfterFocusTransfer(tc.main, tc.preview, tc.aux); got != tc.hide {
 				t.Fatalf("hide = %v, want %v", got, tc.hide)
 			}
 		})
 	}
 }
 
-func TestPreviewCountsAsAnAuxiliaryWindow(t *testing.T) {
+func TestPreviewShowingDoesNotCountAsAuxiliary(t *testing.T) {
 	p := &program{preview: &previewwin.Manager{}}
-	if p.auxiliaryWindowVisible() {
-		t.Fatal("a preview never shown counts as up")
+	if p.auxiliaryWindowVisible() || p.preview.Focused() {
+		t.Fatal("a preview counts as keeping the panel without having the focus")
 	}
 }
 
