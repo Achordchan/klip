@@ -21,6 +21,13 @@ type Manager struct {
 	// Quitting says the program is quitting: the window then lets itself be
 	// closed instead of hiding, or Quit would wait for it for ever.
 	Quitting func() bool
+	// Hidden is called on the UI thread after the window, which was up, went
+	// away; hadFocus says it had the keyboard (the user clicked into it to
+	// select or copy text). May be nil.
+	Hidden func(hadFocus bool)
+	// Blurred is called when the window, having had the keyboard, lost it:
+	// the focus went back to the panel, or out of Klip. May be nil.
+	Blurred func()
 
 	// decode reads a picture cut down to a size (panel.ScaledBitmap when
 	// nil), and onMain runs on the UI thread (mygo.RunOnMain when nil).
@@ -180,6 +187,11 @@ func (mg *Manager) present(it model.Item, bm *ui.Bitmap, pw, ph int, meta string
 				e.PreventDefault()
 				mg.win.Hide()
 			})
+			mg.win.OnBlur(func() {
+				if mg.Blurred != nil {
+					mg.Blurred()
+				}
+			})
 		}
 		mg.win.SetSize(w, h)
 		mg.win.SetPosition(x, y)
@@ -201,8 +213,8 @@ func (mg *Manager) Hide() { mg.hide(-1) }
 func (mg *Manager) hide(seq int) {
 	mg.runOnMain(func() {
 		mg.mu.Lock()
-		defer mg.mu.Unlock()
 		if seq >= 0 && mg.seq != seq {
+			mg.mu.Unlock()
 			return
 		}
 		if seq < 0 {
@@ -210,13 +222,29 @@ func (mg *Manager) hide(seq int) {
 		}
 		mg.id = ""
 		mg.seq++ // a picture that is still being made is not wanted
+		wasUp, hadFocus := false, false
 		if mg.win != nil && mg.win.IsVisible() {
+			wasUp, hadFocus = true, mg.win.IsFocused()
 			mg.win.Hide()
 		}
 		if mg.model != nil {
 			mg.model.over, mg.model.wasOver = false, false
 		}
+		hidden := mg.Hidden
+		mg.mu.Unlock()
+		if wasUp && hidden != nil {
+			hidden(hadFocus) // outside mu: it may ask Visible
+		}
 	})
+}
+
+// Focused says whether the window is up and has the keyboard: the user
+// clicked into it (on Windows that takes the focus). Call it on the UI
+// thread.
+func (mg *Manager) Focused() bool {
+	mg.mu.Lock()
+	defer mg.mu.Unlock()
+	return mg.win != nil && mg.win.IsVisible() && mg.win.IsFocused()
 }
 
 // Close destroys the window (when the program quits). A picture or the files

@@ -162,7 +162,7 @@ func (p *program) ready() {
 	p.model = panel.New(p.app.History, host{p})
 	p.model.Redraw = p.redraw
 	p.about = &aboutwin.Manager{Version: host{p}.Version(), Quitting: p.quitting.Load}
-	p.preview = &previewwin.Manager{IconOf: shelfwin.SystemIcon, Left: p.model.PreviewLeft, Quitting: p.quitting.Load}
+	p.preview = &previewwin.Manager{IconOf: shelfwin.SystemIcon, Left: p.model.PreviewLeft, Quitting: p.quitting.Load, Hidden: p.previewHidden, Blurred: p.checkFocusSoon}
 
 	// The window of the .NET client: 360x620, a bare rounded box.
 	p.win = mygo.NewWindow(mygo.WindowOptions{

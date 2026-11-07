@@ -4,24 +4,32 @@ import (
 	"testing"
 
 	"github.com/egoist/mygo"
+
+	"klip/internal/previewwin"
 )
 
-func TestVisibleAuxiliaryWindowsKeepMainPanel(t *testing.T) {
+func TestWhatKeepsTheMainPanel(t *testing.T) {
 	for _, tc := range []struct {
 		name                     string
-		main, prefs, about, hide bool
+		main, preview, aux, hide bool
 	}{
 		{"main", true, false, false, false},
-		{"preferences open while another application has focus", false, true, false, false},
-		{"about open while another application has focus", false, false, true, false},
-		{"both auxiliary windows open", false, true, true, false},
-		{"another application with auxiliary windows closed", false, false, false, true},
+		{"clicked into the preview to select text", false, true, false, false},
+		{"preferences or About open", false, false, true, false},
+		{"another program (Alt+Tab) while a preview shows under the pointer", false, false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hideAfterFocusTransfer(tc.main, tc.prefs, tc.about); got != tc.hide {
+			if got := hideAfterFocusTransfer(tc.main, tc.preview, tc.aux); got != tc.hide {
 				t.Fatalf("hide = %v, want %v", got, tc.hide)
 			}
 		})
+	}
+}
+
+func TestPreviewShowingDoesNotCountAsAuxiliary(t *testing.T) {
+	p := &program{preview: &previewwin.Manager{}}
+	if p.auxiliaryWindowVisible() || p.preview.Focused() {
+		t.Fatal("a preview counts as keeping the panel without having the focus")
 	}
 }
 

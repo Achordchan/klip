@@ -375,3 +375,45 @@ func TestFailedPictureIsNotReadAgain(t *testing.T) {
 	mg.Show(pic("a"), Rect{})
 	wait("a after Hide", func() bool { return count("a") == 3 })
 }
+
+func TestTextOfThePreviewCanBeSelectedAndCopied(t *testing.T) {
+	text := "第一行内容\nsecond line"
+	m := &Model{Item: model.Item{ID: "t", Kind: model.KindText, Text: &text}}
+	m.MetaLine = m.Meta()
+	tt := ui.NewTester(m.View, 324, 260)
+	tt.Frame()
+	if err := tt.RightClick(text); err != nil {
+		t.Fatal(err)
+	}
+	menu := strings.Join(tt.Menu(), "|")
+	if menu == "" {
+		t.Fatal("the text offers no menu: it cannot be selected")
+	}
+	items := tt.Menu()
+	selectAll, copyItem := "", ""
+	for _, it := range items {
+		switch {
+		case strings.Contains(it, "Select All") || strings.Contains(it, "全选"):
+			selectAll = it
+		case strings.Contains(it, "Copy") || strings.Contains(it, "复制"):
+			copyItem = it
+		}
+	}
+	if selectAll == "" || copyItem == "" {
+		t.Fatalf("menu %q", menu)
+	}
+	if err := tt.ChooseMenuItem(selectAll); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if err := tt.RightClick(text); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt.ChooseMenuItem(copyItem); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if got := tt.Clipboard(); !strings.Contains(got, "第一行内容") || !strings.Contains(got, "second line") {
+		t.Fatalf("copied %q", got)
+	}
+}
