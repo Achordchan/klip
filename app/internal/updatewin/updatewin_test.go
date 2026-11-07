@@ -65,7 +65,7 @@ func newRig(t *testing.T, current string, rel update.Release) *rig {
 		}
 	}))
 	t.Cleanup(r.srv.Close)
-	exe := filepath.Join(t.TempDir(), "maccy.exe")
+	exe := filepath.Join(t.TempDir(), "Klip.exe")
 	_ = os.WriteFile(exe, []byte("EXE"), 0o755)
 	cl := &update.Client{HTTP: r.srv.Client(), ManifestURL: r.srv.URL + "/manifest.json", Current: current, Runtime: "win-x64",
 		ManifestPause: func(int) time.Duration { return time.Millisecond }, DownloadPause: func(int) time.Duration { return time.Millisecond }}

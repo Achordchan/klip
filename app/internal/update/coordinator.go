@@ -414,7 +414,7 @@ func (c *Coordinator) helperCopy(version string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	name := "maccy-update-" + version
+	name := "klip-update-" + version
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}

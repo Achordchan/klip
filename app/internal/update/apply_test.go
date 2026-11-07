@@ -48,7 +48,7 @@ type rig struct {
 func newRig(t *testing.T, newFiles map[string]string, legacy []string) *rig {
 	t.Helper()
 	r := &rig{t: t, install: filepath.Join(t.TempDir(), "Maccy"), root: filepath.Join(t.TempDir(), "updates")}
-	write(t, filepath.Join(r.install, "maccy.exe"), "OLD EXE")
+	write(t, filepath.Join(r.install, "Klip.exe"), "OLD EXE")
 	write(t, filepath.Join(r.install, "maccy.dll"), "OLD NET DLL")
 	write(t, filepath.Join(r.install, "Avalonia.Base.dll"), "OLD AVALONIA")
 	write(t, filepath.Join(r.install, "settings.json"), `{"MaxItems":7}`)
@@ -83,7 +83,7 @@ func (r *rig) hooks() Hooks {
 	}
 }
 
-var newPkg = map[string]string{"maccy.exe": "NEW EXE", "mygo-sqlite3.dll": "NEW SQLITE", "res/x.txt": "X"}
+var newPkg = map[string]string{"Klip.exe": "NEW EXE", "mygo-sqlite3.dll": "NEW SQLITE", "res/x.txt": "X"}
 
 func TestApplyReplacesFilesAndKeepsData(t *testing.T) {
 	r := newRig(t, newPkg, nil)
@@ -109,7 +109,7 @@ func TestApplyReplacesFilesAndKeepsData(t *testing.T) {
 		t.Error("a file that no list names was removed")
 	}
 	// The old program is in the backup.
-	if got := read(t, filepath.Join(r.plan.BackupDir, "replaced", "maccy.exe")); got != "OLD EXE" {
+	if got := read(t, filepath.Join(r.plan.BackupDir, "replaced", "Klip.exe")); got != "OLD EXE" {
 		t.Errorf("backup = %q", got)
 	}
 	// The list is remembered; the program is started again.
@@ -117,7 +117,7 @@ func TestApplyReplacesFilesAndKeepsData(t *testing.T) {
 	if err := json.Unmarshal([]byte(read(t, r.plan.InstalledManifest)), &m); err != nil || m.Version != "1.0.11" || len(m.Files) != 3 {
 		t.Errorf("installed list: %+v %v", m, err)
 	}
-	if len(r.launched) != 1 || r.launched[0] != filepath.Join(r.install, "maccy.exe") || len(r.alerts) != 0 {
+	if len(r.launched) != 1 || r.launched[0] != filepath.Join(r.install, "Klip.exe") || len(r.alerts) != 0 {
 		t.Errorf("launched %v, alerts %v", r.launched, r.alerts)
 	}
 	log := read(t, r.plan.LogPath)
@@ -128,7 +128,7 @@ func TestApplyReplacesFilesAndKeepsData(t *testing.T) {
 
 func TestApplyIsUndoneWhenTheNewProgramWillNotStart(t *testing.T) {
 	r := newRig(t, newPkg, nil)
-	prev := `{"appId":"maccy","version":"1.0.10","runtime":"win-x64","files":[{"path":"maccy.exe"}]}`
+	prev := `{"appId":"maccy","version":"1.0.10","runtime":"win-x64","files":[{"path":"Klip.exe"}]}`
 	write(t, r.plan.InstalledManifest, prev)
 	h := r.hooks()
 	starts := 0
@@ -143,7 +143,7 @@ func TestApplyIsUndoneWhenTheNewProgramWillNotStart(t *testing.T) {
 	if err := RunPlan(r.plan, h); err == nil {
 		t.Fatal("a program that cannot start is a failed update")
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "OLD EXE" {
 		t.Errorf("the old program must be back: %q", got)
 	}
 	if got := read(t, r.plan.InstalledManifest); got != prev {
@@ -155,11 +155,11 @@ func TestApplyIsUndoneWhenTheNewProgramWillNotStart(t *testing.T) {
 }
 
 func TestApplyRemovesWhatThePreviousPackageHadAndLegacyFiles(t *testing.T) {
-	r := newRig(t, newPkg, []string{"maccy.dll", "Avalonia.Base.dll", "images/a.png", "settings.json", "maccy.exe", "not-there.dll"})
+	r := newRig(t, newPkg, []string{"maccy.dll", "Avalonia.Base.dll", "images/a.png", "settings.json", "Klip.exe", "not-there.dll"})
 	// A previous light update had left a list: two files, one still wanted.
 	write(t, filepath.Join(r.install, "old-plugin.dll"), "OLD PLUGIN")
 	prev := PackageManifest{AppID: "maccy", Version: "1.0.10", Runtime: "win-x64", Files: []PackageFile{
-		{Path: "maccy.exe"}, {Path: "old-plugin.dll"}, {Path: "settings.json"},
+		{Path: "Klip.exe"}, {Path: "old-plugin.dll"}, {Path: "settings.json"},
 	}}
 	b, _ := json.Marshal(prev)
 	write(t, r.plan.InstalledManifest, string(b))
@@ -173,7 +173,7 @@ func TestApplyRemovesWhatThePreviousPackageHadAndLegacyFiles(t *testing.T) {
 		}
 	}
 	// Data and the program itself are never removed, whatever a list says.
-	for rel, want := range map[string]string{"settings.json": `{"MaxItems":7}`, "images/a.png": "PNG", "maccy.exe": "NEW EXE"} {
+	for rel, want := range map[string]string{"settings.json": `{"MaxItems":7}`, "images/a.png": "PNG", "Klip.exe": "NEW EXE"} {
 		if got := read(t, filepath.Join(r.install, filepath.FromSlash(rel))); got != want {
 			t.Errorf("%s = %q, want %q", rel, got, want)
 		}
@@ -198,7 +198,7 @@ func TestApplyFailsBeforeTouchingAnything(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "sha256 mismatch before copy") {
 		t.Fatalf("%v", err)
 	}
-	if read(t, filepath.Join(r.install, "maccy.exe")) != "OLD EXE" {
+	if read(t, filepath.Join(r.install, "Klip.exe")) != "OLD EXE" {
 		t.Error("the program was replaced")
 	}
 	if _, serr := os.Stat(filepath.Join(r.install, "mygo-sqlite3.dll")); serr == nil {
@@ -208,7 +208,7 @@ func TestApplyFailsBeforeTouchingAnything(t *testing.T) {
 		t.Errorf("alerts: %v", r.alerts)
 	}
 	// The old program is started again.
-	if len(r.launched) != 1 || r.launched[0] != filepath.Join(r.install, "maccy.exe") {
+	if len(r.launched) != 1 || r.launched[0] != filepath.Join(r.install, "Klip.exe") {
 		t.Errorf("launched %v", r.launched)
 	}
 }
@@ -216,7 +216,7 @@ func TestApplyFailsBeforeTouchingAnything(t *testing.T) {
 func TestApplyRollsBackAfterAFailureHalfWay(t *testing.T) {
 	r := newRig(t, newPkg, nil)
 	// "res" exists as a file, so res/x.txt cannot be written: the failure
-	// comes after maccy.exe and the dll were already replaced.
+	// comes after Klip.exe and the dll were already replaced.
 	write(t, filepath.Join(r.install, "res"), "I AM A FILE")
 	h := r.hooks()
 	copyHook := h.fill().Copy
@@ -231,8 +231,8 @@ func TestApplyRollsBackAfterAFailureHalfWay(t *testing.T) {
 	if err == nil {
 		t.Fatal("the update should have failed")
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
-		t.Errorf("maccy.exe = %q after the rollback", got)
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "OLD EXE" {
+		t.Errorf("Klip.exe = %q after the rollback", got)
 	}
 	if _, serr := os.Stat(filepath.Join(r.install, "mygo-sqlite3.dll")); serr == nil {
 		t.Error("a new file stayed after the rollback")
@@ -267,7 +267,7 @@ func TestApplyChecksTheCopies(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "sha256 mismatch after copy: mygo-sqlite3.dll") {
 		t.Fatalf("%v", err)
 	}
-	if read(t, filepath.Join(r.install, "maccy.exe")) != "OLD EXE" {
+	if read(t, filepath.Join(r.install, "Klip.exe")) != "OLD EXE" {
 		t.Error("not rolled back")
 	}
 	if _, serr := os.Stat(filepath.Join(r.install, "mygo-sqlite3.dll")); serr == nil {
@@ -297,7 +297,7 @@ func TestApplyRefusesAProtectedPathAndAMissingExe(t *testing.T) {
 	m2 := PackageManifest{AppID: "maccy", Version: "1.0.11", Runtime: "win-x64", Files: []PackageFile{{Path: "mygo-sqlite3.dll", SHA256: sha([]byte("NEW SQLITE")), Size: 10}}}
 	nb, _ = json.Marshal(m2)
 	write(t, r2.plan.PackageManifest, string(nb))
-	if err := RunPlan(r2.plan, r2.hooks()); err == nil || !strings.Contains(err.Error(), "package missing maccy.exe") {
+	if err := RunPlan(r2.plan, r2.hooks()); err == nil || !strings.Contains(err.Error(), "package missing Klip.exe") {
 		t.Fatalf("%v", err)
 	}
 }
@@ -322,7 +322,7 @@ func TestInstallerPlanStartsTheInstallerAfterExit(t *testing.T) {
 		r.launched = append(r.launched, path)
 		return nil
 	}
-	p.RestartExe = filepath.Join(r.install, "maccy.exe")
+	p.RestartExe = filepath.Join(r.install, "Klip.exe")
 	if err := RunPlan(p, h); err == nil || len(r.alerts) != 1 {
 		t.Errorf("a failing installer must be reported: %v %v", err, r.alerts)
 	}
@@ -333,15 +333,15 @@ func TestInstallerPlanStartsTheInstallerAfterExit(t *testing.T) {
 
 func TestCleanLegacy(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "maccy.exe"), "NEW")
+	write(t, filepath.Join(dir, "Klip.exe"), "NEW")
 	write(t, filepath.Join(dir, "maccy.dll"), "OLD")
 	write(t, filepath.Join(dir, "Avalonia.Base.dll"), "OLD")
 	write(t, filepath.Join(dir, "runtimes", "win-x64", "native", "x.dll"), "OLD")
 	write(t, filepath.Join(dir, "settings.json"), "DATA")
 	manifest := filepath.Join(t.TempDir(), "installed-package-files.json")
 	pm := PackageManifest{AppID: "maccy", Version: "1.0.11", Runtime: "win-x64",
-		Files:       []PackageFile{{Path: "maccy.exe"}},
-		LegacyFiles: []string{"maccy.dll", "Avalonia.Base.dll", "runtimes/win-x64/native/x.dll", "settings.json", "maccy.exe", "../outside.dll", "gone.dll"}}
+		Files:       []PackageFile{{Path: "Klip.exe"}},
+		LegacyFiles: []string{"maccy.dll", "Avalonia.Base.dll", "runtimes/win-x64/native/x.dll", "settings.json", "Klip.exe", "../outside.dll", "gone.dll"}}
 	b, _ := json.Marshal(pm)
 	write(t, manifest, string(b))
 
@@ -354,7 +354,7 @@ func TestCleanLegacy(t *testing.T) {
 			t.Errorf("%s not removed", f)
 		}
 	}
-	if read(t, filepath.Join(dir, "maccy.exe")) != "NEW" || read(t, filepath.Join(dir, "settings.json")) != "DATA" {
+	if read(t, filepath.Join(dir, "Klip.exe")) != "NEW" || read(t, filepath.Join(dir, "settings.json")) != "DATA" {
 		t.Error("the program or the data was removed")
 	}
 	// Once only.
@@ -390,7 +390,7 @@ func newCoord(t *testing.T, current string) *cRig {
 	s := newServer(t)
 	root := filepath.Join(t.TempDir(), "updates")
 	installDir := t.TempDir()
-	exe := filepath.Join(installDir, "maccy.exe")
+	exe := filepath.Join(installDir, "Klip.exe")
 	write(t, exe, "RUNNING PROGRAM")
 	r := &cRig{rig: &rig{t: t}, s: s, exe: exe}
 	r.c = NewCoordinator(fastClient(s, current), root, exe, func() { r.shut++ })
@@ -592,8 +592,8 @@ func TestCoordinatorUnsupportedSystemAndOneAtATime(t *testing.T) {
 func TestCleanOld(t *testing.T) {
 	r := newCoord(t, "1.0.10")
 	write(t, filepath.Join(r.c.Root, "helper", "h.exe"), "x")
-	write(t, filepath.Join(r.c.Root, "staging", "1.0.11-x", "maccy.exe"), "x")
-	write(t, filepath.Join(r.c.Root, "backups", "b", "maccy.exe"), "keep")
+	write(t, filepath.Join(r.c.Root, "staging", "1.0.11-x", "Klip.exe"), "x")
+	write(t, filepath.Join(r.c.Root, "backups", "b", "Klip.exe"), "keep")
 	write(t, filepath.Join(r.c.Root, "installed-package-files.json"), "{}")
 	r.c.CleanOld()
 	for _, gone := range []string{"helper", "staging"} {
@@ -601,7 +601,7 @@ func TestCleanOld(t *testing.T) {
 			t.Errorf("%s left", gone)
 		}
 	}
-	for _, kept := range []string{"backups/b/maccy.exe", "installed-package-files.json"} {
+	for _, kept := range []string{"backups/b/Klip.exe", "installed-package-files.json"} {
 		if _, err := os.Stat(filepath.Join(r.c.Root, filepath.FromSlash(kept))); err != nil {
 			t.Errorf("%s removed", kept)
 		}
@@ -677,7 +677,7 @@ func TestStalledDownloadIsGivenUp(t *testing.T) {
 
 func TestCleanOldLeavesAnUpdateUnderWayAlone(t *testing.T) {
 	r := newCoord(t, "1.0.10")
-	staged := filepath.Join(r.c.Root, "staging", "1.0.11", "maccy.exe")
+	staged := filepath.Join(r.c.Root, "staging", "1.0.11", "Klip.exe")
 	write(t, staged, "NEW")
 	r.c.mu.Lock()
 	r.c.applying = true
@@ -747,7 +747,7 @@ func TestUnwritableInstallFolderGoesToTheInstaller(t *testing.T) {
 		t.Skip("modes mean something else here")
 	}
 	r := newCoord(t, "1.0.10")
-	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "NEW EXE"}, nil)
+	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"Klip.exe": "NEW EXE"}, nil)
 	r.publish(t, "1.0.11", z, true)
 	r.c.Check(context.Background())
 	dir := filepath.Dir(r.exe)
@@ -850,7 +850,7 @@ func TestHelperGivesUpOnAProgramThatDoesNotExit(t *testing.T) {
 	if waitedFor <= 0 || waitedFor > 10*time.Minute {
 		t.Fatalf("the wait is not bounded: %v", waitedFor)
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "OLD EXE" {
 		t.Fatalf("files were touched: %q", got)
 	}
 	if _, err := os.Stat(recoveryPath(r.install)); !os.IsNotExist(err) {
@@ -927,7 +927,7 @@ func TestCommittedJournalKeepsTheNewVersion(t *testing.T) {
 	if err := RecoverInterruptedUpdate(r.install); err != nil {
 		t.Fatal(err)
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "NEW EXE" {
 		t.Fatalf("a committed update was rolled back: %q", got)
 	}
 	if _, err := os.Stat(recoveryPath(r.install)); !os.IsNotExist(err) {
@@ -946,7 +946,7 @@ func TestUncommittedJournalStillRollsBack(t *testing.T) {
 	if err := RecoverInterruptedUpdate(r.install); err != nil {
 		t.Fatal(err)
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "OLD EXE" {
 		t.Fatalf("an unfinished update was kept: %q", got)
 	}
 }
@@ -962,7 +962,7 @@ func TestCleanOldRemovesOldDownloadsAndBackups(t *testing.T) {
 	write(t, filepath.Join(r.c.Root, "maccy-1.0.12-setup.exe"), "next")
 	for i, name := range []string{"1.0.9-a", "1.0.10-b", "1.0.11-c"} {
 		dir := filepath.Join(r.c.Root, "backups", name)
-		write(t, filepath.Join(dir, "maccy.exe"), "x")
+		write(t, filepath.Join(dir, "Klip.exe"), "x")
 		at := time.Date(2026, 1, 1+i, 0, 0, 0, 0, time.UTC)
 		os.Chtimes(dir, at, at)
 	}
@@ -1026,7 +1026,7 @@ func TestResultIsWrittenBeforeTheProgramThatReadsItStarts(t *testing.T) {
 func TestInstallerStartedIsPendingNotInstalled(t *testing.T) {
 	r := newRig(t, newPkg, nil)
 	p := Plan{PID: 77, Installer: "/tmp/maccy-1.0.12-setup.exe", LogPath: r.plan.LogPath, Version: "1.0.12",
-		ResultPath: filepath.Join(r.root, "result.json"), RestartExe: filepath.Join(r.install, "maccy.exe")}
+		ResultPath: filepath.Join(r.root, "result.json"), RestartExe: filepath.Join(r.install, "Klip.exe")}
 	h := r.hooks()
 	var atInstaller *InstallResult
 	h.LaunchInstaller = func(string) error { atInstaller, _ = ReadResult(p.ResultPath); return nil }
@@ -1074,7 +1074,7 @@ func TestCommittedJournalThatCannotBeRemovedDoesNotBlockStartup(t *testing.T) {
 	if needed || err != nil {
 		t.Fatalf("startup would recover a finished update again: %v %v", needed, err)
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "NEW EXE" {
 		t.Fatalf("the new version was touched: %q", got)
 	}
 }
@@ -1110,7 +1110,7 @@ func TestFailedLaunchIsUndoneEvenWhenTheCommittedJournalIsStuck(t *testing.T) {
 	if !committed {
 		t.Fatal("the test did not reach the committed journal")
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "OLD EXE" {
 		t.Fatalf("the version that does not start was kept: %q", got)
 	}
 	if len(r.launched) != 1 {
@@ -1141,7 +1141,7 @@ func TestRollbackMarkerIsHonouredOverACommittedJournal(t *testing.T) {
 	if err := RecoverInterruptedUpdate(r.install); err != nil {
 		t.Fatal(err)
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "OLD EXE" {
 		t.Fatalf("the undo was not finished: %q", got)
 	}
 	for _, p := range []string{rollbackPath(r.install), recoveryPath(r.install)} {
@@ -1173,7 +1173,7 @@ func TestNoUndoWithoutARecordOfIt(t *testing.T) {
 	if err := RunPlan(r.plan, h); err == nil {
 		t.Fatal("a program that cannot start is a failed update")
 	}
-	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+	if got := read(t, filepath.Join(r.install, "Klip.exe")); got != "NEW EXE" {
 		t.Fatalf("files were undone with no record of it: %q", got)
 	}
 	if len(r.alerts) != 1 || !strings.Contains(r.alerts[0], "没有回滚") {

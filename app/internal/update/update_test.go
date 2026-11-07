@@ -181,7 +181,7 @@ func TestProtectedListsMatchCSharp(t *testing.T) {
 	if got, want := strings.Join(ProtectedFiles, ","), strings.Join(list("ProtectedDataFiles"), ","); got != want {
 		t.Errorf("protected files %s, C# %s", got, want)
 	}
-	for _, s := range []string{`\d+(?:\.\d+){0,3}`, `"maccy.exe"`, `"maccy"`, "TimeSpan.FromSeconds(8)", "700 * attempt", "maxAttempts: 3"} {
+	for _, s := range []string{`\d+(?:\.\d+){0,3}`, `"maccy"`, "TimeSpan.FromSeconds(8)", "700 * attempt", "maxAttempts: 3"} {
 		if !strings.Contains(string(src), s) {
 			t.Errorf("UpdateService.cs no longer contains %q: the port needs a look", s)
 		}
@@ -192,7 +192,7 @@ func TestIsProtected(t *testing.T) {
 	for p, want := range map[string]bool{
 		"settings.json": true, "Settings.JSON": true, "history.json": true, "images/a.png": true, `images\a.png`: true,
 		"FILES/1/x": true, "files": true, "blobs/aa/bb/x": true, "sync/x": true, "updates/y": true, "/images/x": true,
-		"maccy.exe": false, "imagesx/y": false, "mygo-sqlite3.dll": false, "lib/settings.json": false, "filesystem.dll": false,
+		"Klip.exe": false, "imagesx/y": false, "mygo-sqlite3.dll": false, "lib/settings.json": false, "filesystem.dll": false,
 	} {
 		if got := IsProtected(p); got != want {
 			t.Errorf("IsProtected(%q) = %v, want %v", p, got, want)
@@ -369,7 +369,7 @@ func pkgInfo(version string, zipBytes []byte, base string) Info {
 
 func TestDownloadAndPreparePackage(t *testing.T) {
 	s := newServer(t)
-	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "EXE", "mygo-sqlite3.dll": "DLL", "res/a.txt": "A"}, nil)
+	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"Klip.exe": "EXE", "mygo-sqlite3.dll": "DLL", "res/a.txt": "A"}, nil)
 	s.files["/p.zip"] = z
 	c := fastClient(s, "1.0.10")
 	root := t.TempDir()
@@ -394,7 +394,7 @@ func TestDownloadAndPreparePackage(t *testing.T) {
 
 func TestDownloadChecks(t *testing.T) {
 	s := newServer(t)
-	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "EXE"}, nil)
+	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"Klip.exe": "EXE"}, nil)
 	s.files["/p.zip"] = z
 	c := fastClient(s, "1.0.10")
 	root := t.TempDir()
@@ -437,7 +437,7 @@ func TestDownloadChecks(t *testing.T) {
 
 func TestVerifiedDownloadIsKept(t *testing.T) {
 	s := newServer(t)
-	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "EXE"}, nil)
+	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"Klip.exe": "EXE"}, nil)
 	s.files["/p.zip"] = z
 	c := fastClient(s, "1.0.10")
 	root := t.TempDir()
@@ -470,7 +470,7 @@ func prepare(t *testing.T, version string, z []byte) error {
 }
 
 func TestPackageValidationRules(t *testing.T) {
-	good := map[string]string{"maccy.exe": "EXE", "mygo-sqlite3.dll": "DLL"}
+	good := map[string]string{"Klip.exe": "EXE", "mygo-sqlite3.dll": "DLL"}
 	if err := prepare(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", good, nil)); err != nil {
 		t.Fatalf("a good package: %v", err)
 	}
@@ -482,16 +482,16 @@ func TestPackageValidationRules(t *testing.T) {
 		"version":     {zipOf(t, "1.0.12", "win-x64", good, nil), "package version mismatch"},
 		"runtime":     {zipOf(t, "1.0.11", "linux-x64", good, nil), "package runtime mismatch"},
 		"no files":    {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files = nil }), "package file list is empty"},
-		"no exe":      {zipOf(t, "1.0.11", "win-x64", map[string]string{"a.dll": "x"}, nil), "package missing maccy.exe"},
-		"protected":   {zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "x", "settings.json": "{}"}, nil), "package contains protected data path: settings.json"},
-		"protected 2": {zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "x", "images/a.png": "x"}, nil), "package contains protected data path: images/a.png"},
+		"no exe":      {zipOf(t, "1.0.11", "win-x64", map[string]string{"a.dll": "x"}, nil), "package missing Klip.exe"},
+		"protected":   {zipOf(t, "1.0.11", "win-x64", map[string]string{"Klip.exe": "x", "settings.json": "{}"}, nil), "package contains protected data path: settings.json"},
+		"protected 2": {zipOf(t, "1.0.11", "win-x64", map[string]string{"Klip.exe": "x", "images/a.png": "x"}, nil), "package contains protected data path: images/a.png"},
 		"missing": {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) {
 			m.Files = append(m.Files, PackageFile{Path: "ghost.dll", SHA256: "AA", Size: 1})
 		}), "package file missing: ghost.dll"},
-		"size":   {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].Size++ }), "package file size mismatch: " + "maccy.exe"},
-		"no sha": {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].SHA256 = " " }), "package file sha256 missing: maccy.exe"},
-		"sha":    {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].SHA256 = strings.Repeat("0", 64) }), "package file sha256 mismatch: maccy.exe"},
-		"escape": {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].Path = "../maccy.exe" }), "package path is unsafe: ../maccy.exe"},
+		"size":   {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].Size++ }), "package file size mismatch: " + "Klip.exe"},
+		"no sha": {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].SHA256 = " " }), "package file sha256 missing: Klip.exe"},
+		"sha":    {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].SHA256 = strings.Repeat("0", 64) }), "package file sha256 mismatch: Klip.exe"},
+		"escape": {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].Path = "../Klip.exe" }), "package path is unsafe: ../Klip.exe"},
 		"rooted": {zipOf(t, "1.0.11", "win-x64", good, func(m *PackageManifest) { m.Files[0].Path = "/etc/passwd" }), ""},
 	}
 	for name, c := range cases {
@@ -502,7 +502,7 @@ func TestPackageValidationRules(t *testing.T) {
 	}
 
 	// The file list is read when its names have another case or slashes.
-	mixed := zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "EXE", "sub/x.dll": "X"}, func(m *PackageManifest) {
+	mixed := zipOf(t, "1.0.11", "win-x64", map[string]string{"Klip.exe": "EXE", "sub/x.dll": "X"}, func(m *PackageManifest) {
 		for i := range m.Files {
 			m.Files[i].Path = strings.ReplaceAll(m.Files[i].Path, "/", `\`)
 			m.Files[i].SHA256 = strings.ToLower(m.Files[i].SHA256)
@@ -555,7 +555,7 @@ func TestDuplicateEntriesAreRefused(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for i := 0; i < 2; i++ {
-		w, _ := zw.Create("maccy.exe")
+		w, _ := zw.Create("Klip.exe")
 		w.Write([]byte("x"))
 	}
 	zw.Close()
@@ -568,12 +568,12 @@ func TestDuplicateEntriesAreRefused(t *testing.T) {
 
 func TestPackageListingTheSameFileTwiceIsRefused(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "maccy.exe"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "Klip.exe"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sum, _ := SHA256File(filepath.Join(dir, "maccy.exe"))
+	sum, _ := SHA256File(filepath.Join(dir, "Klip.exe"))
 	m := &PackageManifest{AppID: "maccy", Version: "1.0.11", Runtime: "win-x64",
-		Files: []PackageFile{{Path: "maccy.exe", SHA256: sum, Size: 1}, {Path: "MACCY.EXE", SHA256: sum, Size: 1}}}
+		Files: []PackageFile{{Path: "Klip.exe", SHA256: sum, Size: 1}, {Path: "KLIP.EXE", SHA256: sum, Size: 1}}}
 	err := ValidatePackage(Info{Version: "1.0.11", PackageRuntime: "win-x64"}, dir, m)
 	if err == nil || !strings.Contains(err.Error(), "twice") {
 		t.Fatalf("%v", err)
@@ -581,7 +581,7 @@ func TestPackageListingTheSameFileTwiceIsRefused(t *testing.T) {
 }
 
 func TestPackageManifestWithABOMIsRead(t *testing.T) {
-	data := append([]byte("\xef\xbb\xbf"), []byte(`{"appId":"maccy","version":"1.0.11","runtime":"win-x64","files":[{"path":"maccy.exe"}]}`)...)
+	data := append([]byte("\xef\xbb\xbf"), []byte(`{"appId":"maccy","version":"1.0.11","runtime":"win-x64","files":[{"path":"Klip.exe"}]}`)...)
 	m, err := ParsePackageManifest(data)
 	if err != nil || len(m.Files) != 1 {
 		t.Fatalf("%+v %v", m, err)
@@ -594,7 +594,7 @@ func TestWindowsAliasesOfProtectedFilesAreRefused(t *testing.T) {
 			t.Errorf("%q must be refused", p)
 		}
 	}
-	for _, p := range []string{"maccy.exe", "mygo-sqlite3.dll", "sub/dir/file.v2.txt"} {
+	for _, p := range []string{"Klip.exe", "mygo-sqlite3.dll", "sub/dir/file.v2.txt"} {
 		if _, err := NormalizePath(p); err != nil {
 			t.Errorf("%q: %v", p, err)
 		}
@@ -618,7 +618,7 @@ func TestPathThroughALinkIsRefused(t *testing.T) {
 }
 
 func TestPackageWithAnUnsafeLegacyNameIsRefusedBeforeTheHelperRuns(t *testing.T) {
-	files := map[string]string{"maccy.exe": "EXE"}
+	files := map[string]string{"Klip.exe": "EXE"}
 	for _, bad := range []string{"../old.dll", "..\\old.dll", "/etc/x", "C:/x.dll"} {
 		z := zipOf(t, "1.0.11", "win-x64", files, func(m *PackageManifest) { m.LegacyFiles = []string{bad} })
 		if err := prepare(t, "1.0.11", z); err == nil {
@@ -633,7 +633,7 @@ func TestPackageWithAnUnsafeLegacyNameIsRefusedBeforeTheHelperRuns(t *testing.T)
 
 func TestFailedPreparationLeavesNothingStaged(t *testing.T) {
 	zp := filepath.Join(t.TempDir(), "p.zip")
-	// valid zip, but no maccy.exe in the list: validation fails after unpacking
+	// valid zip, but no Klip.exe in the list: validation fails after unpacking
 	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"other.dll": "X"}, nil)
 	if err := os.WriteFile(zp, z, 0o644); err != nil {
 		t.Fatal(err)

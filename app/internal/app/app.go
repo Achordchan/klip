@@ -326,6 +326,14 @@ func (a *App) Start() {
 	a.acctCtx, a.acctCancel = context.WithCancel(ctx)
 	a.mu.Unlock()
 
+	// A start-at-sign-in entry of an earlier version that names its program
+	// file (maccy.exe, gone since 1.0.11) is pointed at this one.
+	if r, ok := a.Prefs.Autostart.(autostart.Repairer); ok {
+		if err := r.Repair(); err != nil {
+			a.cfg.Logf("autostart repair: %v", err)
+		}
+	}
+
 	// A change of the history is a reason to sync, a moment later.
 	a.History.OnChanged(func() {
 		a.syncMu.Lock()

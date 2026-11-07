@@ -336,13 +336,13 @@ func TestStartChecksForUpdatesAndCleansLegacyFiles(t *testing.T) {
 
 	root := t.TempDir()
 	install := t.TempDir()
-	exe := filepath.Join(install, "maccy.exe")
+	exe := filepath.Join(install, "Klip.exe")
 	_ = os.WriteFile(exe, []byte("exe"), 0o755)
 	_ = os.WriteFile(filepath.Join(install, "maccy.dll"), []byte("net"), 0o644)
 	_ = os.WriteFile(filepath.Join(install, "settings.json"), []byte("{}"), 0o644)
 	_ = os.MkdirAll(filepath.Join(root, "updates", "helper"), 0o755)
 	_ = os.WriteFile(filepath.Join(root, "updates", "helper", "old.exe"), []byte("x"), 0o755)
-	list := `{"appId":"maccy","version":"1.0.11","runtime":"win-x64","files":[{"path":"maccy.exe"}],"legacyFiles":["maccy.dll","settings.json"]}`
+	list := `{"appId":"maccy","version":"1.0.11","runtime":"win-x64","files":[{"path":"Klip.exe"}],"legacyFiles":["maccy.dll","settings.json"]}`
 	_ = os.WriteFile(filepath.Join(root, "updates", "installed-package-files.json"), []byte(list), 0o644)
 
 	var changed atomic.Int32

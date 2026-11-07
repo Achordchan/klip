@@ -61,6 +61,40 @@ func (r Registry) SetEnabled(on bool) error {
 	return r.Key.Set(ValueName, `"`+exe+`"`)
 }
 
+// Repairer is a Service whose entry, when there is one, can name another
+// program file than this one.
+type Repairer interface {
+	// Repair points an entry that exists at this program, and leaves no
+	// entry, or a blank one, as it is.
+	Repair() error
+}
+
+// Repair points the value at this program when it names another file. The C#
+// versions were maccy.exe, which the installer of 1.0.11 removes: a value
+// left as it was would start nothing, or, while the file is still there, the
+// old program, which would take the single-instance mutex before Klip.
+func (r Registry) Repair() error {
+	v, ok := r.Key.Get(ValueName)
+	if !ok || strings.TrimSpace(v) == "" {
+		return nil
+	}
+	exe := r.Exe
+	if exe == "" {
+		var err error
+		if exe, err = os.Executable(); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(exe) == "" {
+		return nil
+	}
+	named := strings.Trim(strings.TrimSpace(v), `"`)
+	if strings.EqualFold(filepath.Clean(named), filepath.Clean(exe)) {
+		return nil
+	}
+	return r.Key.Set(ValueName, `"`+exe+`"`)
+}
+
 // Desktop is an XDG autostart entry (Linux): a .desktop file in the user's
 // autostart folder.
 type Desktop struct {

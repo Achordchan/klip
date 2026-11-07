@@ -753,7 +753,7 @@ func CleanLegacy(installDir, installedManifest string) ([]string, error) {
 }
 
 // HelperMain runs the program as the helper when it was started as one
-// (maccy.exe --apply-update plan.json). It says whether it was; if so the
+// (Klip.exe --apply-update plan.json). It says whether it was; if so the
 // caller must exit with the code.
 func HelperMain(args []string, h Hooks) (handled bool, code int) {
 	if len(args) >= 4 && args[1] == "--recover-update" {
