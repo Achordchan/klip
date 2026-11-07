@@ -33,7 +33,7 @@ npx wrangler login
 npx wrangler d1 create klip-sync
 ```
 
-把输出里的 `database_id` 填进 `wrangler.jsonc`，替换 `REPLACE_WITH_D1_ID`。
+把输出里的 `database_id` 填进 `wrangler.jsonc` 里 `d1_databases` 那一项的 `database_id`，替换掉现在的值（仓库里填的是 Klip 线上用的数据库，换个账号部署时必须改）。
 
 ```bash
 npx wrangler r2 bucket create klip-sync

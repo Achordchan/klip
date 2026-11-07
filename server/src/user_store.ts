@@ -11,9 +11,9 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env, TierPolicy } from "./env";
 import { getTierPolicy } from "./env";
 import { hashPassword, verifyPassword } from "./crypto";
-import { setStorageBytes } from "./db";
+import { createPasswordCode, deletePasswordCode, generatePasswordCode, passwordCodeCooldown, setStorageBytes } from "./db";
 import { buildPasswordCodeMessage, sendMail } from "./smtp";
-import { DAY_MS, errorJson, hex, json, nowIso, safeSegment, sseEvent } from "./util";
+import { DAY_MS, PASSWORD_CODE_RESEND_COOLDOWN_SECONDS, errorJson, hex, json, nowIso, safeSegment, sseEvent } from "./util";
 
 const PART_SIZE = 8 * 1024 * 1024; // R2 分片上传：除最后一片外每片一样大
 
@@ -176,6 +176,8 @@ export class UserStore extends DurableObject<Env> {
   // 正在从 R2 删除的 blob（按哈希）：同一个哈希的新上传要等删除结束再开始，
   // 免得删除落在新文件写入之后。
   private blobDeletions = new Map<string, Promise<void>>();
+  // 发验证码按用途排队。
+  private codeLocks = new Map<string, Promise<unknown>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -236,11 +238,11 @@ export class UserStore extends DurableObject<Env> {
         this.sql.exec("DELETE FROM blob_uploads");
       });
     }
-    if (pending.length > 0) {
-      const published = userId ? (await this.env.BUCKET.head(manifestKey(userId)))?.customMetadata?.snapshotKey : undefined;
-      for (const row of pending) {
-        if (row.r2_key && row.r2_key === published) this.promote(row.version);
-        else this.dropPending(row.version, row.r2_key);
+    if (pending.length > 0 && userId) {
+      try {
+        await this.reconcilePending(userId);
+      } catch (e) {
+        console.error("reconcile pending snapshot failed, will retry on next upload", String(e));
       }
     }
     await this.drainCleanup();
@@ -250,6 +252,22 @@ export class UserStore extends DurableObject<Env> {
       const tier = getTierPolicy(row?.tier);
       if (tier) await this.settle(userId, tier);
       await this.flushUsage(userId); // 没有档位时也要把待写入的用量写掉
+    }
+  }
+
+  /**
+   * 处理遗留的待发布快照（发布中断，或写 manifest 时结果不明）：按 R2 里的 manifest 实际指向决定。
+   * 指向它就补成当前快照，否则撤销。读不到 manifest 就抛出，什么都不改，留到下次再判断。
+   * 调用时不能有正在进行的快照上传（DO 启动时，或拿着 snapshotLock 时）。
+   */
+  private async reconcilePending(userId: string): Promise<void> {
+    const pending = this.sql.exec<SnapshotRow>("SELECT version,created_ms,size,current,r2_key FROM snapshots WHERE current=? ORDER BY created_ms ASC", PENDING).toArray();
+    if (pending.length === 0) return;
+    const head = await this.env.BUCKET.head(manifestKey(userId)); // 失败就抛出：不在不确定时删东西
+    const published = head?.customMetadata?.snapshotKey;
+    for (const row of pending) {
+      if (row.r2_key && row.r2_key === published) this.promote(row.version);
+      else this.dropPending(row.version, row.r2_key);
     }
   }
 
@@ -321,9 +339,27 @@ export class UserStore extends DurableObject<Env> {
     return verifyPassword(stored, password);
   }
 
-  /** 发验证码邮件。TLS 握手也耗 CPU，一并放在这里。 */
-  async sendPasswordCode(email: string, code: string, purpose: string): Promise<void> {
-    await sendMail(this.env, email, buildPasswordCodeMessage(this.env, email, code, purpose));
+  /**
+   * 发验证码：冷却检查、生成、发信在这里按用途一个个来（每个用户一个 DO），
+   * 所以同时来的两个请求不会都通过冷却检查，也不会出现后生成的码先送达。
+   * 发信失败就删掉这个码并抛出。TLS 握手也耗 CPU，放在 DO 里正好。
+   */
+  async issuePasswordCode(email: string, purpose: string): Promise<{ sent: boolean; cooldownSeconds: number }> {
+    const run = (this.codeLocks.get(purpose) ?? Promise.resolve()).then(async () => {
+      const cooldown = await passwordCodeCooldown(this.env, email, purpose);
+      if (cooldown > 0) return { sent: false, cooldownSeconds: cooldown };
+      const code = generatePasswordCode();
+      const id = await createPasswordCode(this.env, email, purpose, code);
+      try {
+        await sendMail(this.env, email, buildPasswordCodeMessage(this.env, email, code, purpose));
+      } catch (e) {
+        await deletePasswordCode(this.env, id);
+        throw e;
+      }
+      return { sent: true, cooldownSeconds: PASSWORD_CODE_RESEND_COOLDOWN_SECONDS };
+    });
+    this.codeLocks.set(purpose, run.catch(() => {}));
+    return run;
   }
 
   // ---- 账目 ----
@@ -464,6 +500,8 @@ export class UserStore extends DurableObject<Env> {
     const key = blobKey(userId, sha);
     const intent = this.sql.exec<{ id: number }>("INSERT INTO blob_uploads (sha256, r2_key) VALUES (?,?) RETURNING id", sha, key).one().id;
     const quota = this.quota(tier, true);
+    let storedInR2 = false;
+    let committed = false;
     try {
       let admitted = true;
       let result: StoreResult;
@@ -478,6 +516,7 @@ export class UserStore extends DurableObject<Env> {
       }
       if (!admitted) return this.limitExceeded(tier);
       if (!result.stored) return errorJson(400, "blob sha256 mismatch");
+      storedInR2 = true;
       await this.withCommit(async () => {
         this.ctx.storage.transactionSync(() => {
           this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
@@ -485,6 +524,7 @@ export class UserStore extends DurableObject<Env> {
           this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
           this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", key);
         });
+        committed = true;
         quota.release();
         // blob 占的空间不算备份，所以备份可能因此超额：这里也清理。
         await this.settle(userId, tier);
@@ -492,8 +532,16 @@ export class UserStore extends DurableObject<Env> {
       return json({ sha256: sha, size: result.size, existing: false });
     } finally {
       quota.release();
-      // 失败的路径不会在 R2 里留下文件（streamToR2 出错会中止）；成功时这条在提交里已经删了。
-      this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
+      if (storedInR2 && !committed) {
+        // 文件已经写进 R2，但没记上账：把它交给待清理表（和删意图在同一个事务里），不能就这么丢下。
+        this.ctx.storage.transactionSync(() => {
+          this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) VALUES (?,?)", key, sha);
+          this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
+        });
+      } else {
+        // 其他失败路径不会在 R2 里留下文件（streamToR2 出错会中止）；成功时这条在提交里已经删了。
+        this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
+      }
     }
   }
 
@@ -505,9 +553,11 @@ export class UserStore extends DurableObject<Env> {
   /**
    * 上传快照：先登记成“正在发布”，写进 R2，确定放得下，写 manifest，最后才切成当前快照。
    * 任何一步失败都撤销这份待发布的快照，当前快照、manifest、备份都不动；
-   * 写完 manifest 后 DO 若被重启，recoverPublication 会把它补完。
+   * 写 manifest 的结果不明时先回读核对，读不到就保留待发布状态，留给下次上传或 DO 重启时的 reconcilePending。
    */
   private async uploadSnapshot(request: Request, userId: string, tier: TierPolicy): Promise<Response> {
+    // 先处理上次留下的、结果不明的发布（拿着 snapshotLock，没有别的快照在上传）。
+    await this.withCommit(() => this.reconcilePending(userId));
     const version = this.nextVersion();
     const key = snapshotKey(userId, version);
     this.sql.exec("INSERT INTO snapshots (version,created_ms,size,sha256,current,r2_key) VALUES (?,?,0,'',?,?)", version, Number(version), PENDING, key);
@@ -559,8 +609,19 @@ export class UserStore extends DurableObject<Env> {
           customMetadata: { snapshotKey: key },
         });
       } catch (e) {
-        await discard();
-        throw e;
+        // 写入失败也可能其实已经写进去了（只是确认没回来）：回读 manifest 核对。
+        let published: string | undefined;
+        try {
+          published = (await this.env.BUCKET.head(manifestKey(userId)))?.customMetadata?.snapshotKey;
+        } catch {
+          // 结果不明：保留这份待发布的快照，下次上传或 DO 重启时再按 manifest 判断。
+          throw e;
+        }
+        if (published !== key) {
+          await discard();
+          throw e;
+        }
+        // manifest 已经指向它：当作发布成功，继续。
       }
       this.promote(version);
       return this.settle(userId, tier);

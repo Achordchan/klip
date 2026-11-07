@@ -190,18 +190,13 @@ const passwordCode: Handler = async (req, env) => {
   }
   if (!isEmailConfigured(env)) return errorJson(503, "email service not configured");
 
-  const cooldown = await db.passwordCodeCooldown(env, email, purpose);
-  if (cooldown > 0) return json({ success: true, cooldownSeconds: cooldown });
-  const code = db.generatePasswordCode();
-  const codeId = await db.createPasswordCode(env, email, purpose, code);
   try {
-    await userStub(env, user.id).sendPasswordCode(email, code, purpose);
+    const r = await userStub(env, user.id).issuePasswordCode(email, purpose);
+    return json({ success: true, cooldownSeconds: r.cooldownSeconds });
   } catch (e) {
     console.error("send password code failed", String(e));
-    await db.deletePasswordCode(env, codeId);
     return errorJson(503, "failed to send email");
   }
-  return json({ success: true, cooldownSeconds: PASSWORD_CODE_RESEND_COOLDOWN_SECONDS });
 };
 
 async function setPassword(env: Env, userId: string, password: string): Promise<void> {
