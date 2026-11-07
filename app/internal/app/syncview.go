@@ -344,6 +344,7 @@ func (a *App) remove(pick func(items []model.Item) []model.Item) {
 			if a.subscriptionPaused() {
 				return
 			}
+			check := a.subscriptionCheck(owner)
 			subscription := a.Account.Subscription(ctx)
 			if ctx.Err() != nil || gen != a.acctGen.Load() {
 				return
@@ -351,7 +352,7 @@ func (a *App) remove(pick func(items []model.Item) []model.Item) {
 			if !subscription.Subscribed {
 				switch uploadAfterUnconfirmed(subscription) {
 				case pauseSync:
-					a.SubscriptionChanged(owner, false)
+					a.SubscriptionChanged(check, false)
 				case retrySync:
 					// Unknown (a network failure, a server error): the deletion is
 					// still owed, as after a failed upload.
@@ -360,9 +361,11 @@ func (a *App) remove(pick func(items []model.Item) []model.Item) {
 				}
 				return
 			}
+			a.SubscriptionChanged(check, true)
+			upload := a.subscriptionCheck(owner) // the upload is asked after the check
 			if _, err := a.Syncer.UploadAfterLocalMutation(ctx); err != nil && ctx.Err() == nil {
 				if errors.Is(err, syncer.ErrSubscriptionExpired) {
-					a.SubscriptionChanged(owner, false)
+					a.SubscriptionChanged(upload, false)
 					return
 				}
 				a.cfg.Logf("upload after change: %v", err)

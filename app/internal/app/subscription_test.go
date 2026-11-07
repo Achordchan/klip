@@ -15,7 +15,8 @@ func TestExpiredSubscriptionPausesWithoutFailureAndSurvivesRestart(t *testing.T)
 		s.AuthUserEmail = model.Ptr("expired@example.com")
 	})
 	owner := "expired@example.com"
-	a.runOwner.Store(&owner) // the run that found the subscription expired was for this account
+	check := a.subscriptionCheck(owner)
+	a.runSubCheck.Store(&check) // the question of the run that found the subscription expired
 	a.syncDone("startup", false, syncer.ErrSubscriptionExpired)
 	if !a.subscriptionPaused() || a.Auto.CanSync() {
 		t.Fatal("expired subscription still schedules sync")
@@ -40,10 +41,10 @@ func TestConfirmedRenewalReenablesSync(t *testing.T) {
 		s.AuthRefreshToken = model.Ptr("token")
 		s.AuthUserEmail = model.Ptr("renewed@example.com")
 	})
-	a.SubscriptionChanged("renewed@example.com", false)
+	a.SubscriptionChanged(a.BeginSubscriptionCheck(), false)
 	// Prevent a background request in this unit test while checking the state.
 	a.Auto.CanSync = func() bool { return false }
-	a.SubscriptionChanged("renewed@example.com", true)
+	a.SubscriptionChanged(a.BeginSubscriptionCheck(), true)
 	if a.subscriptionPaused() {
 		t.Fatal("confirmed renewal did not clear pause")
 	}
@@ -73,16 +74,45 @@ func TestSubscriptionAnswerOfALeftAccountChangesNothing(t *testing.T) {
 		s.AuthUserEmail = model.Ptr("b@example.com")
 	})
 	// An answer about account A comes after B signed in.
-	a.SubscriptionChanged("a@example.com", false)
+	a.SubscriptionChanged(a.subscriptionCheck("a@example.com"), false)
 	if a.subscriptionPaused() {
 		t.Fatal("A's expired subscription paused B")
 	}
-	a.SubscriptionChanged("b@example.com", false)
+	a.SubscriptionChanged(a.subscriptionCheck("b@example.com"), false)
 	if !a.subscriptionPaused() {
 		t.Fatal("B's own answer did not pause B")
 	}
-	a.SubscriptionChanged("a@example.com", true)
+	a.SubscriptionChanged(a.subscriptionCheck("a@example.com"), true)
 	if !a.subscriptionPaused() {
 		t.Fatal("A's renewal resumed B")
+	}
+}
+
+func TestOlderSubscriptionAnswerDoesNotUndoANewerOne(t *testing.T) {
+	a := newApp(t, t.TempDir(), &fakeClip{}, "http://127.0.0.1:1")
+	a.Auto.CanSync = func() bool { return false }
+	_ = a.Settings.Update(func(s *model.Settings) {
+		s.AuthRefreshToken = model.Ptr("token")
+		s.AuthUserEmail = model.Ptr("c@example.com")
+	})
+	// A sync asks first; the preferences window asks after it.
+	syncCheck := a.BeginSubscriptionCheck()
+	prefsCheck := a.BeginSubscriptionCheck()
+	// The window's "renewed" comes first (nothing to change: not paused),
+	// then the sync's older "expired".
+	a.SubscriptionChanged(prefsCheck, true)
+	a.SubscriptionChanged(syncCheck, false)
+	if a.subscriptionPaused() {
+		t.Fatal("an older expired answer paused sync after a newer renewal")
+	}
+	// In order, the newer answer wins too.
+	first, second := a.BeginSubscriptionCheck(), a.BeginSubscriptionCheck()
+	a.SubscriptionChanged(first, false)
+	if !a.subscriptionPaused() {
+		t.Fatal("expired did not pause")
+	}
+	a.SubscriptionChanged(second, true)
+	if a.subscriptionPaused() {
+		t.Fatal("the newer renewal did not resume")
 	}
 }

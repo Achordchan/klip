@@ -547,6 +547,15 @@ func (s *Service) passwordUpdated(email string, epoch int64) Result {
 	return Result{OK: true, Message: "密码已更新，请使用新密码重新登录"}
 }
 
+// SubscriptionCheck names one question to the server about the subscription:
+// the account it was asked for and its place among all such questions. It is
+// taken before the question is sent and given back with the answer, so that
+// an answer is applied only for its account and never over a newer one.
+type SubscriptionCheck struct {
+	Owner string
+	Seq   uint64
+}
+
 // Subscription is what the cloud tab shows about the plan.
 type Subscription struct {
 	Subscribed bool   // True only after the server confirms an active subscription.

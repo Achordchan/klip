@@ -42,10 +42,11 @@ type Model struct {
 	Redraw func()
 	// SyncStatus is the sync's last result, for the page (may be nil).
 	SyncStatus func() string
-	// SubscriptionChanged reports a confirmed answer about the subscription of
-	// the account Owner gave when the question was asked (both may be nil).
-	SubscriptionChanged func(owner string, active bool)
-	Owner               func() string
+	// SubscriptionChanged reports a confirmed answer about the subscription
+	// to the question BeginSubscriptionCheck named when it was asked (both
+	// may be nil).
+	SubscriptionChanged    func(c account.SubscriptionCheck, active bool)
+	BeginSubscriptionCheck func() account.SubscriptionCheck
 	// PreviewTheme applies a temporary appearance; nil restores saved settings.
 	PreviewTheme  func(*string)
 	previewValue  string
@@ -174,8 +175,8 @@ func (m *Model) async(work func(ctx context.Context) (done func())) {
 func (m *Model) loadSubscription() {
 	m.sub = account.Loading()
 	m.subGen++
-	gen := m.subGen    // an answer that comes after the account changed is not for this screen
-	owner := m.owner() // and the account the answer is about
+	gen := m.subGen         // an answer that comes after the account changed is not for this screen
+	check := m.beginCheck() // and the account and the order of the question
 	m.async(func(ctx context.Context) func() {
 		s := m.Account.Subscription(ctx)
 		return func() {
@@ -184,7 +185,7 @@ func (m *Model) loadSubscription() {
 			}
 			m.sub = s
 			if m.SubscriptionChanged != nil && (s.Subscribed || s.Status == "未订阅") {
-				m.SubscriptionChanged(owner, s.Subscribed)
+				m.SubscriptionChanged(check, s.Subscribed)
 			}
 			m.refreshAccount() // a token the server refused signs the user out
 		}
@@ -344,11 +345,12 @@ func (m *Model) redeemCard() {
 	m.redeemBusy = true
 	code := m.redeem
 	gen := m.subGen
-	owner := m.owner()
 	m.async(func(ctx context.Context) func() {
 		r := m.Account.Redeem(ctx, code)
 		var s account.Subscription
+		var check account.SubscriptionCheck
 		if r.OK {
+			check = m.beginCheck() // asked after the card went through
 			s = m.Account.Subscription(ctx)
 		}
 		return func() {
@@ -359,7 +361,7 @@ func (m *Model) redeemCard() {
 				if gen == m.subGen { // still the account the card was redeemed for
 					m.sub = s
 					if m.SubscriptionChanged != nil && s.Subscribed {
-						m.SubscriptionChanged(owner, true)
+						m.SubscriptionChanged(check, true)
 					}
 				}
 				// A card may be what the sign-in's first sync was waiting
@@ -383,9 +385,9 @@ func (m *Model) followSettings() {
 	m.syncThemePreview()
 }
 
-func (m *Model) owner() string {
-	if m.Owner == nil {
-		return ""
+func (m *Model) beginCheck() account.SubscriptionCheck {
+	if m.BeginSubscriptionCheck == nil {
+		return account.SubscriptionCheck{}
 	}
-	return m.Owner()
+	return m.BeginSubscriptionCheck()
 }

@@ -43,3 +43,30 @@ func TestWebPLosslessAndExportFormats(t *testing.T) {
 		t.Fatal("overwrote history image")
 	}
 }
+
+func TestExportTellsAnotherCaseFromTheSameFileByTheFileSystem(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "picture.png")
+	img := image.NewNRGBA(image.Rect(0, 0, 2, 2))
+	data, err := Encode(img, "png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Export(src, src); err == nil {
+		t.Fatal("the history image itself was overwritten")
+	}
+	other := filepath.Join(dir, "Picture.png")
+	a, _ := os.Stat(src)
+	b, err := os.Stat(other)
+	sameFile := err == nil && os.SameFile(a, b)
+	err = Export(src, other)
+	if sameFile && err == nil {
+		t.Fatal("on a volume that ignores case, Picture.png is the history image: it was overwritten")
+	}
+	if !sameFile && err != nil {
+		t.Fatalf("on a volume that tells case apart, Picture.png is another file: %v", err)
+	}
+}

@@ -73,7 +73,9 @@ func Export(source, target string) error {
 	if err != nil {
 		return err
 	}
-	if strings.EqualFold(src, dst) {
+	// The same path, as spelled; whether another spelling names the same file
+	// (case on a volume that ignores it, a link) is the file system's to say.
+	if filepath.Clean(src) == filepath.Clean(dst) {
 		return errors.New("请另选文件名，不能覆盖历史图片")
 	}
 	a, ae := os.Stat(src)

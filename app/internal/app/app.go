@@ -103,18 +103,23 @@ type App struct {
 	remoteDuringSync  atomic.Bool     // another device uploaded while a sync ran
 	acctCtx           context.Context
 	acctCancel        context.CancelFunc
-	changedDuringSync atomic.Bool               // the history changed while a sync ran
-	acctGen           atomic.Int64              // moves when the account changes
-	runGen            atomic.Int64              // the account generation the running sync started under
-	runOwner          atomic.Pointer[string]    // the account the running sync started for
-	retrying          atomic.Bool               // the loop that tries the first sync again is running
-	loginWanted       atomic.Bool               // a sync for a new sign-in is owed (one was running when it was asked for)
-	initialOK         atomic.Bool               // a background sync has gone through
-	runEntered        atomic.Bool               // the sync that syncDone is told about did start (Run was entered)
-	pending           pendingDeletes            // what the user deleted here, by account
-	login             atomic.Pointer[loginSeen] // see ownerLearned
-	failStreak        atomic.Int32              // background syncs that failed in a row since the initial one
-	stopWatch         context.CancelFunc        // ends the event stream of the current account
+	changedDuringSync atomic.Bool                               // the history changed while a sync ran
+	acctGen           atomic.Int64                              // moves when the account changes
+	runGen            atomic.Int64                              // the account generation the running sync started under
+	runOwner          atomic.Pointer[string]                    // the account the running sync started for
+	runSubCheck       atomic.Pointer[account.SubscriptionCheck] // the subscription question of the running sync
+
+	subMu       sync.Mutex                // orders the answers about the subscription (SubscriptionChanged)
+	subSeq      atomic.Uint64             // the last question handed out
+	subApplied  uint64                    // the newest question whose answer was applied; under subMu
+	retrying    atomic.Bool               // the loop that tries the first sync again is running
+	loginWanted atomic.Bool               // a sync for a new sign-in is owed (one was running when it was asked for)
+	initialOK   atomic.Bool               // a background sync has gone through
+	runEntered  atomic.Bool               // the sync that syncDone is told about did start (Run was entered)
+	pending     pendingDeletes            // what the user deleted here, by account
+	login       atomic.Pointer[loginSeen] // see ownerLearned
+	failStreak  atomic.Int32              // background syncs that failed in a row since the initial one
+	stopWatch   context.CancelFunc        // ends the event stream of the current account
 }
 
 // New reads the settings and the history and connects the parts. A settings
@@ -243,10 +248,13 @@ func New(cfg Config) (*App, error) {
 		}
 		a.runGen.Store(gen) // which account this sync is for
 		a.runOwner.Store(&owner)
+		a.runSubCheck.Store(nil)
 		a.replayOwnerMoves()
 		if a.subscriptionPaused() {
 			return syncer.ErrSubscriptionExpired
 		}
+		check := a.subscriptionCheck(owner)
+		a.runSubCheck.Store(&check)
 		subscription := a.Account.Subscription(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -262,6 +270,9 @@ func New(cfg Config) (*App, error) {
 		}
 		if subscription.Status == "未登录" {
 			return syncer.ErrNotLoggedIn
+		}
+		if subscription.Subscribed {
+			a.SubscriptionChanged(check, true) // newer than any answer still on its way
 		}
 
 		if err := a.pending.Ready(); err != nil {
@@ -842,8 +853,10 @@ func (a *App) syncDone(reason string, manual bool, err error) {
 		}
 	}()
 	if errors.Is(err, syncer.ErrSubscriptionExpired) && a.runGen.Load() == a.acctGen.Load() {
-		if o := a.runOwner.Load(); o != nil {
-			a.SubscriptionChanged(*o, false) // the account the run was for
+		// The question the run asked, for the account it was for. A run that
+		// found sync already paused asked nothing and has nothing to tell.
+		if c := a.runSubCheck.Load(); c != nil {
+			a.SubscriptionChanged(*c, false)
 		}
 		return
 	}

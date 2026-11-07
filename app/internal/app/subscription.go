@@ -24,30 +24,51 @@ func pausedFor(st model.Settings, owner string) bool {
 	return paused != "" && paused == owner
 }
 
-// Owner is the account signed in now ("" for none): a caller that asks the
-// server about the subscription takes it first and gives it back with the
-// answer (SubscriptionChanged).
-func (a *App) Owner() string { return a.owner() }
+// BeginSubscriptionCheck is taken before a question to the server about the
+// subscription of the account signed in now, and given back with the answer
+// (SubscriptionChanged).
+func (a *App) BeginSubscriptionCheck() account.SubscriptionCheck {
+	return a.subscriptionCheck(a.owner())
+}
+
+func (a *App) subscriptionCheck(owner string) account.SubscriptionCheck {
+	return account.SubscriptionCheck{Owner: owner, Seq: a.subSeq.Add(1)}
+}
 
 // SubscriptionChanged is called only for a confirmed server subscription
-// result, for the account owner the question was asked for. Unknown/network
-// failures must not overwrite an established entitlement state.
+// result, for the question c. Unknown/network failures must not overwrite an
+// established entitlement state.
 //
-// The answer is for that account alone: it is checked against the signed-in
+// The answer is for c's account alone: it is checked against the signed-in
 // account inside the settings update, under its lock, so an answer about an
 // account that was left meanwhile neither pauses nor resumes the next one.
-func (a *App) SubscriptionChanged(owner string, active bool) {
+// And it is applied only if no newer question has been answered: a sync's
+// "expired" that arrives after the preferences window confirmed a renewal
+// is out of date and changes nothing. An answer that changes nothing still
+// counts as the newest.
+func (a *App) SubscriptionChanged(c account.SubscriptionCheck, active bool) {
+	owner := c.Owner
 	if owner == "" || a.Settings == nil {
 		return
 	}
-	if st := a.Settings.Get(); ownerOf(st) != owner || pausedFor(st, owner) == !active {
-		return // not this account's, or nothing to change
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	if c.Seq <= a.subApplied {
+		return // a newer answer was applied
 	}
-	changed, was := false, false
+	if ownerOf(a.Settings.Get()) != owner {
+		return // not this account's
+	}
+	if pausedFor(a.Settings.Get(), owner) == !active {
+		a.subApplied = c.Seq
+		return // nothing to change
+	}
+	changed, was, mine := false, false, false
 	if err := a.Settings.Update(func(st *model.Settings) {
 		if ownerOf(*st) != owner {
 			return // the account changed since the check above
 		}
+		mine = true
 		was = pausedFor(*st, owner)
 		if was == !active {
 			return
@@ -65,6 +86,9 @@ func (a *App) SubscriptionChanged(owner string, active bool) {
 		st.Extra = extra
 	}); err != nil {
 		a.cfg.Logf("subscription pause persistence: %v", err)
+	}
+	if mine {
+		a.subApplied = c.Seq
 	}
 	if !changed || a.owner() != owner {
 		return // the rest is for the account the answer was about, still signed in
