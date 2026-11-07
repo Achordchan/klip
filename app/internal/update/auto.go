@@ -2,6 +2,8 @@ package update
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -157,14 +159,18 @@ func (c *Coordinator) InstallPrepared(decide func(commit func() bool)) error {
 	if err := c.countAttempt(prep.Version); err != nil {
 		return fail(err) // not counted, not tried: a loop could not be stopped
 	}
-	if err := c.startPackage(prep, true); err != nil {
+	commitFile, err := c.newCommitPath(prep.Version)
+	if err != nil {
+		return fail(err) // counted, as a helper that could not be started
+	}
+	if err := c.startPackage(prep, commitFile); err != nil {
 		return fail(err)
 	}
 	committed := false
 	decide(func() bool {
 		// The helper installs only if this exists when the program is gone:
 		// written now, at the one moment the program quits for the update.
-		if err := c.writeCommit(c.commitPath(), quietMarker{Version: prep.Version, At: c.now()}); err != nil {
+		if err := c.writeCommit(commitFile, quietMarker{Version: prep.Version, At: c.now()}); err != nil {
 			return false // not committed: the helper will not install, and is stopped
 		}
 		committed = true
@@ -245,9 +251,35 @@ func (c *Coordinator) writeCommit(path string, v any) error {
 	return writeJSON(path, v)
 }
 
-// commitPath is the program's leave to the helper of a quiet install
-// (Plan.CommitFile).
-func (c *Coordinator) commitPath() string { return filepath.Join(c.Root, "quiet-install-commit.json") }
+// newCommitPath names the program's leave to the helper of one quiet install
+// (Plan.CommitFile). The name is new for each attempt: a leave an earlier
+// attempt wrote, and that could not be removed (a scanner holding it), can
+// never pass for this one's. A file already at the name is refused all the
+// same.
+func (c *Coordinator) newCommitPath(version string) (string, error) {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	path := filepath.Join(c.Root, fmt.Sprintf("%s%s-%s.json", commitPrefix, version, hex.EncodeToString(nonce[:])))
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("the commit file cannot be set up: %s exists or cannot be checked (%v)", path, err)
+	}
+	return path, nil
+}
+
+const commitPrefix = "quiet-install-commit-"
+
+// removeCommits removes the leaves earlier quiet installs left. Each was for
+// its own attempt only, so what is left is of no use; one that cannot be
+// removed is harmless.
+func removeCommits(root string) {
+	old, _ := filepath.Glob(filepath.Join(root, commitPrefix+"*.json"))
+	for _, f := range old {
+		_ = os.Remove(f)
+	}
+	_ = os.Remove(filepath.Join(root, "quiet-install-commit.json")) // the one fixed name used before
+}
 
 // QuietRelaunch says whether this start is the one an update made after the
 // program quit for it without the user (the new version, or the old one put

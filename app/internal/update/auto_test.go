@@ -404,6 +404,55 @@ func TestQuietHelperDoesNothingWhenTheProgramExitsWithoutCommitting(t *testing.T
 	}
 }
 
+// A leave an earlier attempt left behind, which could not be removed, does
+// not authorize the next attempt: each has a commit file of its own.
+func TestLeftoverCommitDoesNotAuthorizeTheNextAttempt(t *testing.T) {
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	planOf := func() Plan {
+		t.Helper()
+		if err := r.c.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var plan Plan
+		r.c.StopHelper = func() {}
+		r.spawn = nil
+		err := r.c.InstallPrepared(func(commit func() bool) {
+			p, err := ReadPlan(r.spawn[0][1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan = p
+		})
+		if !errors.Is(err, errCalledOff) {
+			t.Fatalf("not called off: %v", err)
+		}
+		return plan
+	}
+	first := planOf()
+	// The first attempt's leave, and one at the name used before, are there
+	// (written, then not removed), as is anything an interrupted helper left.
+	for _, f := range []string{first.CommitFile, filepath.Join(r.c.Root, "quiet-install-commit.json")} {
+		if err := writeJSON(f, quietMarker{Version: "1.0.11"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second := planOf()
+	if second.CommitFile == "" || second.CommitFile == first.CommitFile {
+		t.Fatalf("the attempts share a commit file: %q", second.CommitFile)
+	}
+	rr := &rig{t: t}
+	if err := RunPlan(second, rr.hooks()); err == nil || read(t, r.exe) != "RUNNING PROGRAM" {
+		t.Fatalf("a leftover leave let the helper install: %v %q", err, read(t, r.exe))
+	}
+	// CleanOld takes the leftovers away.
+	r.c.CleanOld()
+	if left, _ := filepath.Glob(filepath.Join(r.c.Root, "quiet-install-commit*.json")); len(left) != 0 {
+		t.Fatalf("leftover commit files: %v", left)
+	}
+}
+
 func TestCommitThatCannotBeWrittenIsNoCommit(t *testing.T) {
 	r := newCoord(t, "1.0.10")
 	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)

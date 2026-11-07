@@ -303,7 +303,7 @@ func (c *Coordinator) Apply(ctx context.Context) {
 			prep, err = c.Client.DownloadPackage(ctx, *info, c.Root, progress)
 		}
 		if err == nil {
-			err = c.startPackage(prep, false)
+			err = c.startPackage(prep, "")
 			if err == nil {
 				c.done()
 				return
@@ -495,7 +495,10 @@ func (c *Coordinator) stopHelper() error {
 	return f()
 }
 
-func (c *Coordinator) startPackage(p *Prepared, quiet bool) error {
+// startPackage starts the helper on p. A quiet install passes commitFile, the
+// file the helper must find before it touches anything (Plan.CommitFile); it
+// is a new name for each attempt, never one a file can already be at.
+func (c *Coordinator) startPackage(p *Prepared, commitFile string) error {
 	for _, f := range p.Manifest.Files {
 		target, err := insideRoot(filepath.Dir(c.Exe), f.Path)
 		if err != nil {
@@ -519,11 +522,8 @@ func (c *Coordinator) startPackage(p *Prepared, quiet bool) error {
 		LogPath:           filepath.Join(c.Root, "last_light_update.log"),
 		Version:           p.Version,
 		ResultPath:        c.ResultPath(),
-		Quiet:             quiet,
-	}
-	if quiet {
-		plan.CommitFile = c.commitPath()
-		_ = os.Remove(plan.CommitFile) // one left by an install called off
+		Quiet:             commitFile != "",
+		CommitFile:        commitFile,
 	}
 	return c.launchPlan(plan, p.Version)
 }
@@ -570,6 +570,7 @@ func (c *Coordinator) CleanOld() {
 	}
 	_ = os.RemoveAll(filepath.Join(c.Root, "helper"))
 	_ = os.RemoveAll(filepath.Join(c.Root, "staging"))
+	removeCommits(c.Root)
 	c.removeOldDownloads(filepath.Join(c.Root, "packages"))
 	c.removeOldDownloads(c.Root)
 	keepNewestBackup(filepath.Join(c.Root, "backups"))
