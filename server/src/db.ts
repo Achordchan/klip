@@ -64,6 +64,20 @@ export async function insertRefreshToken(env: Env, tokenHash: string, userId: st
 }
 
 /**
+ * 登录时发刷新令牌：只在用户的密码哈希仍是刚才验证过的那个时才插入。
+ * 验证和插入之间如果密码被改了（改密码会同时作废全部令牌），这里就插不进去，
+ * 旧密码换不到一个能活过改密码的令牌。返回是否插入成功。
+ */
+export async function insertRefreshTokenIfPassword(env: Env, tokenHash: string, userId: string, expiresAt: string, passwordHash: string): Promise<boolean> {
+  const r = await env.DB.prepare(
+    "INSERT INTO refresh_tokens (token_hash,user_id,expires_at,created_at,revoked_at) SELECT ?, id, ?, ?, NULL FROM users WHERE id=? AND password_hash=?",
+  )
+    .bind(tokenHash, expiresAt, nowIso(), userId, passwordHash)
+    .run();
+  return r.meta.changes === 1;
+}
+
+/**
  * 用旧的刷新令牌换一个新的：作废旧的和插入新的在同一个事务里（D1 的 batch），
  * 插入只在作废真的改到一行时生效。所以改密码时的“全部作废”不可能夹在两步中间，
  * 也不会让一个已被作废的令牌换出新令牌。返回令牌所属的用户；旧令牌无效时返回 null。

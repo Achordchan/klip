@@ -53,7 +53,11 @@ export async function verifyJwt(
 
 const PRF_HASH: Record<number, string> = { 0: "SHA-1", 1: "SHA-256", 2: "SHA-512" };
 const DEFAULT_PRF = 2;
-const DEFAULT_ITERATIONS = 100_000; // workerd 的 PBKDF2 上限也是 100000
+// workerd 的 PBKDF2 单次调用最多 100000 次迭代，而且迭代是在一次调用里完成的，没法拆开接着算。
+// 所以迭代次数更高的哈希在这里验证不了。这个后端没有导入任何旧账号：库里所有哈希都是它自己按
+// 100000 次生成的。将来如果要从别处导入账号，迭代次数超过 100000 的那些需要用户找回密码，
+// 或者由管理员在后台重置（POST /admin/user/reset-password），见 server/README.md。
+const DEFAULT_ITERATIONS = 100_000;
 const SALT_SIZE = 16;
 const SUBKEY_LENGTH = 32;
 
@@ -103,6 +107,7 @@ export async function verifyPassword(stored: string, password: string): Promise<
   const iterations = u32(view, 5);
   const saltLength = u32(view, 9);
   const hash = PRF_HASH[prf];
+  // 超过 100000 次的哈希验证不了（见 DEFAULT_ITERATIONS 的说明），按密码错误处理。
   if (!hash || saltLength < 16 || iterations < 1 || iterations > DEFAULT_ITERATIONS) return false;
   if (decoded.length < 13 + saltLength + 16) return false;
   const salt = decoded.slice(13, 13 + saltLength);

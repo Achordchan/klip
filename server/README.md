@@ -70,6 +70,10 @@ npx wrangler deploy
 
 `wrangler.jsonc` 里的 `routes` 会把 Worker 绑到 `klip.achord.cn`，Cloudflare 自动建 DNS 记录和证书（`achord.cn` 需要托管在同一个 Cloudflare 账号下）。
 
+## 密码哈希的限制
+
+密码用 PBKDF2-SHA512、100000 次迭代存储（ASP.NET Core Identity v3 格式）。Workers 运行时的 PBKDF2 单次最多只能算 100000 次迭代，所以迭代次数更高的哈希在这里无法验证，会被当作密码错误。目前库里的哈希都是这个后端自己按 100000 次生成的，不受影响。将来如果从别处导入账号，迭代次数更高的用户需要走“找回密码”，或者由管理员在后台重置密码（`POST /admin/user/reset-password`）。
+
 ## 日常
 
 - 改了代码：`npx wrangler deploy`

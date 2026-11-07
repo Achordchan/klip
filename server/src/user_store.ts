@@ -211,6 +211,7 @@ export class UserStore extends DurableObject<Env> {
     `);
     const cols = this.sql.exec<{ name: string }>("PRAGMA table_info(snapshots)").toArray();
     if (!cols.some((c) => c.name === "r2_key")) this.sql.exec("ALTER TABLE snapshots ADD COLUMN r2_key TEXT");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS idx_snapshots_current ON snapshots (current)");
     const cleanupCols = this.sql.exec<{ name: string }>("PRAGMA table_info(cleanup)").toArray();
     if (!cleanupCols.some((c) => c.name === "blob_sha")) this.sql.exec("ALTER TABLE cleanup ADD COLUMN blob_sha TEXT");
     ctx.blockConcurrencyWhile(() => this.recoverPublication());
@@ -370,8 +371,17 @@ export class UserStore extends DurableObject<Env> {
     return s + this.blobBytes();
   }
 
+  /**
+   * blob 总字节数：存在 meta 里的计数，和记 blob 在同一个事务里更新。
+   * 上传时每收到一块数据都要查一次，不能每次都对整张 blobs 表求和。
+   */
   private blobBytes(): number {
-    return this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM blobs").one().n;
+    const row = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='blob_bytes'").toArray()[0];
+    if (row) return Number(row.v);
+    // 第一次用（或旧数据）：算一次存起来。
+    const n = this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM blobs").one().n;
+    this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes',?)", String(n));
+    return n;
   }
 
   /** 当前快照占的空间。发布过程中按新旧两份里较大的算，宁可多算。 */
@@ -500,7 +510,6 @@ export class UserStore extends DurableObject<Env> {
     const key = blobKey(userId, sha);
     const intent = this.sql.exec<{ id: number }>("INSERT INTO blob_uploads (sha256, r2_key) VALUES (?,?) RETURNING id", sha, key).one().id;
     const quota = this.quota(tier, true);
-    let storedInR2 = false;
     let committed = false;
     try {
       let admitted = true;
@@ -516,10 +525,11 @@ export class UserStore extends DurableObject<Env> {
       }
       if (!admitted) return this.limitExceeded(tier);
       if (!result.stored) return errorJson(400, "blob sha256 mismatch");
-      storedInR2 = true;
       await this.withCommit(async () => {
         this.ctx.storage.transactionSync(() => {
-          this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
+          const before = this.blobBytes();
+          const inserted = this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?) RETURNING size", sha, result.size).toArray().length > 0;
+          if (inserted) this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes',?)", String(before + result.size));
           this.markUsageDirty();
           this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
           this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", key);
@@ -532,15 +542,14 @@ export class UserStore extends DurableObject<Env> {
       return json({ sha256: sha, size: result.size, existing: false });
     } finally {
       quota.release();
-      if (storedInR2 && !committed) {
-        // 文件已经写进 R2，但没记上账：把它交给待清理表（和删意图在同一个事务里），不能就这么丢下。
+      if (!committed) {
+        // 没记上账：R2 里可能有文件也可能没有（写入失败时也可能其实写进去了），
+        // 一律交给待清理表（和删意图在同一个事务里）。删一个不存在的 key 没有副作用；
+        // 同一个哈希已经记账或正在上传的，drainCleanup 不会删它。
         this.ctx.storage.transactionSync(() => {
           this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) VALUES (?,?)", key, sha);
           this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
         });
-      } else {
-        // 其他失败路径不会在 R2 里留下文件（streamToR2 出错会中止）；成功时这条在提交里已经删了。
-        this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
       }
     }
   }

@@ -152,7 +152,13 @@ const login: Handler = async (req, env) => {
   const user = await db.getUserByEmail(env, normalizeEmail(p.email));
   if (!user) return errorJson(400, "invalid email or password");
   if (!(await userStub(env, user.id).verifyPassword(user.password_hash, str(p.password)))) return errorJson(400, "invalid email or password");
-  return json(await issueTokens(env, user.id, user.email));
+  // 刷新令牌只在密码哈希没被改过时才发（验证期间密码被重置的话，这次登录作废）。
+  const refreshToken = newRefreshToken();
+  if (!(await db.insertRefreshTokenIfPassword(env, await sha256Hex(refreshToken.token), user.id, refreshToken.expiresAt, user.password_hash))) {
+    return errorJson(400, "invalid email or password");
+  }
+  const access = await accessTokenFor(env, user.id, user.email);
+  return json({ accessToken: access.accessToken, refreshToken: refreshToken.token, accessTokenExpiresAt: access.accessTokenExpiresAt, email: user.email, userId: user.id });
 };
 
 const refresh: Handler = async (req, env) => {
