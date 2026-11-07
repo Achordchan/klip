@@ -1,10 +1,11 @@
 name: Build and release
 
-# Every pull request and push to main: the tests on Windows, the release
-# files, the installer over a C# installation, and a real unattended update
-# from this version to the next. A tag v<version> does the same and then
-# publishes the GitHub release, whose manifest.json the installed versions
-# read (releases/latest/download/manifest.json).
+# Every pull request and push to main: on Windows the tests, the release
+# files, the installer over a C# installation and a real unattended update
+# from this version to the next; on macOS the tests and the apps for Apple
+# silicon and Intel, started once. A tag v<version> does the same and then
+# publishes the GitHub release with all of them, and the manifest.json the
+# installed versions read (releases/latest/download/manifest.json).
 on:
   pull_request:
   push:
@@ -23,8 +24,8 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 60
-    permissions:
-      contents: write # the release, on a tag only
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     defaults:
       run:
         shell: pwsh
@@ -86,13 +87,88 @@ jobs:
           path: artifacts/release/
           if-no-files-found: error
 
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
+      - name: Version
+        id: version
+        run: |
+          v=$(sed -n 's/.*Version = "\([0-9.]*\)".*/\1/p' app/internal/version/version.go)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Go vet (macOS)
+        working-directory: app
+        run: go vet ./...
+
+      - name: Go tests (macOS)
+        working-directory: app
+        run: go test ./... -count=1
+
+      - name: Apps for Apple silicon and Intel
+        run: |
+          bash tools/package_mac.sh ${{ steps.version.outputs.version }} arm64 artifacts/mac
+          bash tools/package_mac.sh ${{ steps.version.outputs.version }} amd64 artifacts/mac
+
+      - name: Start the app once
+        run: |
+          # A home of its own: the app's data and settings go there.
+          home="$RUNNER_TEMP/klip-home"; mkdir -p "$home"
+          app="artifacts/mac/Klip-${{ steps.version.outputs.version }}-mac-$( [ "$(uname -m)" = arm64 ] && echo arm64 || echo x64 )/Klip.app/Contents/MacOS/Klip"
+          HOME="$home" "$app" > "$RUNNER_TEMP/klip.log" 2>&1 &
+          pid=$!
+          sleep 20
+          alive=0; kill -0 "$pid" 2>/dev/null && alive=1
+          kill "$pid" 2>/dev/null || true
+          cat "$RUNNER_TEMP/klip.log"
+          [ "$alive" = 1 ] || { echo "the app did not keep running"; exit 1; }
+          [ -f "$home/Library/Application Support/Klip/history.json" ] || { echo "the app wrote no history"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Klip-${{ steps.version.outputs.version }}-mac
+          path: artifacts/mac/*.zip
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Manifest with every system's package
+        run: |
+          v="${{ needs.windows.outputs.version }}"
+          rm -f release/manifest.json
+          python tools/release_go.py manifest --version "$v" --dir release --notes-file "docs/release-notes/v$v.md"
+          ls -l release
+
       - name: Publish the release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $v = "${{ steps.version.outputs.version }}"
+          v="${{ needs.windows.outputs.version }}"
           # All files in one call: the release is published only once they are
           # all there, so "latest" never points at a release without its manifest.
-          gh release create "v$v" --verify-tag --title "Klip $v" --notes-file "docs/release-notes/v$v.md" `
-            "artifacts/release/Klip-$v-setup.exe" "artifacts/release/Klip-$v-win-x64.zip" "artifacts/release/manifest.json"
+          gh release create "v$v" --verify-tag --title "Klip $v" --notes-file "docs/release-notes/v$v.md" \
+            "release/Klip-$v-setup.exe" "release/Klip-$v-win-x64.zip" \
+            "release/Klip-$v-mac-arm64.zip" "release/Klip-$v-mac-x64.zip" "release/manifest.json"

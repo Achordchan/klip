@@ -6,10 +6,13 @@ Klip 是一个剪贴板管理工具：记下你复制过的文字、图片和文
 
 ## 下载
 
-到 [Releases](https://github.com/Achordchan/klip/releases/latest) 下载 `Klip-<版本>-setup.exe`，运行即可（Windows 10 / 11，64 位）。
+到 [Releases](https://github.com/Achordchan/klip/releases/latest) 下载：
+
+- **Windows 10 / 11（64 位）**：`Klip-<版本>-setup.exe`，运行即可。
+- **macOS 12 及以上**：Apple 芯片用 `Klip-<版本>-mac-arm64.zip`，Intel 芯片用 `Klip-<版本>-mac-x64.zip`。解压后把 Klip 拖进“应用程序”。Mac 版暂未签名，第一次打开时系统会拦下：到“系统设置 → 隐私与安全性”，点 Klip 旁边的“仍要打开”。Mac 版暂时不能自动更新，有新版本时会提示下载地址。
 
 - 装好后按 `Ctrl + Alt + 2` 呼出面板。
-- **自动更新是无感的**：有新版本时 Klip 在后台下载好，等你离开电脑几分钟、窗口都关着时自动换上并重新启动；装不上会回到原来的版本。
+- **Windows 上的自动更新是无感的**：有新版本时 Klip 在后台下载好，等你离开电脑几分钟、窗口都关着时自动换上并重新启动；装不上会回到原来的版本。
 - **从旧版（1.0.10 及更早）升级**：旧版不会自动收到新版本，请下载安装包直接覆盖安装。历史、设置、登录状态、云同步和开机启动都会保留。
 
 ## 功能
@@ -29,8 +32,9 @@ Klip 是一个剪贴板管理工具：记下你复制过的文字、图片和文
 | `nas-agent-py/` | 同步后端（FastAPI），部署见 [`docs/deploy/baota-python-nas-agent.md`](docs/deploy/baota-python-nas-agent.md) |
 | `installer/klip.iss` | Inno Setup 安装包脚本 |
 | `tools/release_go.py` | 构建与打包：`Klip.exe`、安装包、更新包、更新清单 |
+| `tools/package_mac.sh` | macOS 的 `Klip.app` 与 zip（Apple 芯片 / Intel） |
 | `tools/e2e_update.py` | Windows 上的端到端测试：覆盖安装旧版、无人值守地自动更新到下一个版本 |
-| `.github/workflows/release.yml` | GitHub Actions：测试、构建、端到端测试，推送 tag 时发布 |
+| `.github/workflows/release.yml` | GitHub Actions：Windows 与 macOS 上测试、构建，Windows 上跑端到端测试，推送 tag 时发布 |
 | `docs/release-notes/` | 每个版本的发布说明 |
 | `klip/` | 旧的 C# 客户端（1.0.10 及更早），只作参考 |
 
@@ -54,7 +58,7 @@ python3 tools/release_go.py build --version 1.0.11 --publish-dir /path/to/out
 
 1. 修改 `app/internal/version/version.go` 里的版本号，写好 `docs/release-notes/v<版本>.md`，合并到 `main`。
 2. 推送 tag：`git tag v<版本> && git push origin v<版本>`。
-3. GitHub Actions 在 Windows 上跑全部测试、构建安装包和更新包、跑端到端更新测试，全部通过后发布 Release。已安装的 Klip 从最新 Release 的 `manifest.json` 得知新版本。
+3. GitHub Actions 在 Windows 和 macOS 上跑全部测试，构建 Windows 安装包、更新包和两个 Mac 包，在 Windows 上跑端到端更新测试、在 macOS 上把应用启动一次，全部通过后一起发布 Release。已安装的 Klip 从最新 Release 的 `manifest.json` 得知新版本，清单里每个系统各有自己的包。
 
 ## 同步后端
 

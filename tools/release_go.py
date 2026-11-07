@@ -309,13 +309,28 @@ def build_installer(version: str, runtime: str, iscc_arg: str | None, publish_di
     return out
 
 
+# The zips of macOS, by update runtime (update.CurrentRuntime): a Mac is not
+# updated by itself, but its update window offers the zip of its own kind.
+MAC_ZIP = re.compile(r"Klip-(?P<v>[0-9.]+)-mac-(?P<arch>arm64|x64)\.zip")
+
+
 def write_manifest(path: Path, *, version: str, mandatory: bool, notes: str, base_url: str,
-                   installer: Path, package: Path, runtime: str) -> None:
+                   installer: Path, package: Path, runtime: str, others: list[Path] | None = None) -> None:
     """The update manifest (update.Manifest) of this release, with the
     addresses of its own files: base_url/v<version>/<file name>. Never the
     "latest" address: a client that read this manifest must get these very
-    files, whatever has been released since."""
+    files, whatever has been released since. others are the zips of the
+    other systems (macOS), listed with the Windows package under "packages",
+    where each client takes the one of its runtime."""
     root = base_url.rstrip("/") + f"/v{version}/"
+    entries = [{"kind": "zip", "runtime": runtime, "url": root + package.name,
+                "sha256": sha256_file(package), "size": package.stat().st_size}]
+    for z in others or []:
+        m = MAC_ZIP.fullmatch(z.name)
+        if not m or m["v"] != version:
+            raise ValueError(f"{z.name} is not a macOS zip of {version}")
+        entries.append({"kind": "zip", "runtime": "osx-" + m["arch"], "url": root + z.name,
+                        "sha256": sha256_file(z), "size": z.stat().st_size})
     data = {
         "appId": "maccy",
         "latest": {
@@ -324,10 +339,11 @@ def write_manifest(path: Path, *, version: str, mandatory: bool, notes: str, bas
             "notes": notes,
             "publishedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "installer": {"url": root + installer.name, "sha256": sha256_file(installer), "size": installer.stat().st_size},
-            "package": {"kind": "zip", "runtime": runtime, "url": root + package.name,
-                        "sha256": sha256_file(package), "size": package.stat().st_size},
+            "package": entries[0],
         },
     }
+    if len(entries) > 1:
+        data["latest"]["packages"] = entries
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -393,11 +409,33 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--publish-dir", default="")
     r.add_argument("--out-dir", default="")
 
+    mf = sub.add_parser("manifest", help="manifest.json of a release from its files (the macOS zips among them)")
+    common(mf)
+    mf.add_argument("--dir", required=True, help="the folder with the release's files; manifest.json is written there")
+    mf.add_argument("--notes", default="")
+    mf.add_argument("--notes-file", default="")
+    mf.add_argument("--mandatory", action="store_true")
+    mf.add_argument("--base-url", default=RELEASES)
+
     a = ap.parse_args(argv)
     version = base._validate_version(a.version)
     if a.cmd == "build":
         build_publish(version, a.runtime, (Path(a.publish_dir) if a.publish_dir else REPO / "artifacts" / "publish" / a.runtime).resolve(),
                       a.manifest_url)
+        return 0
+    if a.cmd == "manifest":
+        d = Path(a.dir).resolve()
+        notes = Path(a.notes_file).read_text(encoding="utf-8") if a.notes_file else a.notes
+        notes = notes.replace("\r\n", "\n").strip("\n")
+        installer = d / f"Klip-{version}-setup.exe"
+        package = d / f"Klip-{version}-{a.runtime}.zip"
+        for f in (installer, package):
+            if not f.is_file():
+                raise FileNotFoundError(str(f))
+        macs = sorted(p for p in d.iterdir() if MAC_ZIP.fullmatch(p.name))
+        write_manifest(d / "manifest.json", version=version, mandatory=a.mandatory, notes=notes, base_url=a.base_url,
+                       installer=installer, package=package, runtime=a.runtime, others=macs)
+        print(json.dumps({"manifest": str(d / "manifest.json"), "macos": [p.name for p in macs]}))
         return 0
     if a.cmd == "package":
         pub = (Path(a.publish_dir) if a.publish_dir else REPO / "artifacts" / "publish" / a.runtime).resolve()

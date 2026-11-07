@@ -339,3 +339,50 @@ else:
 		t.Error("an old build folder with user data was offered for clearing")
 	}
 }
+
+// A release with the zips of macOS: each client is offered its own package,
+// Windows the one it installs, a Mac the zip of its kind (for its update
+// window, which cannot install it and names it).
+func TestReleaseManifestOffersEachSystemItsPackage(t *testing.T) {
+	tool := releaseTool(t)
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"Klip-1.0.12-setup.exe": "SETUP", "Klip-1.0.12-win-x64.zip": "WIN",
+		"Klip-1.0.12-mac-arm64.zip": "ARM", "Klip-1.0.12-mac-x64.zip": "INTEL",
+	} {
+		write(t, filepath.Join(dir, name), body)
+	}
+	if res, err := exec.Command("python3", tool, "manifest", "--version", "1.0.12", "--dir", dir, "--notes", "n").CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, res)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := ParseManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "https://github.com/Achordchan/klip/releases/download/v1.0.12/"
+	for rt, file := range map[string]string{"win-x64": "Klip-1.0.12-win-x64.zip", "osx-arm64": "Klip-1.0.12-mac-arm64.zip", "osx-x64": "Klip-1.0.12-mac-x64.zip"} {
+		r := (&Client{Current: "1.0.11", Runtime: rt}).decide(m)
+		if r.Status != UpdateAvailable || r.Info.PackageURL != base+file || !r.Info.HasSupportedPackage(rt) {
+			t.Errorf("%s: %+v", rt, r.Info)
+		}
+		sha, _ := SHA256File(filepath.Join(dir, file))
+		if !strings.EqualFold(r.Info.PackageSHA256, sha) {
+			t.Errorf("%s: sha %s, file %s", rt, r.Info.PackageSHA256, sha)
+		}
+	}
+	// The one package of the manifest, for a client that reads no list, is
+	// the Windows one.
+	if m.Latest.Package == nil || m.Latest.Package.URL != base+"Klip-1.0.12-win-x64.zip" {
+		t.Fatalf("package %+v", m.Latest.Package)
+	}
+	// A Mac cannot install it: its update window names the zip of its kind.
+	c := NewCoordinator(&Client{Current: "1.0.11", Runtime: "osx-arm64"}, t.TempDir(), filepath.Join(t.TempDir(), "Klip"), nil)
+	c.Supported = false
+	if got := c.manualURL((&Client{Current: "1.0.11", Runtime: "osx-arm64"}).decide(m).Info); got != base+"Klip-1.0.12-mac-arm64.zip" {
+		t.Fatalf("a Mac is sent to %s", got)
+	}
+}
