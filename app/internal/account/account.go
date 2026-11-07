@@ -549,12 +549,13 @@ func (s *Service) passwordUpdated(email string, epoch int64) Result {
 
 // Subscription is what the cloud tab shows about the plan.
 type Subscription struct {
-	Status    string // 订阅至 2026-01-02, 已订阅, 未订阅, 未登录, 查询失败, 正在读取中...
-	Tier      string
-	Storage   string
-	Retention string
-	Limit     string // 正常 / 已超限（可能影响同步）
-	OverLimit bool
+	Subscribed bool   // True only after the server confirms an active subscription.
+	Status     string // 订阅至 2026-01-02, 已订阅, 未订阅, 未登录, 查询失败, 正在读取中...
+	Tier       string
+	Storage    string
+	Retention  string
+	Limit      string // 正常 / 已超限（可能影响同步）
+	OverLimit  bool
 }
 
 // Loading is the placeholder while the server is asked.
@@ -590,7 +591,7 @@ func (s *Service) Subscription(ctx context.Context) Subscription {
 	if !st.Subscribed {
 		return None("未订阅")
 	}
-	out := Subscription{Status: "已订阅"}
+	out := Subscription{Subscribed: true, Status: "已订阅"}
 	if st.ExpiresAt != nil {
 		if t, ok := parseTime(*st.ExpiresAt); ok {
 			out.Status = "订阅至 " + t.Format("2006-01-02")

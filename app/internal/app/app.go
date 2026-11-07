@@ -220,6 +220,7 @@ func New(cfg Config) (*App, error) {
 		},
 	})
 	a.Auto = syncer.NewAuto(a.Syncer, a.syncDone)
+	a.Auto.CanSync = func() bool { return a.Syncer.CanAutoSync() && !a.subscriptionPaused() }
 	// Every sync is counted while it runs, so that Stop can wait for them (they
 	// start their own goroutines inside Auto).
 	a.Auto.Begin = a.syncBegin
@@ -243,6 +244,26 @@ func New(cfg Config) (*App, error) {
 		a.runGen.Store(gen) // which account this sync is for
 		a.runOwner.Store(&owner)
 		a.replayOwnerMoves()
+		if a.subscriptionPaused() {
+			return syncer.ErrSubscriptionExpired
+		}
+		subscription := a.Account.Subscription(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if gen != a.acctGen.Load() {
+			return syncer.ErrSessionChanged
+		}
+		if subscription.Status == "未订阅" {
+			return syncer.ErrSubscriptionExpired
+		}
+		if subscription.Status == "查询失败" {
+			return errors.New("无法确认订阅状态")
+		}
+		if subscription.Status == "未登录" {
+			return syncer.ErrNotLoggedIn
+		}
+
 		if err := a.pending.Ready(); err != nil {
 			return err
 		}
@@ -401,6 +422,9 @@ const stopWait = 3 * time.Second
 // only starts after it, and a program started offline would otherwise wait for
 // another device to speak first.
 func (a *App) retryStartup(ctx context.Context) {
+	if a.subscriptionPaused() {
+		return
+	}
 	if !a.retrying.CompareAndSwap(false, true) {
 		return // one loop is enough
 	}
@@ -411,7 +435,7 @@ func (a *App) retryStartup(ctx context.Context) {
 			a.retrying.Store(false)
 			// A sign-in may have asked for a loop while this one was ending: look
 			// again after letting go, so that one of the two is always left.
-			if ctx.Err() == nil && !a.initialOK.Load() {
+			if ctx.Err() == nil && !a.initialOK.Load() && !a.subscriptionPaused() {
 				a.retryStartup(ctx)
 			}
 		}()
@@ -425,7 +449,7 @@ func (a *App) retryStartup(ctx context.Context) {
 				return
 			case <-time.After(wait):
 			}
-			if a.initialOK.Load() {
+			if a.initialOK.Load() || a.subscriptionPaused() {
 				return
 			}
 			a.Auto.Trigger(a.acct(), "startup", false)
@@ -446,6 +470,10 @@ func (a *App) watchRemote(ctx context.Context) {
 	}
 	a.stopWatch = cancel
 	a.mu.Unlock()
+	if a.subscriptionPaused() {
+		cancel()
+		return
+	}
 	a.done.Add(1)
 	go func() {
 		defer a.done.Done()
@@ -722,6 +750,9 @@ func (a *App) Apply(it model.Item) error {
 
 // SyncNow is the user asking for a sync.
 func (a *App) SyncNow() {
+	if a.subscriptionPaused() {
+		return
+	}
 	// The status and the bar are set when the run starts (Auto.Begin): a request
 	// that is turned away because one is still unwinding changes nothing.
 	a.Auto.Trigger(a.acct(), "manual", true)
@@ -810,6 +841,13 @@ func (a *App) syncDone(reason string, manual bool, err error) {
 			a.syncing.Add(-1)
 		}
 	}()
+	if errors.Is(err, syncer.ErrSubscriptionExpired) && a.runGen.Load() == a.acctGen.Load() {
+		a.SubscriptionChanged(false)
+		return
+	}
+	if a.subscriptionPaused() {
+		return
+	}
 	a.syncMu.Lock()
 	changed, remote := a.changedDuringSync.Load(), a.remoteDuringSync.Load()
 	if err == nil {
