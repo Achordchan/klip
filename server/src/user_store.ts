@@ -9,6 +9,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env, TierPolicy } from "./env";
+import { getTierPolicy } from "./env";
 import { hashPassword, verifyPassword } from "./crypto";
 import { setStorageBytes } from "./db";
 import { buildPasswordCodeMessage, sendMail } from "./smtp";
@@ -193,6 +194,9 @@ export class UserStore extends DurableObject<Env> {
         k TEXT PRIMARY KEY,
         v TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS cleanup (
+        r2_key TEXT PRIMARY KEY
+      );
     `);
     const cols = this.sql.exec<{ name: string }>("PRAGMA table_info(snapshots)").toArray();
     if (!cols.some((c) => c.name === "r2_key")) this.sql.exec("ALTER TABLE snapshots ADD COLUMN r2_key TEXT");
@@ -205,16 +209,42 @@ export class UserStore extends DurableObject<Env> {
    */
   private async recoverPublication(): Promise<void> {
     const pending = this.sql.exec<SnapshotRow>("SELECT version,created_ms,size,current,r2_key FROM snapshots WHERE current=?", PENDING).toArray();
-    if (pending.length === 0) return;
+    const hasCleanup = this.sql.exec("SELECT 1 FROM cleanup LIMIT 1").toArray().length > 0;
+    if (pending.length === 0 && !hasCleanup) return;
     const userId = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='user'").toArray()[0]?.v;
-    const published = userId ? (await this.env.BUCKET.head(manifestKey(userId)))?.customMetadata?.snapshotKey : undefined;
-    for (const row of pending) {
-      if (row.r2_key && row.r2_key === published) {
-        this.promote(row.version);
-      } else {
-        if (row.r2_key) await this.env.BUCKET.delete(row.r2_key).catch(() => {});
-        this.sql.exec("DELETE FROM snapshots WHERE version=?", row.version);
+    if (pending.length > 0) {
+      const published = userId ? (await this.env.BUCKET.head(manifestKey(userId)))?.customMetadata?.snapshotKey : undefined;
+      for (const row of pending) {
+        if (row.r2_key && row.r2_key === published) this.promote(row.version);
+        else this.dropPending(row.version, row.r2_key);
       }
+    }
+    await this.drainCleanup();
+    // 恢复改了账目：按用户现在的档位补做一次收尾（清理备份、更新 D1 用量）。
+    if (userId) {
+      const row = await this.env.DB.prepare("SELECT tier FROM users WHERE id=?").bind(userId).first<{ tier: string | null }>();
+      const tier = getTierPolicy(row?.tier);
+      if (tier) await this.settle(userId, tier);
+    }
+  }
+
+  /** 撤销一份待发布的快照：先把它的 R2 文件记进待清理表（和删记录在同一个事务里），再去删文件。 */
+  private dropPending(version: string, r2Key: string | null): void {
+    this.ctx.storage.transactionSync(() => {
+      if (r2Key) this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key) VALUES (?)", r2Key);
+      this.sql.exec("DELETE FROM snapshots WHERE version=? AND current=?", version, PENDING);
+    });
+  }
+
+  /** 删掉待清理表里的 R2 文件；删成功才去掉记录，失败的留到下次（每次提交和 DO 启动时都会再试）。 */
+  private async drainCleanup(): Promise<void> {
+    const keys = this.sql.exec<{ r2_key: string }>("SELECT r2_key FROM cleanup LIMIT ?", R2_DELETE_BATCH).toArray().map((r) => r.r2_key);
+    if (keys.length === 0) return;
+    try {
+      await this.env.BUCKET.delete(keys);
+      for (const k of keys) this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", k);
+    } catch (e) {
+      console.error("r2 cleanup failed, will retry", String(e));
     }
   }
 
@@ -297,6 +327,7 @@ export class UserStore extends DurableObject<Env> {
 
   /** 提交的收尾：清理备份（失败只记日志，下次提交会再清），再把用量写到 D1。只在 withCommit 里调用。 */
   private async settle(userId: string, tier: TierPolicy): Promise<{ pruned: { count: number; bytes: number }; storageBytes: number }> {
+    await this.drainCleanup();
     let pruned = { count: 0, bytes: 0 };
     try {
       pruned = await this.pruneBackups(userId, tier);
@@ -355,28 +386,33 @@ export class UserStore extends DurableObject<Env> {
       await request.body?.cancel();
       return json({ sha256: sha, size: existing.size, existing: true });
     }
+    // 额度一直占着，直到 blob 在提交里记进账目才释放：排队等提交的这段时间里，
+    // 别的上传也看得到这部分空间已经被占用。
     const quota = this.quota(tier, true);
-    let admitted = true;
-    let result: StoreResult;
     try {
-      result = await streamToR2(this.env.BUCKET, blobKey(userId, sha), request.body, this.isGzip(request), {
-        expectedSha256: sha,
-        admit: (size) => (admitted = quota.admit(size)),
+      let admitted = true;
+      let result: StoreResult;
+      try {
+        result = await streamToR2(this.env.BUCKET, blobKey(userId, sha), request.body, this.isGzip(request), {
+          expectedSha256: sha,
+          admit: (size) => (admitted = quota.admit(size)),
+        });
+      } catch (e) {
+        if (e instanceof GzipError) return errorJson(400, "invalid gzip payload");
+        throw e;
+      }
+      if (!admitted) return this.limitExceeded(tier);
+      if (!result.stored) return errorJson(400, "blob sha256 mismatch");
+      await this.withCommit(async () => {
+        this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
+        quota.release();
+        // blob 占的空间不算备份，所以备份可能因此超额：这里也清理。
+        await this.settle(userId, tier);
       });
-    } catch (e) {
-      if (e instanceof GzipError) return errorJson(400, "invalid gzip payload");
-      throw e;
+      return json({ sha256: sha, size: result.size, existing: false });
     } finally {
       quota.release();
     }
-    if (!admitted) return this.limitExceeded(tier);
-    if (!result.stored) return errorJson(400, "blob sha256 mismatch");
-    await this.withCommit(async () => {
-      this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
-      // blob 占的空间不算备份，所以备份可能因此超额：这里也清理。
-      await this.settle(userId, tier);
-    });
-    return json({ sha256: sha, size: result.size, existing: false });
   }
 
   private nextVersion(): string {
@@ -394,8 +430,8 @@ export class UserStore extends DurableObject<Env> {
     const key = snapshotKey(userId, version);
     this.sql.exec("INSERT INTO snapshots (version,created_ms,size,sha256,current,r2_key) VALUES (?,?,0,'',?,?)", version, Number(version), PENDING, key);
     const discard = async () => {
-      this.sql.exec("DELETE FROM snapshots WHERE version=? AND current=?", version, PENDING);
-      await this.env.BUCKET.delete(key).catch(() => {});
+      this.dropPending(version, key);
+      await this.drainCleanup();
     };
 
     const quota = this.quota(tier, false);

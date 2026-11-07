@@ -63,15 +63,22 @@ export async function insertRefreshToken(env: Env, tokenHash: string, userId: st
     .run();
 }
 
-/** 把一个有效的刷新令牌作废并返回它的用户；无效就返回 null。 */
-export async function consumeRefreshToken(env: Env, tokenHash: string): Promise<string | null> {
+/**
+ * 用旧的刷新令牌换一个新的：作废旧的和插入新的在同一个事务里（D1 的 batch），
+ * 插入只在作废真的改到一行时生效。所以改密码时的“全部作废”不可能夹在两步中间，
+ * 也不会让一个已被作废的令牌换出新令牌。返回令牌所属的用户；旧令牌无效时返回 null。
+ */
+export async function rotateRefreshToken(env: Env, oldHash: string, newHash: string, expiresAt: string): Promise<{ id: string; email: string } | null> {
   const now = nowIso();
-  const row = await env.DB.prepare(
-    "UPDATE refresh_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL AND expires_at > ? RETURNING user_id",
-  )
-    .bind(now, tokenHash, now)
-    .first<{ user_id: string }>();
-  return row?.user_id ?? null;
+  const [, , owner] = await env.DB.batch([
+    env.DB.prepare("UPDATE refresh_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL AND expires_at > ?").bind(now, oldHash, now),
+    env.DB.prepare(
+      "INSERT INTO refresh_tokens (token_hash,user_id,expires_at,created_at,revoked_at) " +
+        "SELECT ?, r.user_id, ?, ?, NULL FROM refresh_tokens r JOIN users u ON u.id = r.user_id WHERE r.token_hash=? AND changes() = 1",
+    ).bind(newHash, expiresAt, now, oldHash),
+    env.DB.prepare("SELECT u.id, u.email FROM refresh_tokens r JOIN users u ON u.id = r.user_id WHERE r.token_hash=?").bind(newHash),
+  ]);
+  return (owner.results[0] as { id: string; email: string } | undefined) ?? null;
 }
 
 // ---- 订阅与卡密 ----
@@ -196,14 +203,17 @@ export async function passwordCodeCooldown(env: Env, email: string, purpose: str
   return remaining <= 0 ? 0 : Math.max(1, Math.ceil(remaining));
 }
 
+/** 发新验证码：同一邮箱同一用途之前还没用的码一并作废，只有最新的这个有效。 */
 export async function createPasswordCode(env: Env, email: string, purpose: string, code: string): Promise<string> {
   const id = newId();
   const now = Date.now();
-  await env.DB.prepare(
-    "INSERT INTO password_verification_codes (id,email,purpose,code_hash,expires_at,attempts,used_at,created_at) VALUES (?,?,?,?,?,0,NULL,?)",
-  )
-    .bind(id, normalizeEmail(email), purpose, await hashPasswordCode(email, purpose, code), new Date(now + PASSWORD_CODE_TTL_MINUTES * 60_000).toISOString(), new Date(now).toISOString())
-    .run();
+  const nowText = new Date(now).toISOString();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE password_verification_codes SET used_at=? WHERE email=? AND purpose=? AND used_at IS NULL").bind(nowText, normalizeEmail(email), purpose),
+    env.DB.prepare(
+      "INSERT INTO password_verification_codes (id,email,purpose,code_hash,expires_at,attempts,used_at,created_at) VALUES (?,?,?,?,?,0,NULL,?)",
+    ).bind(id, normalizeEmail(email), purpose, await hashPasswordCode(email, purpose, code), new Date(now + PASSWORD_CODE_TTL_MINUTES * 60_000).toISOString(), nowText),
+  ]);
   return id;
 }
 
@@ -219,13 +229,14 @@ export async function deletePasswordCode(env: Env, id: string): Promise<void> {
 export async function verifyPasswordCode(env: Env, email: string, purpose: string, code: string): Promise<string | null> {
   const normalizedEmail = normalizeEmail(email);
   const normalizedCode = code.trim();
+  // 只看最新的那个码，用过了就拒绝：不会退回去用更早的码。
   const row = await env.DB.prepare(
-    "SELECT id,code_hash,expires_at FROM password_verification_codes " +
-      "WHERE email=? AND purpose=? AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
+    "SELECT id,code_hash,expires_at,used_at FROM password_verification_codes " +
+      "WHERE email=? AND purpose=? ORDER BY created_at DESC LIMIT 1",
   )
     .bind(normalizedEmail, purpose)
-    .first<{ id: string; code_hash: string; expires_at: string }>();
-  if (!row) return "invalid or expired code";
+    .first<{ id: string; code_hash: string; expires_at: string; used_at: string | null }>();
+  if (!row || row.used_at) return "invalid or expired code";
 
   const now = nowIso();
   const retire = () => env.DB.prepare("UPDATE password_verification_codes SET used_at=? WHERE id=? AND used_at IS NULL").bind(now, row.id).run();

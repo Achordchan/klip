@@ -80,7 +80,7 @@ async function requireAdmin(request: Request, env: Env): Promise<{ email: string
   return { email: normalizeEmail(claims.email) || adminEmail || "admin", authType: "password", accessTokenExpiresAt: exp };
 }
 
-async function issueTokens(env: Env, userId: string, email: string) {
+async function accessTokenFor(env: Env, userId: string, email: string) {
   const now = Date.now();
   const iat = Math.floor(now / 1000);
   const accessExpires = now + ACCESS_TOKEN_HOURS * HOUR_MS;
@@ -95,10 +95,18 @@ async function issueTokens(env: Env, userId: string, email: string) {
     iat,
     exp: Math.floor(accessExpires / 1000),
   };
-  const accessToken = await signJwt(claims, env.AUTH_SIGNING_KEY);
-  const refreshToken = base64UrlEncode(randomBytes(32));
-  await db.insertRefreshToken(env, await sha256Hex(refreshToken), userId, new Date(now + REFRESH_TOKEN_DAYS * DAY_MS).toISOString());
-  return { accessToken, refreshToken, accessTokenExpiresAt: new Date(accessExpires).toISOString(), email, userId };
+  return { accessToken: await signJwt(claims, env.AUTH_SIGNING_KEY), accessTokenExpiresAt: new Date(accessExpires).toISOString() };
+}
+
+function newRefreshToken() {
+  return { token: base64UrlEncode(randomBytes(32)), expiresAt: new Date(Date.now() + REFRESH_TOKEN_DAYS * DAY_MS).toISOString() };
+}
+
+async function issueTokens(env: Env, userId: string, email: string) {
+  const refreshToken = newRefreshToken();
+  await db.insertRefreshToken(env, await sha256Hex(refreshToken.token), userId, refreshToken.expiresAt);
+  const access = await accessTokenFor(env, userId, email);
+  return { accessToken: access.accessToken, refreshToken: refreshToken.token, accessTokenExpiresAt: access.accessTokenExpiresAt, email, userId };
 }
 
 /** 订阅有效且分配了档位才能同步。 */
@@ -151,11 +159,11 @@ const refresh: Handler = async (req, env) => {
   const p = await readJson(req);
   const token = p?.refreshToken;
   if (typeof token !== "string" || !token.trim()) return errorJson(400, "missing refresh token");
-  const userId = await db.consumeRefreshToken(env, await sha256Hex(token.trim()));
-  if (!userId) return httpError(401);
-  const user = await db.getUserById(env, userId);
+  const fresh = newRefreshToken();
+  const user = await db.rotateRefreshToken(env, await sha256Hex(token.trim()), await sha256Hex(fresh.token), fresh.expiresAt);
   if (!user) return httpError(401);
-  return json(await issueTokens(env, user.id, user.email));
+  const access = await accessTokenFor(env, user.id, user.email);
+  return json({ accessToken: access.accessToken, refreshToken: fresh.token, accessTokenExpiresAt: access.accessTokenExpiresAt, email: user.email, userId: user.id });
 };
 
 const me: Handler = async (req, env) => {
