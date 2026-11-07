@@ -21,7 +21,7 @@ const AppID = "maccy"
 
 // ExeName is the program file that a package must contain and that is
 // started after an update. Klip 1.0.11, the first release from GitHub, is the
-// first to be called so (Klip.exe before): every later version must keep it,
+// first to be called so (maccy.exe before): every later version must keep it,
 // as the version installed checks for it.
 const ExeName = "Klip.exe"
 
@@ -29,6 +29,10 @@ const ExeName = "Klip.exe"
 type Manifest struct {
 	AppID  string  `json:"appId"`
 	Latest Release `json:"latest"`
+	// Mirrors are the prefixes of the GitHub proxies the clients may use
+	// beside GitHub itself (see Client.Mirrors). Read from a signed manifest
+	// only, and kept: a release can replace the ones that died.
+	Mirrors []string `json:"mirrors,omitempty"`
 }
 
 // Release is the newest version.

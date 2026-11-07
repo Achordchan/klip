@@ -154,9 +154,32 @@ func (c *Client) download(ctx context.Context, url, target, wantSHA string, want
 		}
 		return nil
 	}
+	// GitHub and the proxies, fastest first as the check found them: a route
+	// that fails, stalls or delivers another file is left for the next one.
+	addrs := c.addresses(url)
+	if len(addrs) == 0 {
+		addrs = []string{url}
+	}
+	var err error
+	for i, addr := range addrs {
+		more := i < len(addrs)-1
+		if err = c.downloadFrom(ctx, addr, target, wantSHA, wantSize, progress, more); err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
+}
+
+// downloadFrom fetches target from one address and checks it. With more
+// routes left it gives up sooner (two tries, 20 s of silence), for them.
+func (c *Client) downloadFrom(ctx context.Context, url, target, wantSHA string, wantSize int64, progress Progress, more bool) error {
 	temp := target + ".download"
 	_ = os.Remove(temp)
-	_, err := retry(ctx, 3, c.downloadPause, func(int) (struct{}, error) {
+	attempts := 3
+	if more {
+		attempts = 2
+	}
+	_, err := retry(ctx, attempts, c.downloadPause, func(int) (struct{}, error) {
 		_ = os.Remove(temp)
 		// A transfer that stops for a while is given up and tried again: the
 		// timer is pushed back at every piece that arrives.
@@ -165,6 +188,9 @@ func (c *Client) download(ctx context.Context, url, target, wantSHA string, want
 		idle := c.DownloadIdle
 		if idle <= 0 {
 			idle = 60 * time.Second
+			if more {
+				idle = 20 * time.Second
+			}
 		}
 		watchdog := time.AfterFunc(idle, cancel)
 		defer watchdog.Stop()

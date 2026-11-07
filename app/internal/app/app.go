@@ -59,6 +59,9 @@ type Config struct {
 	Exe string
 	// ManifestURL is the update manifest (UpdateManifestURL when empty).
 	ManifestURL string
+	// UpdateKey is the public key of the manifest's signature, base64
+	// (update.ReleaseKey when empty): tests sign with a key of their own.
+	UpdateKey string
 	// UpdateFirst and UpdateEvery time the check for a new version (6 s and
 	// 12 h unless a test sets them).
 	UpdateFirst, UpdateEvery time.Duration
@@ -73,10 +76,13 @@ type Config struct {
 // UpdateManifestURL is where the update manifest is published: an asset of
 // the newest GitHub release (drafts and prereleases are not "latest"), so
 // that a release and what it tells the installed versions go out together.
-// Every version from 1.0.11 on reads this address: it must not move. It is a
-// variable only so that a test build can be pointed at a local server
-// (-ldflags -X, see tools/e2e_update.py); the releases never set it.
-var UpdateManifestURL = "https://github.com/Achordchan/klip/releases/latest/download/manifest.json"
+// From 1.0.12 on it is the signed one (update.Envelope), fetched through
+// GitHub and its proxies (update.DefaultMirrors) at once; 1.0.11 reads
+// manifest.json beside it. Every version reads its address for ever: it must
+// not move. It is a variable only so that a test build can be pointed at a
+// local server (-ldflags -X, see tools/e2e_update.py); the releases never
+// set it.
+var UpdateManifestURL = "https://github.com/Achordchan/klip/releases/latest/download/manifest.signed.json"
 
 // App is the program without windows.
 type App struct {
@@ -294,7 +300,17 @@ func New(cfg Config) (*App, error) {
 	if exe == "" {
 		exe, _ = os.Executable()
 	}
-	a.Updates = update.NewCoordinator(&update.Client{ManifestURL: manifestURL, Current: version.Version},
+	updateKey := cfg.UpdateKey
+	if updateKey == "" {
+		updateKey = update.ReleaseKey
+	}
+	key, err := update.ParsePublicKey(updateKey)
+	if err != nil {
+		return nil, fmt.Errorf("app: update key: %w", err)
+	}
+	a.Updates = update.NewCoordinator(&update.Client{ManifestURL: manifestURL, Current: version.Version,
+		PublicKey: key, Mirrors: update.DefaultMirrors,
+		MirrorsFile: filepath.Join(cfg.Layout.Root, "updates", "mirrors.json")},
 		filepath.Join(cfg.Layout.Root, "updates"), exe, func() {
 			if cfg.Quit != nil {
 				cfg.Quit()

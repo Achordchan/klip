@@ -133,7 +133,7 @@ def check_disposable(publish_dir: Path) -> None:
             raise RuntimeError(f"refusing to clear {pub}: {rel} is not something a build makes")
 
 
-def build_publish(version: str, runtime: str, publish_dir: Path, manifest_url: str = "") -> None:
+def build_publish(version: str, runtime: str, publish_dir: Path, manifest_url: str = "", release_key: str = "") -> None:
     """Klip.exe (a Windows GUI program with icon and version) and the SQLite
     library, in publish_dir. manifest_url is for a test build only (the end to
     end test of an update, tools/e2e_update.py): a release reads the address
@@ -155,6 +155,8 @@ def build_publish(version: str, runtime: str, publish_dir: Path, manifest_url: s
         ldflags = f"-s -w -H=windowsgui -X klip/internal/version.Version={version}"
         if manifest_url:
             ldflags += f" -X klip/internal/app.UpdateManifestURL={manifest_url}"
+        if release_key:
+            ldflags += f" -X klip/internal/update.ReleaseKey={release_key}"
         run(["go", "build", "-trimpath", "-ldflags", ldflags,
              "-o", str(publish_dir / EXE), "./cmd/klip"],
             cwd=APP, env={"GOOS": "windows", "GOARCH": arch, "CGO_ENABLED": "0"})
@@ -391,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
     common(b)
     b.add_argument("--publish-dir", default="")
     b.add_argument("--manifest-url", default="", help="test builds only: the update manifest to read")
+    b.add_argument("--release-key", default="", help="test builds only: the public key its manifest is signed with")
 
     pk = sub.add_parser("package", help="the light-update zip from a publish folder")
     common(pk)
@@ -421,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     version = base._validate_version(a.version)
     if a.cmd == "build":
         build_publish(version, a.runtime, (Path(a.publish_dir) if a.publish_dir else REPO / "artifacts" / "publish" / a.runtime).resolve(),
-                      a.manifest_url)
+                      a.manifest_url, a.release_key)
         return 0
     if a.cmd == "manifest":
         d = Path(a.dir).resolve()

@@ -179,7 +179,8 @@ func TestTheManifestAddressIsTheNewestGitHubRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := strings.TrimSuffix(releases, "/download") + "/latest/download/manifest.json"
+	// The signed one (1.0.12 on); 1.0.11 reads manifest.json beside it.
+	want := strings.TrimSuffix(releases, "/download") + "/latest/download/manifest.signed.json"
 	if !strings.Contains(string(src), `var UpdateManifestURL = "`+want+`"`) {
 		t.Fatalf("app.UpdateManifestURL is not %s", want)
 	}

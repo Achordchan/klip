@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -29,6 +31,7 @@ import (
 	"klip/internal/settings"
 	"klip/internal/syncclient"
 	"klip/internal/syncer"
+	"klip/internal/update"
 )
 
 type fakeClip struct {
@@ -329,8 +332,13 @@ func TestPrefsAndAccountAreWired(t *testing.T) {
 // A newer version on the manifest is found a little after the start, quietly,
 // and the files of the old program are cleaned once.
 func TestStartChecksForUpdatesAndCleansLegacyFiles(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	signed, err := update.SignManifest(priv, []byte(`{"appId":"maccy","latest":{"version":"99.0.0","notes":"n","installer":{"url":"http://x/setup.exe"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	manifest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"appId":"maccy","latest":{"version":"99.0.0","notes":"n","installer":{"url":"http://x/setup.exe"}}}`))
+		w.Write(signed)
 	}))
 	defer manifest.Close()
 
@@ -348,7 +356,8 @@ func TestStartChecksForUpdatesAndCleansLegacyFiles(t *testing.T) {
 	var changed atomic.Int32
 	a, err := New(Config{Layout: paths.Layout{Root: root}, Clipboard: &fakeClip{}, ChangeSeq: (&fakeClip{}).seq.Load,
 		Interval: 5 * time.Millisecond, BaseURL: "http://127.0.0.1:1", Logf: t.Logf,
-		Exe: exe, ManifestURL: manifest.URL, UpdateFirst: 20 * time.Millisecond, UpdateEvery: time.Hour,
+		Exe: exe, ManifestURL: manifest.URL, UpdateKey: base64.StdEncoding.EncodeToString(pub),
+		UpdateFirst: 20 * time.Millisecond, UpdateEvery: time.Hour,
 		Changed: func() { changed.Add(1) }})
 	if err != nil {
 		t.Fatal(err)
