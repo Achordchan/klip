@@ -18,8 +18,13 @@ settings.json, a sign-in entry naming maccy.exe), and checks that the old
 program files are gone, the sign-in entry names Klip.exe and the data is
 still there.
 
-It uses this user's real data folder (%LOCALAPPDATA%\\maccy): run it on a
-machine made for tests (CI), never on one with a Klip in use.
+The program's data is a folder of the test's own (LOCALAPPDATA is set for
+the program, and so for the helper and the version it starts): the user's
+history is never touched. What cannot be kept apart is still this Windows
+user's: the sign-in entry (HKCU Run "maccy", put back as it was) and the
+installer's entry under the installed programs (removed by its uninstaller).
+So it runs only on a machine made for it: in GitHub Actions, or with
+--disposable-machine. It stops only the Klip processes it started.
 """
 from __future__ import annotations
 
@@ -61,16 +66,28 @@ def file_version(path: Path) -> str:
 
 
 def klip_processes() -> list[str]:
-    """The paths of the running Klip.exe processes."""
+    """The paths of the running Klip.exe and helper processes."""
     out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                          "Get-Process -Name Klip -ErrorAction SilentlyContinue | ForEach-Object { $_.Path }"],
+                          "Get-Process -Name Klip, klip-update-* -ErrorAction SilentlyContinue | ForEach-Object { $_.Path }"],
                          capture_output=True, text=True).stdout
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def stop_klip() -> None:
-    subprocess.run(["taskkill", "/F", "/IM", "Klip.exe"], capture_output=True)
-    subprocess.run(["taskkill", "/F", "/IM", "klip-update-*"], capture_output=True)
+def inside(path: str, folder: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(folder.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def stop_klip(work: Path) -> None:
+    """Stops the Klip processes started from the test's folder, no other."""
+    folder = str(work.resolve()).replace("'", "''")
+    subprocess.run(["powershell", "-NoProfile", "-Command",
+                    "Get-Process -Name Klip, klip-update-* -ErrorAction SilentlyContinue | "
+                    f"Where-Object {{ $_.Path -and $_.Path.StartsWith('{folder}', 'OrdinalIgnoreCase') }} | Stop-Process -Force"],
+                   capture_output=True)
 
 
 def show(path: Path) -> None:
@@ -107,6 +124,17 @@ def delete_run_value() -> None:
 
 
 def check_installer(installer: Path, work: Path) -> None:
+    saved = run_value()
+    try:
+        install_over_csharp(installer, work)
+    finally:
+        if saved is None:
+            delete_run_value()
+        else:
+            set_run_value(saved)
+
+
+def install_over_csharp(installer: Path, work: Path) -> None:
     """The installer over a folder of the C# program: the old program files
     go, the user's data stays, Klip.exe is there."""
     target = work / "installed-over-csharp"
@@ -135,12 +163,11 @@ def check_installer(installer: Path, work: Path) -> None:
     entry = run_value()
     if (entry or "").lower() != f'"{target / release_go.EXE}"'.lower():
         problems.append(f"the sign-in entry is {entry!r}, not the program installed")
-    delete_run_value()
     if problems:
         show(log)
         raise SystemExit("installer: " + "; ".join(problems))
     print("installer: Klip.exe installed, the C# program files removed, the sign-in entry moved to it, the data kept")
-    stop_klip()
+    stop_klip(work)
     uninstaller = target / "unins000.exe"
     if uninstaller.exists():
         subprocess.run([str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
@@ -150,17 +177,26 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", required=True, help="the version installed")
     ap.add_argument("--installer", default="", help="a setup to check first (see above)")
-    ap.add_argument("--work", default="", help="folder for the builds (a new temporary one when empty)")
+    ap.add_argument("--work", default="", help="folder for the builds and the program's data (a new temporary one when empty)")
+    ap.add_argument("--disposable-machine", action="store_true",
+                    help="run outside GitHub Actions: this Windows user's sign-in entry and installed programs are changed for a while")
     a = ap.parse_args()
     if os.name != "nt":
         raise SystemExit("this test runs on Windows")
+    if not (a.disposable_machine or os.environ.get("GITHUB_ACTIONS") == "true"):
+        raise SystemExit("this test changes this Windows user's sign-in entry and installed programs: "
+                         "run it in GitHub Actions, or pass --disposable-machine on a machine made for it")
     current, upcoming = a.version, next_version(a.version)
     work = Path(a.work) if a.work else Path(tempfile.mkdtemp(prefix="klip-e2e-"))
     work.mkdir(parents=True, exist_ok=True)
-    data = Path(os.environ["LOCALAPPDATA"]) / "maccy"
+    # The program's data, and the helper it starts, in the test's folder.
+    local = work / "localappdata"
+    data = local / "maccy"
     updates = data / "updates"
-
-    stop_klip()
+    others = [p for p in klip_processes() if not inside(p, work)]
+    if others:
+        # It would hold the single-instance mutex, and it is somebody's.
+        raise SystemExit(f"close the Klip that is running first: {others}")
     if a.installer:
         check_installer(Path(a.installer).resolve(), work)
 
@@ -182,7 +218,7 @@ def main() -> int:
     install = work / "install"
     shutil.copytree(work / "current", install)
     if data.exists():
-        shutil.rmtree(data)
+        shutil.rmtree(data)  # the test's own, from an earlier run in this folder
     updates.mkdir(parents=True)
     # Started as an update leaves it: no window. The panel would be in front,
     # and an open panel holds the update back (the user is using Klip).
@@ -196,7 +232,8 @@ def main() -> int:
 
     print("[3/4] start", current, "and wait for the update")
     out = open(work / "klip-current.log", "w", encoding="utf-8")
-    subprocess.Popen([str(install / release_go.EXE)], cwd=str(install), stdout=out, stderr=subprocess.STDOUT)
+    env = dict(os.environ, LOCALAPPDATA=str(local))
+    subprocess.Popen([str(install / release_go.EXE)], cwd=str(install), stdout=out, stderr=subprocess.STDOUT, env=env)
     exe = install / release_go.EXE
     helper_log = updates / "last_light_update.log"
     deadline = time.time() + WAIT
@@ -226,7 +263,7 @@ def main() -> int:
             problems.append("the new version did not start quietly (its marker is still there)")
         if (updates / "last-update-result.json").exists():
             problems.append("the new version did not take in the helper's result")
-    stop_klip()
+    stop_klip(work)
     out.close()
     if problems:
         for f in (work / "klip-current.log", helper_log, updates / "last-update-result.json"):

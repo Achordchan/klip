@@ -143,10 +143,19 @@ func TestRepairPointsTheOldEntryAtThisProgram(t *testing.T) {
 	if k["maccy"] != `"`+exe+`"` {
 		t.Fatalf("value %q", k["maccy"])
 	}
-	// Already this program (in another spelling of the case): not written.
-	k = fakeKey{"maccy": `"c:\users\me\appdata\local\klip\klip.exe"`}
-	if err := (Registry{Key: k, Exe: exe}).Repair(); err != nil || k["maccy"] != `"c:\users\me\appdata\local\klip\klip.exe"` {
-		t.Fatalf("rewritten: %q %v", k["maccy"], err)
+	// Any entry that is not the old program file stays: this one, in another
+	// spelling of the case, the Klip.exe the user installed while this is a
+	// build run from a temporary folder (go run), another program the user
+	// put there.
+	for _, v := range []string{
+		`"c:\users\me\appdata\local\klip\klip.exe"`,
+		`"C:\Users\me\AppData\Local\Klip\Klip.exe"`,
+		`"D:\tools\other.exe"`,
+	} {
+		k := fakeKey{"maccy": v}
+		if err := (Registry{Key: k, Exe: `C:\Users\me\AppData\Local\Temp\go-build1\exe\klip.exe`}).Repair(); err != nil || k["maccy"] != v {
+			t.Fatalf("%s rewritten to %q (%v)", v, k["maccy"], err)
+		}
 	}
 	// No entry, or a blank one: the user did not ask to start at sign-in.
 	for _, k := range []fakeKey{{}, {"maccy": "  "}} {

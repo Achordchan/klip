@@ -69,10 +69,13 @@ type Repairer interface {
 	Repair() error
 }
 
-// Repair points the value at this program when it names another file. The C#
-// versions were maccy.exe, which the installer of 1.0.11 removes: a value
-// left as it was would start nothing, or, while the file is still there, the
-// old program, which would take the single-instance mutex before Klip.
+// Repair points the value at this program when it names the program file of
+// the versions before 1.0.11, maccy.exe, which the installer of 1.0.11
+// removes: a value left as it was would start nothing, or, while the file is
+// still there, the old program, which would take the single-instance mutex
+// before Klip. A value naming any other file is left alone: it is a Klip.exe
+// the user installed (this program may be a copy run from elsewhere, a build
+// of go run in a temporary folder, which would be gone at the next sign-in).
 func (r Registry) Repair() error {
 	v, ok := r.Key.Get(ValueName)
 	if !ok || strings.TrimSpace(v) == "" {
@@ -89,7 +92,9 @@ func (r Registry) Repair() error {
 		return nil
 	}
 	named := strings.Trim(strings.TrimSpace(v), `"`)
-	if strings.EqualFold(filepath.Clean(named), filepath.Clean(exe)) {
+	// Base, not filepath.Base: the value is a Windows path, whatever this is.
+	base := named[strings.LastIndexAny(named, `\/`)+1:]
+	if !strings.EqualFold(base, "maccy.exe") || strings.EqualFold(filepath.Clean(named), filepath.Clean(exe)) {
 		return nil
 	}
 	return r.Key.Set(ValueName, `"`+exe+`"`)
