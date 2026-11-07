@@ -186,6 +186,24 @@ func (a *Auto) OnHistoryChanged(ctx context.Context) {
 }
 
 func (a *Auto) Suppressed() bool { return a.suppressed.Load() }
+
+// Reserve takes the runner without waiting, when no sync runs: until release,
+// no sync starts (a trigger meanwhile is remembered, as while one runs). It
+// is for an update that quits the program, which must neither cut a sync off
+// nor see one begin after it decided. ok is false when a sync is running.
+// release, if the program does not quit after all, lets the remembered
+// trigger run.
+func (a *Auto) Reserve() (release func(), ok bool) {
+	a.startMu.Lock()
+	if a.busy.Load() {
+		a.startMu.Unlock()
+		return nil, false
+	}
+	a.busy.Store(true)
+	a.startMu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { a.finish(a.baseContext()) }) }, true
+}
 func (a *Auto) Exclusive(ctx context.Context, f func()) bool {
 	for {
 		a.startMu.Lock()

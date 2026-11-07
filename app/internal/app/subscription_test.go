@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"klip/internal/account"
 	"klip/internal/model"
 	"klip/internal/syncer"
@@ -167,5 +168,25 @@ func TestRunEndingWhilePausedEndsItsDisplay(t *testing.T) {
 	a.syncDone("manual", true, nil)
 	if v := a.Sync(); v.Syncing || v.Progress {
 		t.Fatalf("the run is still shown as running: %+v", v)
+	}
+}
+
+func TestReserveQuitHoldsTheSyncRunner(t *testing.T) {
+	a := newApp(t, t.TempDir(), &fakeClip{}, "http://127.0.0.1:1")
+	release, ok := a.ReserveQuit()
+	if !ok {
+		t.Fatal("nothing runs: the quit can be reserved")
+	}
+	if a.Auto.Trigger(context.Background(), "remote_event", false) {
+		t.Fatal("a sync started after the quit was reserved")
+	}
+	if _, ok := a.ReserveQuit(); ok {
+		t.Fatal("reserved twice")
+	}
+	release()
+	a.syncing.Add(1) // a sync under way
+	defer a.syncing.Add(-1)
+	if _, ok := a.ReserveQuit(); ok {
+		t.Fatal("the quit was reserved over a running sync")
 	}
 }

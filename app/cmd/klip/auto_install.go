@@ -94,9 +94,16 @@ func (p *program) decideAutoInstall(commit func()) {
 		defer close(done)
 		g := p.gate()
 		g.ready = true // the update is being handed over, no longer "ready"
-		if !p.quitting.Load() && shouldAutoInstall(g) {
-			commit() // quits, through quitForUpdate
+		if p.quitting.Load() || !shouldAutoInstall(g) {
+			return
 		}
+		// No sync may start from here on (one that would is remembered and
+		// left for the next start), and none runs: the quit cuts nothing off.
+		// A sync running now, or the runner held, calls the install off.
+		if _, ok := p.app.ReserveQuit(); !ok {
+			return
+		}
+		commit() // quits, through quitForUpdate; the runner stays held
 	})
 	<-done
 }

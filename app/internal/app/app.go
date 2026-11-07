@@ -849,6 +849,17 @@ func (a *App) AccountChanged(signedIn bool) {
 // quits the program waits until it is not.
 func (a *App) Syncing() bool { return a.syncing.Load() > 0 }
 
+// ReserveQuit keeps any sync from starting, without waiting, when none runs
+// (syncer.Auto.Reserve): the quiet update takes it right before it quits the
+// program. ok is false when a sync, or the work that holds the runner (an
+// upload after a deletion), is under way.
+func (a *App) ReserveQuit() (release func(), ok bool) {
+	if a.Syncing() {
+		return nil, false
+	}
+	return a.Auto.Reserve()
+}
+
 func (a *App) SyncStatus() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()

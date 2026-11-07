@@ -234,3 +234,39 @@ func TestAutoKeepsACaptureDuringTheFirstSync(t *testing.T) {
 		t.Errorf("runs %d: the capture made during the first sync was dropped", n)
 	}
 }
+
+func TestReserveKeepsSyncsFromStartingAndReleaseRunsWhatCame(t *testing.T) {
+	r := newRig()
+	release, ok := r.a.Reserve()
+	if !ok {
+		t.Fatal("nothing runs: the runner can be taken")
+	}
+	// A background trigger while it is held starts nothing, and is kept.
+	if r.a.Trigger(context.Background(), "remote_event", false) {
+		t.Fatal("a sync started while the runner was reserved")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if r.runs.Load() != 0 {
+		t.Fatal("a sync ran while the runner was reserved")
+	}
+	if _, ok := r.a.Reserve(); ok {
+		t.Fatal("the runner was taken twice")
+	}
+	release() // the program did not quit after all
+	waitFor(t, "the kept trigger", func() bool { return r.runs.Load() == 1 })
+	release() // once is enough
+}
+
+func TestReserveFailsWhileASyncRuns(t *testing.T) {
+	r := newRig()
+	gate := make(chan struct{})
+	r.setGate(gate)
+	if !r.a.Trigger(context.Background(), "manual", true) {
+		t.Fatal("the sync did not start")
+	}
+	waitFor(t, "the sync", func() bool { return r.runs.Load() == 1 })
+	if _, ok := r.a.Reserve(); ok {
+		t.Fatal("the runner was taken from a running sync")
+	}
+	close(gate)
+}
