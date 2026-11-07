@@ -421,7 +421,8 @@ const adminGenerateCards: Handler = async (req, env) => {
   const durationDays = clamp(asInt(p.durationDays, 30), 1, 3650);
   const codes = Array.from({ length: count }, db.generateCardCode);
   const now = nowIso();
-  await env.DB.batch(codes.map((c) => env.DB.prepare("INSERT INTO cards (code,duration_days,created_at) VALUES (?,?,?)").bind(c, durationDays, now)));
+  // 一条语句插入全部：免费版 D1 每次调用最多 50 条查询，batch 里的每条都算。
+  await env.DB.prepare("INSERT INTO cards (code,duration_days,created_at) SELECT value, ?, ? FROM json_each(?)").bind(durationDays, now, JSON.stringify(codes)).run();
   return json({ codes, durationDays });
 };
 

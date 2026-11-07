@@ -195,23 +195,44 @@ export class UserStore extends DurableObject<Env> {
         v TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS cleanup (
-        r2_key TEXT PRIMARY KEY
+        r2_key TEXT PRIMARY KEY,
+        blob_sha TEXT
+      );
+      CREATE TABLE IF NOT EXISTS blob_uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sha256 TEXT NOT NULL,
+        r2_key TEXT NOT NULL
       );
     `);
     const cols = this.sql.exec<{ name: string }>("PRAGMA table_info(snapshots)").toArray();
     if (!cols.some((c) => c.name === "r2_key")) this.sql.exec("ALTER TABLE snapshots ADD COLUMN r2_key TEXT");
+    const cleanupCols = this.sql.exec<{ name: string }>("PRAGMA table_info(cleanup)").toArray();
+    if (!cleanupCols.some((c) => c.name === "blob_sha")) this.sql.exec("ALTER TABLE cleanup ADD COLUMN blob_sha TEXT");
     ctx.blockConcurrencyWhile(() => this.recoverPublication());
   }
 
   /**
-   * 上次发布到一半就中断了（DO 重启）：看 R2 里的 manifest 指向谁。
-   * 指向待发布的那份就把它补成当前快照；否则撤销它，删掉 R2 里的文件。
+   * DO 启动时收拾上次中断留下的东西：
+   * - 发布到一半的快照：看 R2 里的 manifest 指向谁，指向它就补成当前快照，否则撤销。
+   * - 上传到一半的 blob（有上传意图、没有记账）：R2 里的文件交给待清理表删掉。
+   * - 没写成功的 D1 用量：再写一次。
    */
   private async recoverPublication(): Promise<void> {
     const pending = this.sql.exec<SnapshotRow>("SELECT version,created_ms,size,current,r2_key FROM snapshots WHERE current=?", PENDING).toArray();
     const hasCleanup = this.sql.exec("SELECT 1 FROM cleanup LIMIT 1").toArray().length > 0;
-    if (pending.length === 0 && !hasCleanup) return;
+    const hasBlobIntents = this.sql.exec("SELECT 1 FROM blob_uploads LIMIT 1").toArray().length > 0;
+    const usageDirty = this.sql.exec("SELECT 1 FROM meta WHERE k='usage_dirty'").toArray().length > 0;
+    if (pending.length === 0 && !hasCleanup && !hasBlobIntents && !usageDirty) return;
     const userId = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='user'").toArray()[0]?.v;
+    if (hasBlobIntents) {
+      // 启动时没有正在进行的上传：留下的意图都是中断的。已经记账的 blob 不用动。
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(
+          "INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) SELECT r2_key, sha256 FROM blob_uploads u WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = u.sha256)",
+        );
+        this.sql.exec("DELETE FROM blob_uploads");
+      });
+    }
     if (pending.length > 0) {
       const published = userId ? (await this.env.BUCKET.head(manifestKey(userId)))?.customMetadata?.snapshotKey : undefined;
       for (const row of pending) {
@@ -225,6 +246,7 @@ export class UserStore extends DurableObject<Env> {
       const row = await this.env.DB.prepare("SELECT tier FROM users WHERE id=?").bind(userId).first<{ tier: string | null }>();
       const tier = getTierPolicy(row?.tier);
       if (tier) await this.settle(userId, tier);
+      await this.flushUsage(userId); // 没有档位时也要把待写入的用量写掉
     }
   }
 
@@ -236,9 +258,20 @@ export class UserStore extends DurableObject<Env> {
     });
   }
 
-  /** 删掉待清理表里的 R2 文件；删成功才去掉记录，失败的留到下次（每次提交和 DO 启动时都会再试）。 */
+  /**
+   * 删掉待清理表里的 R2 文件；删成功才去掉记录，失败的留到下次（每次提交和 DO 启动时都会再试）。
+   * blob 的 key 由哈希决定，同一个 blob 可能已经被重新传上来：已经记账的不删（只去掉记录），
+   * 正在上传的先跳过，免得删掉刚写进去的文件。
+   */
   private async drainCleanup(): Promise<void> {
-    const keys = this.sql.exec<{ r2_key: string }>("SELECT r2_key FROM cleanup LIMIT ?", R2_DELETE_BATCH).toArray().map((r) => r.r2_key);
+    this.sql.exec("DELETE FROM cleanup WHERE blob_sha IS NOT NULL AND EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = cleanup.blob_sha)");
+    const keys = this.sql
+      .exec<{ r2_key: string }>(
+        "SELECT r2_key FROM cleanup c WHERE c.blob_sha IS NULL OR NOT EXISTS (SELECT 1 FROM blob_uploads u WHERE u.sha256 = c.blob_sha) LIMIT ?",
+        R2_DELETE_BATCH,
+      )
+      .toArray()
+      .map((r) => r.r2_key);
     if (keys.length === 0) return;
     try {
       await this.env.BUCKET.delete(keys);
@@ -334,13 +367,33 @@ export class UserStore extends DurableObject<Env> {
     } catch (e) {
       console.error("prune backups failed", String(e));
     }
-    const storageBytes = this.usageBytes();
+    this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('usage_dirty','1')");
+    await this.flushUsage(userId);
+    return { pruned, storageBytes: this.usageBytes() };
+  }
+
+  /**
+   * 把用量写到 D1。先记下“待写入”，写成功才清掉；失败就用 alarm 一分钟后再试，
+   * DO 重启时也会再试，所以一次失败不会让 D1 里的用量一直停在旧值。只在提交里调用。
+   */
+  private async flushUsage(userId: string): Promise<void> {
+    if (this.sql.exec("SELECT 1 FROM meta WHERE k='usage_dirty'").toArray().length === 0) return;
     try {
-      await setStorageBytes(this.env, userId, storageBytes);
+      await setStorageBytes(this.env, userId, this.usageBytes());
+      this.sql.exec("DELETE FROM meta WHERE k='usage_dirty'");
     } catch (e) {
-      console.error("update storage_bytes failed", String(e));
+      console.error("update storage_bytes failed, will retry", String(e));
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
     }
-    return { pruned, storageBytes };
+  }
+
+  async alarm(): Promise<void> {
+    const userId = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='user'").toArray()[0]?.v;
+    if (!userId) return;
+    await this.withCommit(async () => {
+      await this.drainCleanup();
+      await this.flushUsage(userId);
+    });
   }
 
   async missingBlobs(hashes: string[]): Promise<string[]> {
@@ -388,12 +441,15 @@ export class UserStore extends DurableObject<Env> {
     }
     // 额度一直占着，直到 blob 在提交里记进账目才释放：排队等提交的这段时间里，
     // 别的上传也看得到这部分空间已经被占用。
+    // 写 R2 之前先记下上传意图：上传中途 DO 重启的话，恢复时能找到并删掉没记账的文件。
+    const key = blobKey(userId, sha);
+    const intent = this.sql.exec<{ id: number }>("INSERT INTO blob_uploads (sha256, r2_key) VALUES (?,?) RETURNING id", sha, key).one().id;
     const quota = this.quota(tier, true);
     try {
       let admitted = true;
       let result: StoreResult;
       try {
-        result = await streamToR2(this.env.BUCKET, blobKey(userId, sha), request.body, this.isGzip(request), {
+        result = await streamToR2(this.env.BUCKET, key, request.body, this.isGzip(request), {
           expectedSha256: sha,
           admit: (size) => (admitted = quota.admit(size)),
         });
@@ -404,7 +460,11 @@ export class UserStore extends DurableObject<Env> {
       if (!admitted) return this.limitExceeded(tier);
       if (!result.stored) return errorJson(400, "blob sha256 mismatch");
       await this.withCommit(async () => {
-        this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
+        this.ctx.storage.transactionSync(() => {
+          this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
+          this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
+          this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", key);
+        });
         quota.release();
         // blob 占的空间不算备份，所以备份可能因此超额：这里也清理。
         await this.settle(userId, tier);
@@ -412,6 +472,8 @@ export class UserStore extends DurableObject<Env> {
       return json({ sha256: sha, size: result.size, existing: false });
     } finally {
       quota.release();
+      // 失败的路径不会在 R2 里留下文件（streamToR2 出错会中止）；成功时这条在提交里已经删了。
+      this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
     }
   }
 
