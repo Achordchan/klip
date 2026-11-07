@@ -6,10 +6,13 @@ Klip is a clipboard manager: it keeps the text, images and files you copy, so yo
 
 ## Download
 
-Get `Klip-<version>-setup.exe` from [Releases](https://github.com/Achordchan/klip/releases/latest) and run it (Windows 10 / 11, 64-bit).
+From [Releases](https://github.com/Achordchan/klip/releases/latest):
+
+- **Windows 10 / 11 (64-bit)**: run `Klip-<version>-setup.exe`.
+- **macOS 12 or later**: `Klip-<version>-mac-arm64.zip` for Apple silicon, `Klip-<version>-mac-x64.zip` for Intel. Unzip and drag Klip to Applications. The Mac app is not signed yet: the first time, macOS blocks it; open System Settings > Privacy & Security and click "Open Anyway" next to Klip. It does not update itself yet; it tells you when there is a new version and where to download it.
 
 - Press `Ctrl + Alt + 2` to open the panel.
-- **Updates are seamless**: a new version is downloaded in the background and installed when you have been away for a few minutes with Klip's windows closed, then Klip starts again on its own. If it cannot be installed, the previous version is put back.
+- **Updates on Windows are seamless**: a new version is downloaded in the background and installed when you have been away for a few minutes with Klip's windows closed, then Klip starts again on its own. If it cannot be installed, the previous version is put back.
 - **Upgrading from 1.0.10 or earlier**: those versions do not receive the update by themselves. Download the installer and install over them; history, settings, sign-in, sync and start-at-login are kept.
 
 ## Repository

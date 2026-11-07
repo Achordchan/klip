@@ -16,7 +16,7 @@
 #if !FileExists(MyExePath)
   #error "Published EXE not found: " + MyExePath + " (run: python tools/release_go.py build --version <x.y.z>)"
 #endif
-#define MyAppVersionShort "1.0.11"
+#define MyAppVersionShort "1.0.12"
 #define MyAppId "{{4F6E38C4-29B6-4C3C-9D36-9B0D2F38C4F1}}"
 
 [Setup]

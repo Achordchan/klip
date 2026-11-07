@@ -1,14 +1,27 @@
 #!/bin/bash
-# Builds dist/Klip.app (and a zip) for the machine's architecture, for local
-# testing. Not a release: no signing, no notarization, no auto-update.
-# usage: tools/package_mac.sh [version]
+# Builds Klip.app for macOS and its zip, Klip-<version>-mac-<arm64|x64>.zip.
+# Signed ad hoc only (no Developer ID): macOS asks the user to allow it once
+# (System Settings > Privacy & Security > Open Anyway). No auto-update on macOS:
+# the update window points at the zip of the newest release.
+#
+# usage: tools/package_mac.sh <version> [arm64|amd64] [out-dir]
+#   arch defaults to this machine's, out-dir to dist/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VER="${1:-1.0.11}"
-ARCH="$(uname -m | sed 's/x86_64/amd64/')"
-OUT="$ROOT/dist"
-APP="$OUT/Klip.app"
-rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+VER="${1:?usage: tools/package_mac.sh <version> [arm64|amd64] [out-dir]}"
+ARCH="${2:-$(uname -m | sed 's/x86_64/amd64/')}"
+case "$ARCH" in
+  arm64) SUFFIX=arm64 ;;
+  amd64) SUFFIX=x64 ;;
+  *) echo "arch must be arm64 or amd64, not $ARCH" >&2; exit 2 ;;
+esac
+OUT="${3:-$ROOT/dist}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+# Each arch in a folder of its own: two builds into one out-dir do not meet.
+STAGE="$OUT/Klip-$VER-mac-$SUFFIX"
+APP="$STAGE/Klip.app"
+rm -rf "$STAGE"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 (cd "$ROOT/app" && CGO_ENABLED=0 GOOS=darwin GOARCH="$ARCH" go build -trimpath \
   -ldflags "-s -w -X klip/internal/version.Version=$VER" -o "$APP/Contents/MacOS/Klip" ./cmd/klip)
@@ -17,7 +30,7 @@ rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 LIB="$(cd "$ROOT/app" && go list -m -f '{{.Dir}}' github.com/egoist/mygo)/plugins/sqlite/mygo-plugin.json"
 read -r NAME URL SHA < <(python3 - "$LIB" "$ARCH" <<'PY'
 import json,sys
-m=json.load(open(sys.argv[1])); k="darwin-"+("arm64" if sys.argv[2]=="arm64" else "amd64")
+m=json.load(open(sys.argv[1])); k="darwin-"+sys.argv[2]
 for l in m["libraries"]:
     if l["name"]=="mygo-sqlite3":
         f=l["files"][k]; print(f["name"],f["url"],f["sha256"])
@@ -54,6 +67,11 @@ cat > "$APP/Contents/Info.plist" <<PL
 </dict></plist>
 PL
 
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
-(cd "$OUT" && rm -f "Klip-$VER-mac-$ARCH.zip" && ditto -c -k --keepParent Klip.app "Klip-$VER-mac-$ARCH.zip")
-echo "$APP"; ls -lh "$OUT/Klip-$VER-mac-$ARCH.zip"
+# An ad hoc signature over the whole bundle: an Apple silicon Mac runs no
+# unsigned code, and the library must be sealed in with the program.
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
+ZIP="$OUT/Klip-$VER-mac-$SUFFIX.zip"
+rm -f "$ZIP"
+(cd "$STAGE" && ditto -c -k --keepParent Klip.app "$ZIP")
+echo "$ZIP"
