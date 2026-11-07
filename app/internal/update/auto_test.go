@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -237,9 +238,14 @@ func TestCalledOffInstallQuitsNothingAndGivesTheAttemptBack(t *testing.T) {
 	if err := r.c.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	stopped := 0
+	r.c.StopHelper = func() { stopped++ }
 	// The user came back while the helper was being prepared.
 	if err := r.c.InstallPrepared(func(func()) {}); err == nil {
 		t.Fatal("a called-off install succeeded")
+	}
+	if len(r.spawn) != 1 || stopped != 1 {
+		t.Fatalf("the waiting helper was not stopped: started %d, stopped %d", len(r.spawn), stopped)
 	}
 	if r.shut != 0 {
 		t.Fatal("the program quit although the install was called off")
@@ -283,5 +289,38 @@ func TestCleanOldDuringPrepareCannotLeaveAPreparationWithoutFiles(t *testing.T) 
 		if _, err := os.Stat(prep.StagingPath); err != nil {
 			t.Fatal("a preparation whose files were removed is published")
 		}
+	}
+}
+
+func TestStopHelperEndsARealWaitingHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for the helper")
+	}
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "helper.sh")
+	// Says it is ready, then waits as the helper waits for the program.
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\ntouch \"$2.ready\"\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plan := filepath.Join(dir, "plan.json")
+	if err := WritePlan(plan, Plan{PID: os.Getpid()}); err != nil {
+		t.Fatal(err)
+	}
+	c := &Coordinator{}
+	if err := c.spawn(helper, plan); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.stopHelper() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the helper was not stopped")
+	}
+	if c.stopHelper() != nil {
+		t.Fatal("a second stop fails")
 	}
 }

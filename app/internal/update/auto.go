@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,8 +117,10 @@ var errCalledOff = errors.New("the quiet install was called off")
 // waits, with commit, which writes the quiet marker and asks the program to
 // quit (Shutdown); decide calls it, on the UI thread right after looking
 // again that nobody came back, or returns without it to call the install
-// off. Called off, the attempt is given back, and the helper, whose program
-// does not exit, gives up without touching anything (exitWait).
+// off. Called off, the helper, which still waits for this process and has
+// touched nothing, is stopped and reaped (were it left, a quit by the user
+// within its wait would install the update after all, and it would hold the
+// update mutex meanwhile), and the attempt is given back.
 func (c *Coordinator) InstallPrepared(decide func(commit func())) error {
 	c.mu.Lock()
 	if !c.readyLocked() || c.attempts(c.prepared.Version) >= MaxAutoAttempts {
@@ -152,6 +155,12 @@ func (c *Coordinator) InstallPrepared(decide func(commit func())) error {
 		c.done()
 	})
 	if !committed {
+		if err := c.stopHelper(); err != nil {
+			// It could not be stopped: it will install when the program quits.
+			// The attempt stays counted, and the install stays under way for
+			// this process, so that nothing starts a second one.
+			return fmt.Errorf("%w; the helper could not be stopped: %v", errCalledOff, err)
+		}
 		c.uncountAttempt(prep.Version)
 		return fail(errCalledOff)
 	}

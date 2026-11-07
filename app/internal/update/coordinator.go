@@ -62,6 +62,8 @@ type Coordinator struct {
 	Supported bool
 	// StartHelper starts the helper (the package's own by default).
 	StartHelper func(helperExe, planPath string) error
+	// StopHelper, with StartHelper, stops the helper it started (tests).
+	StopHelper func()
 	// Now is time.Now unless a test sets it.
 	Now func() time.Time
 
@@ -81,6 +83,9 @@ type Coordinator struct {
 	// afterDownload, for tests, runs in Prepare between the download and the
 	// publication of what it made.
 	afterDownload func()
+	// helperStop stops and reaps the helper last started, which waits for
+	// this process to exit (nil when none was). Under mu.
+	helperStop func() error
 }
 
 // NewCoordinator returns a Coordinator for the running program.
@@ -420,7 +425,16 @@ func (c *Coordinator) helperCopy(version string) (string, error) {
 
 func (c *Coordinator) spawn(helper, plan string) error {
 	if c.StartHelper != nil {
-		return c.StartHelper(helper, plan)
+		if err := c.StartHelper(helper, plan); err != nil {
+			return err
+		}
+		c.setHelperStop(func() error {
+			if c.StopHelper != nil {
+				c.StopHelper()
+			}
+			return nil
+		})
+		return nil
 	}
 	p, err := ReadPlan(plan)
 	if err != nil {
@@ -439,7 +453,17 @@ func (c *Coordinator) spawn(helper, plan string) error {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err = os.Stat(p.ReadyFile); err == nil {
-			go cmd.Wait()
+			reaped := make(chan struct{})
+			go func() { _ = cmd.Wait(); close(reaped) }()
+			c.setHelperStop(func() error {
+				// It still waits for this process, which is alive: it has
+				// touched nothing, and may go.
+				if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					return err
+				}
+				<-reaped
+				return nil
+			})
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -449,6 +473,24 @@ func (c *Coordinator) spawn(helper, plan string) error {
 	}
 	_ = cmd.Wait()
 	return errors.New("update helper readiness timed out")
+}
+
+func (c *Coordinator) setHelperStop(f func() error) {
+	c.mu.Lock()
+	c.helperStop = f
+	c.mu.Unlock()
+}
+
+// stopHelper stops the helper last started, if any.
+func (c *Coordinator) stopHelper() error {
+	c.mu.Lock()
+	f := c.helperStop
+	c.helperStop = nil
+	c.mu.Unlock()
+	if f == nil {
+		return nil
+	}
+	return f()
 }
 
 func (c *Coordinator) startPackage(p *Prepared, quiet bool) error {
