@@ -88,22 +88,37 @@ func (p *program) autoInstallNow() {
 // the same step, with no click in between. Otherwise nothing happens (the
 // user came back, a sync or a migration began). Any goroutine but the UI
 // thread: it waits for it.
-func (p *program) decideAutoInstall(commit func()) {
+func (p *program) decideAutoInstall(commit func() bool) {
 	done := make(chan struct{})
 	mygo.RunOnMain(func() {
 		defer close(done)
-		g := p.gate()
-		g.ready = true // the update is being handed over, no longer "ready"
-		if p.quitting.Load() || !shouldAutoInstall(g) {
-			return
-		}
-		// No sync may start from here on (one that would is remembered and
-		// left for the next start), and none runs: the quit cuts nothing off.
-		// A sync running now, or the runner held, calls the install off.
-		if _, ok := p.app.ReserveQuit(); !ok {
-			return
-		}
-		commit() // quits, through quitForUpdate; the runner stays held
+		decideQuietInstall(func() autoInstallGate {
+			g := p.gate()
+			g.ready = true // the update is being handed over, no longer "ready"
+			return g
+		}, p.quitting.Load, p.app.ReserveQuit, commit)
 	})
 	<-done
+}
+
+// decideQuietInstall is decideAutoInstall without the UI thread: the moment
+// is judged again; then no sync may start from here on (one that would is
+// remembered and left for the next start), and none runs, so the quit cuts
+// nothing off: a sync running now, or the runner held, calls the install
+// off. commit quits for the update and says whether it did; when it did not
+// (its marker could not be written), the runner is given back, or no sync
+// would ever start again. It says whether the program quits.
+func decideQuietInstall(gate func() autoInstallGate, quitting func() bool, reserve func() (func(), bool), commit func() bool) bool {
+	if quitting() || !shouldAutoInstall(gate()) {
+		return false
+	}
+	release, ok := reserve()
+	if !ok {
+		return false
+	}
+	if !commit() {
+		release()
+		return false
+	}
+	return true // the runner stays held until the process ends
 }

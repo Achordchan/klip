@@ -28,3 +28,39 @@ func TestShouldAutoInstall(t *testing.T) {
 		}
 	}
 }
+
+func TestQuietInstallGivesTheSyncRunnerBackWhenItCannotCommit(t *testing.T) {
+	away := func() autoInstallGate { return autoInstallGate{ready: true, idle: autoInstallIdle} }
+	no := func() bool { return false }
+	for _, tc := range []struct {
+		name                       string
+		reserved, committed, quits bool
+		released                   int
+	}{
+		{"committed: the runner stays held", true, true, true, 0},
+		{"the commit failed: the runner is given back", true, false, false, 1},
+		{"a sync runs: nothing is reserved", false, true, false, 0},
+	} {
+		released, commits := 0, 0
+		reserve := func() (func(), bool) {
+			if !tc.reserved {
+				return nil, false
+			}
+			return func() { released++ }, true
+		}
+		commit := func() bool { commits++; return tc.committed }
+		quits := decideQuietInstall(away, no, reserve, commit)
+		if quits != tc.quits || released != tc.released {
+			t.Errorf("%s: quits %v, released %d", tc.name, quits, released)
+		}
+		if !tc.reserved && commits != 0 {
+			t.Errorf("%s: committed without the runner", tc.name)
+		}
+	}
+	// The user is back: nothing is reserved, nothing committed.
+	reserved := false
+	busy := func() autoInstallGate { g := away(); g.panel = true; return g }
+	if decideQuietInstall(busy, no, func() (func(), bool) { reserved = true; return func() {}, true }, func() bool { return true }) || reserved {
+		t.Fatal("the install went on with the panel up")
+	}
+}

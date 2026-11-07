@@ -136,7 +136,7 @@ var errCalledOff = errors.New("the quiet install was called off")
 // touched nothing, is stopped and reaped (were it left, a quit by the user
 // within its wait would install the update after all, and it would hold the
 // update mutex meanwhile), and the attempt is given back.
-func (c *Coordinator) InstallPrepared(decide func(commit func())) error {
+func (c *Coordinator) InstallPrepared(decide func(commit func() bool)) error {
 	c.mu.Lock()
 	if !c.readyLocked() || c.attempts(c.prepared.Version) >= MaxAutoAttempts {
 		c.mu.Unlock()
@@ -161,11 +161,11 @@ func (c *Coordinator) InstallPrepared(decide func(commit func())) error {
 		return fail(err)
 	}
 	committed := false
-	decide(func() {
+	decide(func() bool {
 		// The helper installs only if this exists when the program is gone:
 		// written now, at the one moment the program quits for the update.
-		if err := writeJSON(c.commitPath(), quietMarker{Version: prep.Version, At: c.now()}); err != nil {
-			return // not committed: the helper will not install, and is stopped
+		if err := c.writeCommit(c.commitPath(), quietMarker{Version: prep.Version, At: c.now()}); err != nil {
+			return false // not committed: the helper will not install, and is stopped
 		}
 		committed = true
 		// The helper waits for this process: the new one is told to keep quiet.
@@ -173,6 +173,7 @@ func (c *Coordinator) InstallPrepared(decide func(commit func())) error {
 			_ = err // a start that shows the panel is all that is lost
 		}
 		c.done()
+		return true
 	})
 	if !committed {
 		if err := c.stopHelper(); err != nil {
@@ -233,6 +234,16 @@ type quietMarker struct {
 }
 
 func (c *Coordinator) quietMarkerPath() string { return filepath.Join(c.Root, "quiet-relaunch.json") }
+
+// writeCommit writes the commit file (writeJSON; tests make it fail).
+func (c *Coordinator) writeCommit(path string, v any) error {
+	if c.failCommit != nil {
+		if err := c.failCommit(); err != nil {
+			return err
+		}
+	}
+	return writeJSON(path, v)
+}
 
 // commitPath is the program's leave to the helper of a quiet install
 // (Plan.CommitFile).

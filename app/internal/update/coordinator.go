@@ -83,6 +83,8 @@ type Coordinator struct {
 	// afterDownload, for tests, runs in Prepare between the download and the
 	// publication of what it made.
 	afterDownload func()
+	// failCommit, for tests, makes the commit file fail to be written.
+	failCommit func() error
 	// helperStop stops and reaps the helper last started, which waits for
 	// this process to exit (nil when none was). Under mu.
 	helperStop func() error

@@ -2,6 +2,7 @@ package update
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -231,7 +232,7 @@ func TestUnwritableInstallFolderIsNotPreparedForAQuietInstall(t *testing.T) {
 	}
 }
 
-func commitAlways(commit func()) { commit() }
+func commitAlways(commit func() bool) { commit() }
 
 func TestCalledOffInstallQuitsNothingAndGivesTheAttemptBack(t *testing.T) {
 	r := newCoord(t, "1.0.10")
@@ -243,7 +244,7 @@ func TestCalledOffInstallQuitsNothingAndGivesTheAttemptBack(t *testing.T) {
 	stopped := 0
 	r.c.StopHelper = func() { stopped++ }
 	// The user came back while the helper was being prepared.
-	if err := r.c.InstallPrepared(func(func()) {}); err == nil {
+	if err := r.c.InstallPrepared(func(func() bool) {}); err == nil {
 		t.Fatal("a called-off install succeeded")
 	}
 	if len(r.spawn) != 1 || stopped != 1 {
@@ -363,7 +364,7 @@ func TestQuietHelperDoesNothingWhenTheProgramExitsWithoutCommitting(t *testing.T
 	var plan Plan
 	// The user quit Klip while the helper was being made ready: decide never
 	// commits; the program is gone all the same.
-	_ = r.c.InstallPrepared(func(func()) {
+	_ = r.c.InstallPrepared(func(func() bool) {
 		p, err := ReadPlan(r.spawn[0][1])
 		if err != nil {
 			t.Fatal(err)
@@ -400,5 +401,25 @@ func TestQuietHelperDoesNothingWhenTheProgramExitsWithoutCommitting(t *testing.T
 	}
 	if _, err := os.Stat(plan2.CommitFile); !os.IsNotExist(err) {
 		t.Fatal("the commit file stays for another time")
+	}
+}
+
+func TestCommitThatCannotBeWrittenIsNoCommit(t *testing.T) {
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	if err := r.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.c.failCommit = func() error { return errors.New("disk full") }
+	stopped := 0
+	r.c.StopHelper = func() { stopped++ }
+	var said *bool
+	err := r.c.InstallPrepared(func(commit func() bool) { ok := commit(); said = &ok })
+	if err == nil || said == nil || *said {
+		t.Fatalf("a commit that was not written counts: err %v, said %v", err, said)
+	}
+	if r.shut != 0 || stopped != 1 || r.c.attempts("1.0.11") != 0 {
+		t.Fatalf("shut %d, helper stopped %d, attempts %d", r.shut, stopped, r.c.attempts("1.0.11"))
 	}
 }
