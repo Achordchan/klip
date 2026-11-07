@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -70,10 +69,13 @@ func Start(t *testing.T) *Server {
 	if err != nil {
 		t.Skipf("server source not available: %v", err)
 	}
-	wrangler := filepath.Join(dir, "node_modules", ".bin", "wrangler")
-	if runtime.GOOS == "windows" {
-		wrangler += ".cmd"
+	// Wrangler's JavaScript entry point, run with node: on Windows the
+	// node_modules/.bin shim is a .cmd that exec cannot start by itself.
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skipf("node is not installed: %v", err)
 	}
+	wrangler := filepath.Join(dir, "node_modules", "wrangler", "bin", "wrangler.js")
 	if _, err := os.Stat(wrangler); err != nil {
 		t.Skipf("run npm install in %s first: %v", dir, err)
 	}
@@ -81,7 +83,7 @@ func Start(t *testing.T) *Server {
 	state := t.TempDir()
 	env := append(os.Environ(), "WRANGLER_SEND_METRICS=false", "CI=1")
 	var out bytes.Buffer
-	migrate := exec.Command(wrangler, "d1", "migrations", "apply", "DB", "--local", "--persist-to", state)
+	migrate := exec.Command(node, wrangler, "d1", "migrations", "apply", "DB", "--local", "--persist-to", state)
 	migrate.Dir, migrate.Env, migrate.Stdout, migrate.Stderr = dir, env, &out, &out
 	if err := migrate.Run(); err != nil {
 		t.Fatalf("d1 migrations: %v\n%s", err, out.String())
@@ -89,7 +91,7 @@ func Start(t *testing.T) *Server {
 	out.Reset()
 
 	port := freePort(t)
-	cmd := exec.Command(wrangler, "dev", "--local",
+	cmd := exec.Command(node, wrangler, "dev", "--local",
 		"--ip", "127.0.0.1", "--port", fmt.Sprint(port), "--inspector-port", fmt.Sprint(freePort(t)),
 		"--persist-to", state, "--show-interactive-dev-session=false", "--log-level", "warn",
 		"--var", "ADMIN_KEY:"+AdminKey,

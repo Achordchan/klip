@@ -85,27 +85,40 @@ export function isActive(expiresAt: string | null): boolean {
   return expiresAt !== null && parseUtc(expiresAt) > Date.now();
 }
 
-export function extendFrom(expiresAt: string | null, days: number): string {
-  const base = isActive(expiresAt) ? parseUtc(expiresAt) : Date.now();
-  return new Date(base + days * DAY_MS).toISOString();
-}
+// 到期时间在 SQL 里从当前值算出来（没到期就接着加，过期了就从现在加），
+// 这样两次延长同时发生也不会互相覆盖。格式和 toISOString() 一样。
+const ISO = "'%Y-%m-%dT%H:%M:%fZ'";
+const EXTENDED = (days: string) => `strftime(${ISO}, max(julianday(subscriptions.expires_at), julianday('now')) + ${days})`;
+const FROM_NOW = (days: string) => `strftime(${ISO}, julianday('now') + ${days})`;
 
-export function upsertSubscriptionStatement(env: Env, userId: string, expiresAt: string): D1PreparedStatement {
+/** 后台加时：原子地把订阅延长 days 天。 */
+export function extendSubscriptionStatement(env: Env, userId: string, days: number): D1PreparedStatement {
   const now = nowIso();
   return env.DB.prepare(
-    "INSERT INTO subscriptions (user_id,expires_at,created_at,updated_at) VALUES (?,?,?,?) " +
-      "ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, updated_at=excluded.updated_at",
-  ).bind(userId, expiresAt, now, now);
+    `INSERT INTO subscriptions (user_id,expires_at,created_at,updated_at) VALUES (?, ${FROM_NOW("?")}, ?, ?) ` +
+      `ON CONFLICT(user_id) DO UPDATE SET expires_at=${EXTENDED("?")}, updated_at=excluded.updated_at`,
+  ).bind(userId, days, now, now, days);
 }
 
-export interface CardRow {
-  code: string;
-  duration_days: number;
-  used_by: string | null;
-}
-
-export async function getCard(env: Env, code: string): Promise<CardRow | null> {
-  return env.DB.prepare("SELECT code,duration_days,used_by FROM cards WHERE code=?").bind(code).first<CardRow>();
+/**
+ * 兑换卡密：认领卡密和延长订阅在同一个事务里（D1 的 batch）。
+ * 延长那条只在认领真的改到一行时生效（changes() = 1），所以同一张卡并发兑换
+ * 只有一次成功；任何一步失败整体回滚，不会出现卡用掉了却没加时间。
+ * 返回新的到期时间；卡不存在或已被用掉时返回 null。
+ */
+export async function redeemCard(env: Env, userId: string, code: string): Promise<string | null> {
+  const now = nowIso();
+  const [claim, , current] = await env.DB.batch([
+    env.DB.prepare("UPDATE cards SET used_at=?, used_by=? WHERE code=? AND used_by IS NULL").bind(now, userId, code),
+    env.DB.prepare(
+      `INSERT INTO subscriptions (user_id,expires_at,created_at,updated_at) ` +
+        `SELECT ?, ${FROM_NOW("c.duration_days")}, ?, ? FROM cards c WHERE c.code=? AND changes() = 1 ` +
+        `ON CONFLICT(user_id) DO UPDATE SET expires_at=${EXTENDED("(SELECT duration_days FROM cards WHERE code=?)")}, updated_at=excluded.updated_at`,
+    ).bind(userId, now, now, code, code),
+    env.DB.prepare("SELECT expires_at FROM subscriptions WHERE user_id=?").bind(userId),
+  ]);
+  if (claim.meta.changes !== 1) return null;
+  return (current.results[0] as { expires_at: string } | undefined)?.expires_at ?? null;
 }
 
 export function generateCardCode(): string {
@@ -198,37 +211,47 @@ export async function deletePasswordCode(env: Env, id: string): Promise<void> {
   await env.DB.prepare("DELETE FROM password_verification_codes WHERE id=?").bind(id).run();
 }
 
-/** 校验验证码；成功或作废都会把它标为已用。返回错误文字，成功为 null。 */
+/**
+ * 校验并消耗验证码。返回错误文字，成功为 null。
+ * 并发安全：猜错的计数用 attempts = attempts + 1 原子累加，成功消耗用带条件的
+ * UPDATE，只有真正把 used_at 从空改成有值的那个请求算成功。
+ */
 export async function verifyPasswordCode(env: Env, email: string, purpose: string, code: string): Promise<string | null> {
   const normalizedEmail = normalizeEmail(email);
   const normalizedCode = code.trim();
   const row = await env.DB.prepare(
-    "SELECT id,code_hash,expires_at,attempts FROM password_verification_codes " +
+    "SELECT id,code_hash,expires_at FROM password_verification_codes " +
       "WHERE email=? AND purpose=? AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
   )
     .bind(normalizedEmail, purpose)
-    .first<{ id: string; code_hash: string; expires_at: string; attempts: number }>();
+    .first<{ id: string; code_hash: string; expires_at: string }>();
   if (!row) return "invalid or expired code";
 
-  const markUsed = () => env.DB.prepare("UPDATE password_verification_codes SET used_at=? WHERE id=? AND used_at IS NULL").bind(nowIso(), row.id).run();
-  const attempts = row.attempts ?? 0;
-  if (attempts >= PASSWORD_CODE_MAX_ATTEMPTS) {
-    await markUsed();
+  const now = nowIso();
+  const retire = () => env.DB.prepare("UPDATE password_verification_codes SET used_at=? WHERE id=? AND used_at IS NULL").bind(now, row.id).run();
+  if (parseUtc(row.expires_at) <= Date.now()) {
+    await retire();
+    return "invalid or expired code";
+  }
+
+  const wellFormed = new RegExp(`^\\d{${PASSWORD_CODE_DIGITS}}$`).test(normalizedCode);
+  if (wellFormed && (await hashPasswordCode(normalizedEmail, purpose, normalizedCode)) === row.code_hash) {
+    const consumed = await env.DB.prepare(
+      "UPDATE password_verification_codes SET used_at=? WHERE id=? AND used_at IS NULL AND attempts < ? AND expires_at > ?",
+    )
+      .bind(now, row.id, PASSWORD_CODE_MAX_ATTEMPTS, now)
+      .run();
+    return consumed.meta.changes === 1 ? null : "invalid or expired code";
+  }
+
+  const counted = await env.DB.prepare(
+    "UPDATE password_verification_codes SET attempts = attempts + 1 WHERE id=? AND used_at IS NULL RETURNING attempts",
+  )
+    .bind(row.id)
+    .first<{ attempts: number }>();
+  if (counted && counted.attempts >= PASSWORD_CODE_MAX_ATTEMPTS) {
+    await retire();
     return "too many code attempts";
   }
-  if (parseUtc(row.expires_at) <= Date.now()) {
-    await markUsed();
-    return "invalid or expired code";
-  }
-  const wellFormed = new RegExp(`^\\d{${PASSWORD_CODE_DIGITS}}$`).test(normalizedCode);
-  if (!wellFormed || (await hashPasswordCode(normalizedEmail, purpose, normalizedCode)) !== row.code_hash) {
-    await env.DB.prepare("UPDATE password_verification_codes SET attempts=? WHERE id=?").bind(attempts + 1, row.id).run();
-    if (attempts + 1 >= PASSWORD_CODE_MAX_ATTEMPTS) {
-      await markUsed();
-      return "too many code attempts";
-    }
-    return "invalid or expired code";
-  }
-  await markUsed();
-  return null;
+  return "invalid or expired code";
 }

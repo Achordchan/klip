@@ -37,8 +37,10 @@ class GzipError extends Error {}
 interface StoreResult {
   size: number;
   sha256: string;
-  stored: boolean; // 超出大小上限或校验不符时为 false，R2 里什么也不留
+  stored: boolean; // 被 admit 拒绝或校验不符时为 false，R2 里什么也不留
 }
+
+const R2_DELETE_BATCH = 1000; // R2 一次 delete 最多 1000 个 key
 
 /**
  * 把（可能是 gzip 的）请求体解压后写进 R2，同时算 sha256 和大小。
@@ -49,7 +51,9 @@ async function streamToR2(
   key: string,
   body: ReadableStream<Uint8Array> | null,
   gzip: boolean,
-  opts: { maxBytes?: number; expectedSha256?: string },
+  // admit(已收到的字节数)：每收到一块问一次还能不能存；返回 false 就放弃写入，
+  // 但继续读完请求体，好报出完整大小。
+  opts: { admit?: (size: number) => boolean; expectedSha256?: string },
 ): Promise<StoreResult> {
   let stream: ReadableStream<Uint8Array> = body ?? new ReadableStream({ start: (c) => c.close() });
   if (gzip) stream = stream.pipeThrough(new DecompressionStream("gzip"));
@@ -109,7 +113,7 @@ async function streamToR2(
       size += data.byteLength;
       await digestWriter.write(data);
       if (!storing) continue;
-      if (opts.maxBytes !== undefined && size > opts.maxBytes) {
+      if (opts.admit && !opts.admit(size)) {
         await abort();
         continue;
       }
@@ -151,6 +155,8 @@ type SnapshotRow = {
 export class UserStore extends DurableObject<Env> {
   private sql: SqlStorage;
   private snapshotLock: Promise<unknown> = Promise.resolve();
+  // 正在进行的上传各自已经收到的字节数：并发上传一起占额度。
+  private inflight = new Map<symbol, number>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -189,8 +195,47 @@ export class UserStore extends DurableObject<Env> {
 
   private usageBytes(): number {
     const s = this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM snapshots").one().n;
-    const b = this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM blobs").one().n;
-    return s + b;
+    return s + this.blobBytes();
+  }
+
+  private blobBytes(): number {
+    return this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM blobs").one().n;
+  }
+
+  private currentSnapshotBytes(): number {
+    return this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size),0) AS n FROM snapshots WHERE current=1").one().n;
+  }
+
+  private inflightBytes(except: symbol): number {
+    let n = 0;
+    for (const [k, v] of this.inflight) if (k !== except) n += v;
+    return n;
+  }
+
+  /**
+   * 给一次上传做额度检查。备份不算占用：发布新快照后会从最旧的开始清掉，
+   * 所以“能不能放下”只看当前快照、blob 和其他正在进行的上传。
+   * withCurrentSnapshot 为 false 时（上传的就是新快照，会替换当前的）不算当前快照。
+   */
+  private quota(tier: TierPolicy, withCurrentSnapshot: boolean) {
+    const id = Symbol("upload");
+    this.inflight.set(id, 0);
+    return {
+      admit: (size: number): boolean => {
+        const fixed = this.blobBytes() + (withCurrentSnapshot ? this.currentSnapshotBytes() : 0);
+        const ok = fixed + this.inflightBytes(id) + size <= tier.storageLimitBytes;
+        this.inflight.set(id, ok ? size : 0);
+        return ok;
+      },
+      release: () => this.inflight.delete(id),
+    };
+  }
+
+  private limitExceeded(tier: TierPolicy): Response {
+    return json(
+      { code: "storage_limit_exceeded", error: "storage usage exceeds tier limit", tier: tier.name, storageBytes: this.usageBytes(), storageLimitBytes: tier.storageLimitBytes },
+      409,
+    );
   }
 
   async missingBlobs(hashes: string[]): Promise<string[]> {
@@ -213,14 +258,15 @@ export class UserStore extends DurableObject<Env> {
     if (!userId) return errorJson(400, "missing user");
 
     if (url.pathname === "/events") return this.acceptEvents(request);
-    if (request.method === "PUT" && url.pathname === "/snapshot") {
-      const tier: TierPolicy = JSON.parse(request.headers.get("x-klip-tier") ?? "null");
+    const tier: TierPolicy | null = JSON.parse(request.headers.get("x-klip-tier") ?? "null");
+    if (request.method === "PUT" && !tier) return errorJson(400, "missing tier");
+    if (request.method === "PUT" && tier && url.pathname === "/snapshot") {
       const run = this.snapshotLock.then(() => this.uploadSnapshot(request, userId, tier));
       this.snapshotLock = run.catch(() => {});
       return run;
     }
     const blob = url.pathname.match(/^\/blobs\/([0-9a-f]{64})$/);
-    if (request.method === "PUT" && blob) return this.uploadBlob(request, userId, blob[1]);
+    if (request.method === "PUT" && tier && blob) return this.uploadBlob(request, userId, blob[1], tier);
     return errorJson(404, "not found");
   }
 
@@ -228,19 +274,27 @@ export class UserStore extends DurableObject<Env> {
     return (request.headers.get("content-encoding") ?? "").toLowerCase().includes("gzip");
   }
 
-  private async uploadBlob(request: Request, userId: string, sha: string): Promise<Response> {
+  private async uploadBlob(request: Request, userId: string, sha: string, tier: TierPolicy): Promise<Response> {
     const existing = this.sql.exec<{ size: number }>("SELECT size FROM blobs WHERE sha256=?", sha).toArray()[0];
     if (existing) {
       await request.body?.cancel();
       return json({ sha256: sha, size: existing.size, existing: true });
     }
+    const quota = this.quota(tier, true);
+    let admitted = true;
     let result: StoreResult;
     try {
-      result = await streamToR2(this.env.BUCKET, blobKey(userId, sha), request.body, this.isGzip(request), { expectedSha256: sha });
+      result = await streamToR2(this.env.BUCKET, blobKey(userId, sha), request.body, this.isGzip(request), {
+        expectedSha256: sha,
+        admit: (size) => (admitted = quota.admit(size)),
+      });
     } catch (e) {
       if (e instanceof GzipError) return errorJson(400, "invalid gzip payload");
       throw e;
+    } finally {
+      quota.release();
     }
+    if (!admitted) return this.limitExceeded(tier);
     if (!result.stored) return errorJson(400, "blob sha256 mismatch");
     this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?)", sha, result.size);
     await setStorageBytes(this.env, userId, this.usageBytes());
@@ -255,18 +309,25 @@ export class UserStore extends DurableObject<Env> {
   private async uploadSnapshot(request: Request, userId: string, tier: TierPolicy): Promise<Response> {
     const version = this.nextVersion();
     const key = snapshotKey(userId, version);
+    // 先确定放得下再发布：超额时什么都不改（当前快照、manifest、备份都不动）。
+    const quota = this.quota(tier, false);
     let result: StoreResult;
     try {
-      result = await streamToR2(this.env.BUCKET, key, request.body, this.isGzip(request), { maxBytes: tier.storageLimitBytes });
+      result = await streamToR2(this.env.BUCKET, key, request.body, this.isGzip(request), { admit: quota.admit });
     } catch (e) {
       if (e instanceof GzipError) return errorJson(400, "invalid gzip payload");
       throw e;
+    } finally {
+      quota.release();
     }
     if (!result.stored) {
-      return json(
-        { code: "snapshot_too_large", error: "snapshot size exceeds tier limit", tier: tier.name, snapshotBytes: result.size, storageLimitBytes: tier.storageLimitBytes },
-        413,
-      );
+      if (result.size > tier.storageLimitBytes) {
+        return json(
+          { code: "snapshot_too_large", error: "snapshot size exceeds tier limit", tier: tier.name, snapshotBytes: result.size, storageLimitBytes: tier.storageLimitBytes },
+          413,
+        );
+      }
+      return this.limitExceeded(tier);
     }
 
     const updatedAt = nowIso();
@@ -290,16 +351,15 @@ export class UserStore extends DurableObject<Env> {
       customMetadata: { snapshotKey: key },
     });
 
-    const pruned = await this.pruneBackups(userId, tier);
+    // 新快照已经发布：清理失败只记日志，不影响这次上传的结果，下次上传会再清。
+    let pruned = { count: 0, bytes: 0 };
+    try {
+      pruned = await this.pruneBackups(userId, tier);
+    } catch (e) {
+      console.error("prune backups failed", String(e));
+    }
     const storageBytes = this.usageBytes();
     await setStorageBytes(this.env, userId, storageBytes);
-
-    if (storageBytes > tier.storageLimitBytes) {
-      return json(
-        { code: "storage_limit_exceeded", error: "storage usage exceeds tier limit after pruning", tier: tier.name, storageBytes, storageLimitBytes: tier.storageLimitBytes },
-        409,
-      );
-    }
 
     this.broadcast(sseEvent("sync-updated", { version, updatedAt, sha256: result.sha256, size: result.size }));
 
@@ -327,10 +387,18 @@ export class UserStore extends DurableObject<Env> {
       doomed.push(b);
       usage -= b.size;
     }
-    if (doomed.length === 0) return { count: 0, bytes: 0 };
-    await this.env.BUCKET.delete(doomed.map((b) => snapshotKey(userId, b.version)));
-    for (const b of doomed) this.sql.exec("DELETE FROM snapshots WHERE version=?", b.version);
-    return { count: doomed.length, bytes: doomed.reduce((n, b) => n + b.size, 0) };
+    // 分批删：R2 一次最多 1000 个；每批删成功才从账目里去掉这一批。
+    const removed = { count: 0, bytes: 0 };
+    for (let i = 0; i < doomed.length; i += R2_DELETE_BATCH) {
+      const batch = doomed.slice(i, i + R2_DELETE_BATCH);
+      await this.env.BUCKET.delete(batch.map((b) => snapshotKey(userId, b.version)));
+      for (const b of batch) {
+        this.sql.exec("DELETE FROM snapshots WHERE version=?", b.version);
+        removed.count++;
+        removed.bytes += b.size;
+      }
+    }
+    return removed;
   }
 
   // ---- 推送 ----

@@ -68,8 +68,9 @@ export function normalizeEmail(value: unknown): string {
   return str(value).trim().toLowerCase();
 }
 
+/** 账号邮箱：普通写法，不含空白、控制字符和尖括号（邮箱会被拼进 SMTP 命令和邮件头）。 */
 export function isValidEmail(email: string): boolean {
-  return email.length > 0 && email.includes("@") && email.length <= 200;
+  return email.length <= 200 && /^[^\s<>()\[\],;:\\"@\x00-\x1f\x7f]+@[^\s<>()\[\],;:\\"@\x00-\x1f\x7f]+\.[^\s<>()\[\],;:\\"@\x00-\x1f\x7f]+$/.test(email);
 }
 
 export function asInt(value: unknown, fallback: number): number {

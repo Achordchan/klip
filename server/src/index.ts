@@ -254,12 +254,8 @@ const redeemCard: Handler = async (req, env) => {
   const raw = p?.code;
   if (typeof raw !== "string" || !raw.trim()) return errorJson(400, "missing code");
   const code = raw.trim().toUpperCase();
-  const card = await db.getCard(env, code);
-  if (!card || card.used_by) return errorJson(400, "card not found or used");
-  const claimed = await env.DB.prepare("UPDATE cards SET used_at=?, used_by=? WHERE code=? AND used_by IS NULL").bind(nowIso(), user.id, code).run();
-  if (!claimed.meta.changes) return errorJson(400, "card not found or used");
-  const expiresAt = db.extendFrom(await db.getSubscription(env, user.id), Number(card.duration_days));
-  await db.upsertSubscriptionStatement(env, user.id, expiresAt).run();
+  const expiresAt = await db.redeemCard(env, user.id, code);
+  if (!expiresAt) return errorJson(400, "card not found or used");
   return json({ success: true, expiresAt });
 };
 
@@ -305,10 +301,10 @@ const syncBlobCheck: Handler = async (req, env) => {
 };
 
 const syncBlobPut: Handler = async (req, env, _ctx, [raw]) => {
-  const { user } = await requireSync(req, env);
+  const { user, tier } = await requireSync(req, env);
   const sha = normalizeBlobSha256(raw);
   if (!sha) return errorJson(400, "invalid blob hash");
-  return forwardUpload(req, env, user.id, `/blobs/${sha}`);
+  return forwardUpload(req, env, user.id, `/blobs/${sha}`, { "x-klip-tier": JSON.stringify(tier) });
 };
 
 const syncBlobGet: Handler = async (req, env, _ctx, [raw]) => {
@@ -436,14 +432,12 @@ const adminUpgrade: Handler = async (req, env) => {
   if (hasTier && tier === null) return json({ error: "invalid tier", supportedTiers: SUPPORTED_TIERS }, 400);
   if (durationDays <= 0 && !hasTier) return errorJson(400, "missing operation (durationDays or tier required)");
 
-  let expiresAt = await db.getSubscription(env, user.id);
   const statements: D1PreparedStatement[] = [];
-  if (durationDays > 0) {
-    expiresAt = db.extendFrom(expiresAt, durationDays);
-    statements.push(db.upsertSubscriptionStatement(env, user.id, expiresAt));
-  }
+  if (durationDays > 0) statements.push(db.extendSubscriptionStatement(env, user.id, durationDays));
   if (hasTier) statements.push(env.DB.prepare("UPDATE users SET tier=?, updated_at=? WHERE id=?").bind(tier, nowIso(), user.id));
-  await env.DB.batch(statements);
+  statements.push(env.DB.prepare("SELECT expires_at FROM subscriptions WHERE user_id=?").bind(user.id));
+  const results = await env.DB.batch(statements);
+  const expiresAt = (results[results.length - 1].results[0] as { expires_at: string } | undefined)?.expires_at ?? null;
   return json({ success: true, expiresAt, email: user.email, userId: user.id, tier: tier ?? normalizeTierName(user.tier) });
 };
 

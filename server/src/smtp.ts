@@ -4,7 +4,7 @@
 import { connect } from "cloudflare:sockets";
 import type { Env } from "./env";
 import { envFlag } from "./env";
-import { PASSWORD_CODE_TTL_MINUTES } from "./util";
+import { PASSWORD_CODE_TTL_MINUTES, isValidEmail } from "./util";
 
 export function isEmailConfigured(env: Env): boolean {
   return Boolean(env.SMTP_HOST?.trim() && Number(env.SMTP_PORT) > 0 && smtpFrom(env));
@@ -90,10 +90,11 @@ class SmtpConnection {
     await this.writer.write(this.encoder.encode(line + "\r\n"));
   }
 
-  async command(line: string, expect: number[]): Promise<string> {
+  /** 发一条命令。出错信息只带 label，不带命令内容：认证那几条里是账号和密码。 */
+  async command(line: string, expect: number[], label: string): Promise<string> {
     await this.send(line);
     const r = await this.reply();
-    if (!expect.includes(r.code)) throw new Error(`smtp "${line.split(" ")[0]}" failed: ${r.text}`);
+    if (!expect.includes(r.code)) throw new Error(`smtp ${label} failed: ${r.code}`);
     return r.text;
   }
 
@@ -114,6 +115,8 @@ class SmtpConnection {
 }
 
 export async function sendMail(env: Env, to: string, message: string): Promise<void> {
+  const from = smtpFrom(env);
+  if (!isValidEmail(to) || !isValidEmail(from)) throw new Error("smtp refused: invalid mailbox");
   const ssl = envFlag(env.SMTP_SSL, false);
   const starttls = !ssl && envFlag(env.SMTP_STARTTLS, true);
   const socket = connect(
@@ -125,24 +128,24 @@ export async function sendMail(env: Env, to: string, message: string): Promise<v
   const run = async () => {
     const greeting = await conn.reply();
     if (greeting.code !== 220) throw new Error(`smtp greeting: ${greeting.text}`);
-    await conn.command("EHLO klip-sync", [250]);
+    await conn.command("EHLO klip-sync", [250], "EHLO");
     if (starttls) {
-      await conn.command("STARTTLS", [220]);
+      await conn.command("STARTTLS", [220], "STARTTLS");
       await conn.upgradeTls();
-      await conn.command("EHLO klip-sync", [250]);
+      await conn.command("EHLO klip-sync", [250], "EHLO");
     }
     const user = env.SMTP_USER?.trim();
     if (user) {
-      await conn.command("AUTH LOGIN", [334]);
-      await conn.command(b64(user), [334]);
-      await conn.command(b64(env.SMTP_PASSWORD ?? ""), [235]);
+      await conn.command("AUTH LOGIN", [334], "AUTH");
+      await conn.command(b64(user), [334], "AUTH user");
+      await conn.command(b64(env.SMTP_PASSWORD ?? ""), [235], "AUTH password");
     }
-    await conn.command(`MAIL FROM:<${smtpFrom(env)}>`, [250]);
-    await conn.command(`RCPT TO:<${to}>`, [250, 251]);
-    await conn.command("DATA", [354]);
-    await conn.command(`${message}\r\n.`, [250]);
+    await conn.command(`MAIL FROM:<${from}>`, [250], "MAIL FROM");
+    await conn.command(`RCPT TO:<${to}>`, [250, 251], "RCPT TO");
+    await conn.command("DATA", [354], "DATA");
+    await conn.command(`${message}\r\n.`, [250], "message");
     try {
-      await conn.command("QUIT", [221]);
+      await conn.command("QUIT", [221], "QUIT");
     } catch {
       /* 邮件已经交出去了 */
     }
