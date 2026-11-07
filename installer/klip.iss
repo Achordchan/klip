@@ -1,6 +1,14 @@
 #define MyAppName "Klip"
 #define MyAppPublisher "Achord Chan"
-#define MyAppExeName "maccy.exe"
+; The Go program (release_go.py passes /DGoBuild) is Klip.exe, its installer
+; Klip-<version>-setup.exe; a build of the C# program keeps its names.
+#ifdef GoBuild
+  #define MyAppExeName "Klip.exe"
+  #define MyOutputPrefix "Klip"
+#else
+  #define MyAppExeName "maccy.exe"
+  #define MyOutputPrefix "maccy"
+#endif
 #ifndef MyPublishDir
   #define MyPublishDir SourcePath + "..\artifacts\publish\win-x64"
 #endif
@@ -22,7 +30,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=..\artifacts\installer
-OutputBaseFilename=maccy-{#MyAppVersionShort}-setup
+OutputBaseFilename={#MyOutputPrefix}-{#MyAppVersionShort}-setup
 SetupIconFile=..\klip\Assets\avalonia-logo.ico
 Compression=lzma
 SolidCompression=yes
@@ -94,6 +102,20 @@ begin
     DeleteFile(Cur);
 end;
 
+// RepointAutostart points the sign-in entry (the Run value "maccy", which
+// every version uses) at the program just installed, when there is one and it
+// is not blank. The C# program's entry names maccy.exe, which is removed just
+// before: left as it was, the next sign-in would start nothing, and Klip
+// repairs it only when it is started (the user may sign in again before).
+// No entry, or a blank one, is the user's choice and stays.
+procedure RepointAutostart();
+var
+  V: String;
+begin
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'maccy', V) and (Trim(V) <> '') then
+    RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'maccy', '"' + ExpandConstant('{app}\{#MyAppExeName}') + '"');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
@@ -102,6 +124,7 @@ begin
 #if FileExists(SourcePath + "legacy-delete.iss")
     #include "legacy-delete.iss"
 #endif
+    RepointAutostart();
 #endif
     // the shortcuts that were called Maccy before the program was renamed Klip
     DeleteFile(ExpandConstant('{userprograms}\Maccy.lnk'));

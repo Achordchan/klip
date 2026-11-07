@@ -14,10 +14,10 @@ import (
 // Addresses the window opens (AuthorInfoWindow).
 const (
 	Email      = "achordchan@gmail.com"
-	ProjectURL = "https://gitee.com/Achordchan/maccy"
-	PrivacyURL = "https://gitee.com/Achordchan/maccy/blob/master/docs/privacy.md"
-	LicenseURL = "https://gitee.com/Achordchan/maccy/blob/master/LICENSE"
-	SponsorURL = "https://gitee.com/Achordchan/maccy/blob/master/docs/sponsor.md"
+	ProjectURL = "https://github.com/Achordchan/klip"
+	PrivacyURL = "https://github.com/Achordchan/klip/blob/main/docs/privacy.md"
+	LicenseURL = "https://github.com/Achordchan/klip/blob/main/LICENSE"
+	SponsorURL = "https://github.com/Achordchan/klip/blob/main/docs/sponsor.md"
 )
 
 // Size of the window.

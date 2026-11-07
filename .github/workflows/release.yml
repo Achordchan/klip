@@ -1,0 +1,98 @@
+name: Build and release
+
+# Every pull request and push to main: the tests on Windows, the release
+# files, the installer over a C# installation, and a real unattended update
+# from this version to the next. A tag v<version> does the same and then
+# publishes the GitHub release, whose manifest.json the installed versions
+# read (releases/latest/download/manifest.json).
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # the release, on a tag only
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version
+        id: version
+        run: |
+          $v = (Select-String -Path app/internal/version/version.go -Pattern 'Version = "([0-9.]+)"').Matches[0].Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}".TrimStart("v")
+            if ($tag -ne $v) { throw "tag v$tag does not match the program's version $v (app/internal/version)" }
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "version $v"
+
+      - name: Go vet (Windows)
+        working-directory: app
+        run: go vet ./...
+
+      - name: Go tests (Windows)
+        working-directory: app
+        run: go test ./... -count=1
+
+      - name: Release tool tests
+        working-directory: tools
+        run: python test_release_go.py
+
+      - name: Inno Setup
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Release files
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true # a failed command fails the step
+          python tools/release_go.py release --version ${{ steps.version.outputs.version }} --notes-file docs/release-notes/v${{ steps.version.outputs.version }}.md
+          Get-ChildItem artifacts/release | Format-Table Name, Length
+
+      - name: Installer over a C# installation, then an unattended update to the next version
+        run: python tools/e2e_update.py --version ${{ steps.version.outputs.version }} --installer artifacts/release/Klip-${{ steps.version.outputs.version }}-setup.exe --work "${{ runner.temp }}/e2e"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Klip-${{ steps.version.outputs.version }}-win-x64
+          path: artifacts/release/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          # All files in one call: the release is published only once they are
+          # all there, so "latest" never points at a release without its manifest.
+          gh release create "v$v" --verify-tag --title "Klip $v" --notes-file "docs/release-notes/v$v.md" `
+            "artifacts/release/Klip-$v-setup.exe" "artifacts/release/Klip-$v-win-x64.zip" "artifacts/release/manifest.json"

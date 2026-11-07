@@ -1,50 +1,41 @@
 # Klip
 
-Klip is an open-source clipboard management tool designed specifically for Windows. It helps users manage and utilize clipboard content more efficiently, supporting capture and paste of text, images, and files.
+Klip is a clipboard manager: it keeps the text, images and files you copy, so you can search, pin, annotate and paste them again, and sync your history across devices with an account.
 
-## Key Features
+[中文](README.md)
 
-- **Clipboard History**: Automatically saves historical clipboard content for easy access anytime.
-- **Multi-format Support**: Supports capture and paste of text, images, and files.
-- **User-Friendly Interface**: A clean and intuitive interface for effortless operation.
-- **Quick Search**: Provides a search function to easily locate desired content.
-- **Auto-Start**: Supports automatic launch upon system startup.
-- **Update Check**: Built-in update checking to ensure the software remains up to date.
+## Download
 
-## Installation Guide
+Get `Klip-<version>-setup.exe` from [Releases](https://github.com/Achordchan/klip/releases/latest) and run it (Windows 10 / 11, 64-bit).
 
-### Windows
+- Press `Ctrl + Alt + 2` to open the panel.
+- **Updates are seamless**: a new version is downloaded in the background and installed when you have been away for a few minutes with Klip's windows closed, then Klip starts again on its own. If it cannot be installed, the previous version is put back.
+- **Upgrading from 1.0.10 or earlier**: those versions do not receive the update by themselves. Download the installer and install over them; history, settings, sign-in, sync and start-at-login are kept.
 
-1. Download the latest installation package.
-2. Run the installer and follow the prompts to complete installation.
-3. After installation, Klip will automatically display an icon in the system tray.
+## Repository
 
-## Usage Instructions
+| Folder | Contents |
+|---|---|
+| `app/` | The client (Go + [MyGo](https://github.com/egoist/mygo)) |
+| `nas-agent-py/` | The sync server (FastAPI) |
+| `installer/klip.iss` | Inno Setup script |
+| `tools/release_go.py` | Build and packaging: `Klip.exe`, installer, update package, update manifest |
+| `tools/e2e_update.py` | End-to-end test on Windows: installing over the old version, and an unattended update to the next one |
+| `.github/workflows/release.yml` | GitHub Actions: tests, build, end-to-end test; publishes the release on a tag |
+| `klip/` | The old C# client (1.0.10 and earlier), for reference |
 
-- **Open/Close Clipboard Window**: Default shortcut is `Ctrl + Shift + V`.
-- **Search Content**: Use the search box in the clipboard window to filter items by keyword.
-- **Apply Content**: Click on any history item to paste it into the currently active application.
-- **Edit Notes**: Right-click an item and select "Edit Note" to add descriptive information.
-- **Pin Items**: Right-click an item and select "Pin" to prevent it from being automatically cleared.
-- **Delete Items**: Right-click an item and select "Delete" to remove unwanted entries.
+## Development
 
-## Settings
+```bash
+cd app
+go run ./cmd/klip
+go test ./...
+```
 
-- **Theme Settings**: Supports three theme modes: Follow System, Dark, and Light.
-- **Capture Settings**: Enable or disable capture of text, images, and files individually.
-- **History Limits**: Set the maximum number of saved items and maximum storage capacity.
-- **Auto-Start**: Enable the "Start with System" option in settings for automatic launch on boot.
+## Releasing
 
-## Contribution Guide
-
-We welcome contributions of all kinds. If you're interested in contributing to development, please follow these steps:
-
-1. Fork the project repository.
-2. Create a new branch (`git checkout -b feature/new-feature`).
-3. Commit your changes (`git commit -am 'Add some feature'`).
-4. Push to the branch (`git push origin feature/new-feature`).
-5. Create a Pull Request.
+Set the version in `app/internal/version/version.go`, write `docs/release-notes/v<version>.md`, merge to `main`, then push the tag `v<version>`. GitHub Actions tests, builds, runs the end-to-end update test and publishes the release; installed copies learn about it from the release's `manifest.json`.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+See [LICENSE](LICENSE).

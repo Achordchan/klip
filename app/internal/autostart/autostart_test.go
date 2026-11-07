@@ -15,7 +15,7 @@ func (k fakeKey) Delete(n string) error       { delete(k, n); return nil }
 
 func TestRegistryUsesTheNameOfOldVersions(t *testing.T) {
 	k := fakeKey{}
-	r := Registry{Key: k, Exe: `C:\Users\me\AppData\Local\Programs\maccy\maccy.exe`}
+	r := Registry{Key: k, Exe: `C:\Users\me\AppData\Local\Programs\maccy\Klip.exe`}
 	if r.IsEnabled() {
 		t.Fatal("empty key is not enabled")
 	}
@@ -23,7 +23,7 @@ func TestRegistryUsesTheNameOfOldVersions(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Byte for byte what 1.0.10 writes: value "maccy", the path in quotes.
-	if got, ok := k["maccy"]; !ok || got != `"C:\Users\me\AppData\Local\Programs\maccy\maccy.exe"` || len(k) != 1 {
+	if got, ok := k["maccy"]; !ok || got != `"C:\Users\me\AppData\Local\Programs\maccy\Klip.exe"` || len(k) != 1 {
 		t.Fatalf("registry: %#v", k)
 	}
 	if !r.IsEnabled() {
@@ -131,5 +131,46 @@ func TestSwitchedOffEntryIsNotEnabled(t *testing.T) {
 	_ = os.WriteFile(f, append(b, []byte("Hidden=true\n")...), 0o644) // as a startup manager does it
 	if d.IsEnabled() {
 		t.Fatal("an entry marked Hidden is off")
+	}
+}
+
+func TestRepairPointsTheOldEntryAtThisProgram(t *testing.T) {
+	exe := `C:\Users\me\AppData\Local\Klip\Klip.exe`
+	k := fakeKey{"maccy": `"C:\Users\me\AppData\Local\Klip\maccy.exe"`}
+	if err := (Registry{Key: k, Exe: exe}).Repair(); err != nil {
+		t.Fatal(err)
+	}
+	if k["maccy"] != `"`+exe+`"` {
+		t.Fatalf("value %q", k["maccy"])
+	}
+	// The same folder in another spelling (case, slashes) is the same.
+	k = fakeKey{"maccy": `"c:/users/me/appdata/local/klip/MACCY.EXE"`}
+	if err := (Registry{Key: k, Exe: exe}).Repair(); err != nil || k["maccy"] != `"`+exe+`"` {
+		t.Fatalf("value %q (%v)", k["maccy"], err)
+	}
+	// Any entry that is not the old program file stays: this one, in another
+	// spelling of the case, the Klip.exe the user installed while this is a
+	// build run from a temporary folder (go run), another program the user
+	// put there.
+	for _, v := range []string{
+		`"c:\users\me\appdata\local\klip\klip.exe"`,
+		`"C:\Users\me\AppData\Local\Klip\Klip.exe"`,
+		`"D:\tools\other.exe"`,
+		// The C# program of another folder: an installation that is still
+		// there, while this is a build of go run.
+		`"C:\Users\me\AppData\Local\Klip\maccy.exe"`,
+		`"maccy.exe"`,
+	} {
+		k := fakeKey{"maccy": v}
+		if err := (Registry{Key: k, Exe: `C:\Users\me\AppData\Local\Temp\go-build1\exe\klip.exe`}).Repair(); err != nil || k["maccy"] != v {
+			t.Fatalf("%s rewritten to %q (%v)", v, k["maccy"], err)
+		}
+	}
+	// No entry, or a blank one: the user did not ask to start at sign-in.
+	for _, k := range []fakeKey{{}, {"maccy": "  "}} {
+		before := len(k)
+		if err := (Registry{Key: k, Exe: exe}).Repair(); err != nil || len(k) != before || strings.TrimSpace(k["maccy"]) != "" {
+			t.Fatalf("an entry was made: %v %v", k, err)
+		}
 	}
 }

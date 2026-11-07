@@ -1,41 +1,44 @@
+import json
 import tempfile
-import subprocess
 import unittest
 from pathlib import Path
 
-from release_go import commit_manifest, package_file_list
+from release_go import LEGACY_CSHARP, legacy_files_from, package_file_list, write_legacy_delete
 
 
-class ManifestCommitTests(unittest.TestCase):
+class ReleaseToolTests(unittest.TestCase):
     def test_nested_generated_archives_are_excluded(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            (root / "maccy.exe").write_bytes(b"app")
+            (root / "Klip.exe").write_bytes(b"app")
             (root / "packages").mkdir()
             (root / "packages/maccy-1.0.1-win-x64.zip").write_bytes(b"old")
-            self.assertEqual([f["path"] for f in package_file_list(root)], ["maccy.exe"])
+            (root / "packages/Klip-1.0.12-win-x64.zip").write_bytes(b"old")
+            self.assertEqual([f["path"] for f in package_file_list(root)], ["Klip.exe"])
 
-    def test_empty_success_and_rejected_commit(self):
+    def test_the_csharp_file_list_is_read(self):
+        # The list committed for the installer: the old program file and its
+        # .NET libraries, never what the new program has or the user's data.
+        legacy = legacy_files_from(str(LEGACY_CSHARP), {"Klip.exe", "mygo-sqlite3.dll"})
+        lowered = {p.lower() for p in legacy}
+        self.assertIn("maccy.exe", lowered)
+        self.assertIn("maccy.dll", lowered)
+        self.assertNotIn("klip.exe", lowered)
+        for p in lowered:
+            self.assertFalse(p.startswith(("images/", "files/", "blobs/", "sync/", "updates/")), p)
+            self.assertNotIn(p, ("settings.json", "history.json"))
+
+    def test_the_old_program_file_is_deleted_without_a_list(self):
         with tempfile.TemporaryDirectory() as folder:
-            repo = Path(folder)
-            def git(*args):
-                return subprocess.run(["git", *args], cwd=repo, check=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            git("init")
-            git("config", "user.name", "Test")
-            git("config", "user.email", "test@example.invalid")
-            commit_manifest(repo, "1.0")
-            (repo / "manifest.json").write_text("{}")
-            git("add", "manifest.json")
-            hook = repo / ".git/hooks/pre-commit"
-            hook.write_text("#!/bin/sh\nexit 1\n")
-            hook.chmod(0o755)
-            with self.assertRaises(SystemExit):
-                commit_manifest(repo, "1.0")
-            hook.unlink()
-            commit_manifest(repo, "1.0")
-            self.assertIn(b"update manifest for v1.0", git("log", "-1", "--format=%s").stdout)
-            commit_manifest(repo, "1.0")
+            root = Path(folder)
+            (root / "Klip.exe").write_bytes(b"app")
+            out = write_legacy_delete(root, None, root / "legacy-delete.iss")
+            self.assertEqual(out.read_text(encoding="utf-8").count("DeleteLegacy('maccy.exe');"), 1)
+
+    def test_the_csharp_file_list_is_well_formed(self):
+        data = json.loads(LEGACY_CSHARP.read_text(encoding="utf-8"))
+        self.assertGreater(len(data["files"]), 10)
+        self.assertTrue(all("/" not in f["path"] or not f["path"].startswith("/") for f in data["files"]))
 
 
 if __name__ == "__main__":

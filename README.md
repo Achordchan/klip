@@ -1,141 +1,74 @@
 # Klip
 
-Klip 是一个面向 Windows 的剪贴板管理工具。当前仓库包含桌面客户端、Python 同步后端、自动更新清单和安装包脚本。
+Klip 是一个剪贴板管理工具：记下你复制过的文字、图片和文件，随时搜索、置顶、备注，再贴回去；可以登录账号，在多台设备间同步历史。
 
-## 功能概览
+[English](README.en.md)
 
-- 记录剪贴板历史，支持文本、图片和文件列表
-- 支持搜索、备注、置顶、删除和重复内容合并
-- 支持历史持久化，以及按条目数/容量自动清理
-- 支持主题、开机启动、捕获开关、文件扩展名和文件大小限制
-- 提供全局快捷键 `Ctrl + Alt + 2` 呼出主窗口
-- 支持自建 `nas-agent-py` 后端进行账号登录、订阅状态查询、快照同步、Blob 去重传输和 SSE 事件触发同步
-- 支持通过更新清单检查新版本、下载安装包并校验 `sha256`
+## 下载
+
+到 [Releases](https://github.com/Achordchan/klip/releases/latest) 下载 `Klip-<版本>-setup.exe`，运行即可（Windows 10 / 11，64 位）。
+
+- 装好后按 `Ctrl + Alt + 2` 呼出面板。
+- **自动更新是无感的**：有新版本时 Klip 在后台下载好，等你离开电脑几分钟、窗口都关着时自动换上并重新启动；装不上会回到原来的版本。
+- **从旧版（1.0.10 及更早）升级**：旧版不会自动收到新版本，请下载安装包直接覆盖安装。历史、设置、登录状态、云同步和开机启动都会保留。
+
+## 功能
+
+- 剪贴板历史：文本、图片、文件列表；搜索、备注、置顶、拖动排序、重复内容合并
+- 按条目数 / 容量自动清理，置顶的可以不算在内；图片可以存成 WebP
+- 悬停预览，预览里的文字可以选中复制
+- 货架：按住修饰键拖动并晃动鼠标，临时放文件
+- 主题、开机启动、捕获开关、文件扩展名和大小限制；存储位置可以迁移
+- 账号与订阅，快照同步、Blob 去重传输、服务器推送触发同步
 
 ## 仓库结构
 
-- `klip/`：Windows 桌面客户端，技术栈为 `.NET 8 + Avalonia 11`
-- `nas-agent-py/`：Python 同步后端，技术栈为 `FastAPI + uvicorn + httpx + PyJWT`
-- `docs/updates/manifest.json`：客户端自动更新清单
-- `installer/klip.iss`：Inno Setup 安装包脚本
-- `tools/package_nas_agent_py.py`：后端上传包生成脚本
-- `docs/deploy/baota-python-nas-agent.md`：宝塔 Python 项目部署说明
+| 目录 | 内容 |
+|---|---|
+| `app/` | 客户端（Go + [MyGo](https://github.com/egoist/mygo)），说明见 [`app/README.md`](app/README.md) |
+| `nas-agent-py/` | 同步后端（FastAPI），部署见 [`docs/deploy/baota-python-nas-agent.md`](docs/deploy/baota-python-nas-agent.md) |
+| `installer/klip.iss` | Inno Setup 安装包脚本 |
+| `tools/release_go.py` | 构建与打包：`Klip.exe`、安装包、更新包、更新清单 |
+| `tools/e2e_update.py` | Windows 上的端到端测试：覆盖安装旧版、无人值守地自动更新到下一个版本 |
+| `.github/workflows/release.yml` | GitHub Actions：测试、构建、端到端测试，推送 tag 时发布 |
+| `docs/release-notes/` | 每个版本的发布说明 |
+| `klip/` | 旧的 C# 客户端（1.0.10 及更早），只作参考 |
 
-## 客户端开发
+## 开发
 
-### 环境要求
+需要 Go（版本见 `app/go.mod`）。
 
-- Windows 10 / 11
-- .NET 8 SDK
-- Inno Setup 6
-
-### 本地运行
-
-```powershell
-dotnet build .\klip\klip.csproj
-dotnet run --project .\klip\klip.csproj
+```bash
+cd app
+go run ./cmd/klip
+go test ./...
 ```
 
-启动后默认通过全局快捷键 `Ctrl + Alt + 2` 呼出主窗口。
+Windows 版本可以在任何系统上交叉编译：
 
-### 发布目录
-
-```powershell
-dotnet publish .\klip\klip.csproj -c Release -r win-x64 --self-contained false -o .\artifacts\publish\win-x64
+```bash
+python3 tools/release_go.py build --version 1.0.11 --publish-dir /path/to/out
 ```
 
-### 打包安装程序
+## 发布
 
-```powershell
-"D:\Inno Setup 6\ISCC.exe" .\installer\klip.iss
-```
+1. 修改 `app/internal/version/version.go` 里的版本号，写好 `docs/release-notes/v<版本>.md`，合并到 `main`。
+2. 推送 tag：`git tag v<版本> && git push origin v<版本>`。
+3. GitHub Actions 在 Windows 上跑全部测试、构建安装包和更新包、跑端到端更新测试，全部通过后发布 Release。已安装的 Klip 从最新 Release 的 `manifest.json` 得知新版本。
 
-## 同步后端 `nas-agent-py`
+## 同步后端
 
-`nas-agent-py` 是当前客户端实际对接的后台服务，不是旧的 `.NET + Docker` 方案。它主要负责：
-
-- `GET /health`：健康检查
-- `POST /auth/register`、`/auth/login`、`/auth/refresh`
-- `GET /auth/me`
-- `GET /subscription/status`
-- `POST /card/redeem`
-- `GET /sync/manifest`
-- `GET/PUT /sync/snapshot`
-- `POST /sync/blobs/check`
-- `GET/PUT /sync/blobs/{blob_sha256}`
-- `GET /sync/events`
-- `GET /admin` 及一组后台管理接口
-
-### 环境变量
-
-可以参考 `nas-agent-py/.env.example`：
-
-- `STORAGE_ROOT`：后端数据目录
-- `ADMIN_KEY`：后台管理密钥
-- `ADMIN_EMAIL`：后台登录邮箱
-- `ADMIN_PASSWORD`：后台登录密码
-- `AUTH_ISSUER`：JWT issuer
-- `AUTH_AUDIENCE`：JWT audience
-- `AUTH_SIGNING_KEY`：JWT 签名密钥
-- `LISTEN_HOST`：监听地址
-- `LISTEN_PORT`：监听端口
-
-### 本地启动
+`nas-agent-py` 提供账号、订阅、快照与 Blob 同步、SSE 事件和后台管理。本地启动：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\pip install -r .\nas-agent-py\requirements.txt
 Copy-Item .\nas-agent-py\.env.example .\nas-agent-py\.env
-# 按需修改 .\nas-agent-py\.env
 .\.venv\Scripts\python -m uvicorn main:app --app-dir .\nas-agent-py --host 127.0.0.1 --port 17655
 ```
 
-启动后可访问：
+环境变量见 `nas-agent-py/.env.example`；打包上传用 `python tools/package_nas_agent_py.py`。
 
-- `http://127.0.0.1:17655/health`
-- `http://127.0.0.1:17655/admin`
+## 许可
 
-在 Linux / 宝塔环境中，也可以直接使用 `nas-agent-py/run.sh` 启动，它会读取 `LISTEN_HOST` 和 `LISTEN_PORT`。
-
-### 兼容性烟雾测试
-
-```powershell
-.\.venv\Scripts\python .\nas-agent-py\tests\compat_smoke.py --base-url http://127.0.0.1:17655 --admin-key change-me --skip-upload
-```
-
-如果要覆盖快照上传下载链路，可以去掉 `--skip-upload`。
-
-### 打包上传
-
-```powershell
-python .\tools\package_nas_agent_py.py
-```
-
-输出目录：
-
-- `artifacts/nas-agent-py/current/`
-- `artifacts/nas-agent-py/nas-agent-py-upload.zip`
-
-## 自动更新
-
-客户端读取：
-
-- `docs/updates/manifest.json`
-
-更新流程基于以下字段：
-
-- `latest.version`
-- `latest.notes`
-- `latest.installer.url`
-- `latest.installer.sha256`
-- `latest.installer.size`
-
-如果发现更高版本，客户端会下载 `latest.installer.url` 指向的安装包，校验 `sha256` 后启动安装器。
-
-## 部署参考
-
-- [宝塔部署 `nas-agent-py`](docs/deploy/baota-python-nas-agent.md)
-
-## 发布仓库
-
-- Gitee: https://gitee.com/Achordchan/maccy
+见 [LICENSE](LICENSE)。

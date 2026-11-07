@@ -208,7 +208,7 @@ cd app && KLIP_REAL_CLIPBOARD=1 go test -count=1 -race ./internal/platform/
 
 **规则（照 C#）**：数字输入按键就写入，停 0.7 秒后才弹“设置已生效”；最大条目必须大于 0，否则忽略；单文件上限最小 1、最大不超过历史容量，校正后写回输入框且不弹提示；把历史容量改小会同时把单文件上限压下来；打开窗口时，空的或旧默认的文件后缀换成新默认，“开机启动”以系统里的实际状态为准；货架触发键为 `Disabled` 时显示为未启用。
 
-**开机启动**：Windows 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `maccy`，值是带引号的程序路径，与 1.0.10 一模一样，所以升级后用户原来的选择还在；两个版本互相开关的是同一条。因为 1.0.11 的程序文件名仍是 `maccy.exe`，原来的路径继续有效。
+**开机启动**：Windows 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `maccy`，值是带引号的程序路径，与 1.0.10 一模一样，所以升级后用户原来的选择还在。1.0.11 起程序文件名是 `Klip.exe`：启动时若这条值存在、指的却是别的文件（C# 版的 `maccy.exe`），就改成当前程序（`autostart.Repair`）；安装包同时删掉旧的 `maccy.exe`，免得登录时启动旧程序。
 
 **账号**：错误提示沿用 C# 的对照（`邮箱或密码不正确`、`验证码错误或已过期`、`邮件服务尚未配置，请联系管理员` 等）；兑换卡密失败时服务器回的是 JSON，和 C# 一样只显示“兑换失败”；登录或注册成功后立即同步一次（`app.AccountChanged`）；一个服务器说不认的访问令牌会让账号退出登录，邮箱保留。
 
@@ -232,21 +232,15 @@ cd app && KLIP_REAL_CLIPBOARD=1 go test -count=1 -race ./internal/platform/
 
 ## 更新与发布（internal/update、updatewin、tools/release_go.py）
 
-**客户端**：启动 6 秒后、之后每 12 小时静默检查一次清单（`https://gitee.com/Achordchan/maccy/raw/master/docs/updates/manifest.json`，1.0.10 读的同一个地址）；发现新版本时面板页脚出现“新版本 x.y.z”按钮，托盘和偏好设置里也有“检查更新”。更新窗口显示更新内容，“立即更新”先下载轻量包（zip），校验大小和 SHA-256，解到暂存目录再逐文件校验；然后把自己复制一份当辅助程序（`updates/helper/`），写下计划文件，退出；辅助程序等进程结束，再次校验、备份、拷贝、拷后校验、删上一版清单里有而新版没有的文件和 `legacyFiles`、记下新清单、重新启动 `maccy.exe`，任何一步失败都回滚、弹窗、重启旧程序。轻量包失败时若有安装包就改用安装包（辅助程序等退出后启动它）。规则和文字全部照 1.0.10 的 `UpdateService` / `UpdateCoordinator`，只有两点不同：辅助程序是 Go 不是 PowerShell；拷贝失败会重试几次（杀毒软件刚写完的文件可能被占）。
+**客户端**：启动 6 秒后、之后每 12 小时静默检查一次清单 `https://github.com/Achordchan/klip/releases/latest/download/manifest.json`（最新一个正式 GitHub Release 的附件，草稿和预发布不算）。有能装的新版本时先在后台下载、校验、解好（不出现在界面上）；用户离开电脑 3 分钟以上、面板/偏好设置/关于/更新窗口都关着、没有同步/迁移/手动更新时，在界面线程上做最后决定，写下这一次专属的确认文件后退出。辅助程序（程序自己的副本，`updates/helper/`）只有看到确认文件才动手：再次校验、备份、拷贝、拷后校验、删上一版有而新版没有的文件、记下新清单、写结果、带“安静启动”标记重启 `Klip.exe`；任何一步失败都回滚并重启旧版本。同一版本最多自动试 2 次。面板页脚的“新版本 x.y.z”按钮和“检查更新”仍可手动更新。
 
-**1.0.10 → 1.0.11 的第一跳**由 1.0.10 自己的 PowerShell 脚本完成，所以包必须符合它认的格式：`maccy.exe`、`maccy-package.json`（`appId: maccy`、版本、runtime、每个文件的 `path/sha256/size`）、不含用户数据路径。1.0.10 是依赖 .NET 运行时的发布，更新后目录里会剩下 41 个旧文件（`maccy.dll`、Avalonia 的 dll 等），它们的名字写在包清单的 `legacyFiles` 里（1.0.10 读不懂也不管），新程序第一次启动时清掉（`update.CleanLegacy`）；用安装包升级则由 `installer/klip.iss` 的 `[InstallDelete]` 清。
+**C# 版（1.0.10 及更早）**：不再通过它的自动更新升级（它读 Gitee 上的旧清单，仍停在 1.0.10）。用户下载安装包覆盖安装：`installer/klip.iss` 装完后删掉 `installer/legacy-csharp-files.json` 列出的 C# 程序文件（1.0.9、1.0.10 轻量包的文件清单）和 `maccy.exe`，用户数据不动。数据目录、注册表值名、互斥体 `maccy_mutex`、安装程序的 AppId 都没变。
 
-**发布**：`python tools/release_go.py release --version 1.0.11 --notes-file notes.txt --legacy-from manifest`（Windows，需要 Inno Setup；`--publish-gitee --yes` 同时上传并推送）。它交叉编译 `maccy.exe`（GUI 子系统、`-trimpath -s -w`、写入版本、用 `go-winres` 嵌入图标与文件/产品版本）、从 MyGo 的清单下载并校验 `mygo-sqlite3.dll`、编安装包、打 zip、更新 `docs/updates/manifest.json`。`build` 和 `package` 子命令在任何装有 Go 的系统上都能跑。`--legacy-from manifest` 会下载清单里现在那个包，取它的文件清单。清单的 `packages` 数组是给以后多平台用的（1.0.10 不读）；现在只写 `package`（win-x64）。
+**发布**：在 GitHub 推送 tag `v<版本>`（与 `internal/version` 一致），`.github/workflows/release.yml` 在 Windows 上跑全部测试、`python tools/release_go.py release --version <版本> --notes-file docs/release-notes/v<版本>.md`（交叉编译 `Klip.exe`、下载并校验 `mygo-sqlite3.dll`、编 Inno 安装包、打 zip、写 `manifest.json`，都在 `artifacts/release/`），再跑 `tools/e2e_update.py`，最后用一次 `gh release create` 把安装包、zip、清单一起发出去。每个 PR 和 main 的推送也跑同样的构建和测试，只是不发布。
 
-**程序**：`maccy.exe` 约 13 MB（含 MyGo 的界面引擎），加 `mygo-sqlite3.dll` 1.4 MB；zip 约 6 MB。启动时在 Windows 上取命名互斥体 `maccy_mutex`（与 1.0.10 和安装程序的 `AppMutex` 一致，安装程序据此要求关闭正在运行的程序）。
+**端到端验证**（`tools/e2e_update.py`，CI 的 Windows 上每次都跑）：先把安装包静默装到一个“像装过 C# 版”的文件夹，检查 `Klip.exe` 装上、C# 文件删掉、用户数据还在；再把这份代码编成“已安装的版本”（清单地址指到本机，`-ldflags -X app.UpdateManifestURL=…`）和“下一个版本”，本机提供下一个版本的包和清单，无人操作地启动已安装的版本，等它自己更新：安装目录里的 `Klip.exe` 变成新版本、辅助程序记下已应用、新版本在运行、是安静启动的、读走了结果。
 
-**升级验证**：见 [`docs/upgrade-verification-1.0.11.md`](../docs/upgrade-verification-1.0.11.md)。`cmd/klip-testbed` 是个小服务，让 1.0.10（地址写死为 gitee.com）去一个本机的、还没发布的 1.0.11 更新：hosts 指向本机、信任它生成的自签名证书、以管理员运行。
-
-**测试**：
-- `internal/update`：版本、保护路径与 C# 源码对照、检查的各种结果与重试超时、下载校验、zip 校验的每条规则、zip-slip、应用更新（成功、保留用户数据、删旧文件、中途失败回滚、拷后校验失败回滚、保护路径拒绝、安装包计划）、`CleanLegacy`、协调器全流程；加上**发布工具（Python）打出的 zip 与清单被 Go 客户端接受**。变异检查：保护路径、回滚、拷后校验、重试状态码、版本修订号、大小校验、zip 重名都能被抓到。
-- `cmd/klip`：编译真实程序，当辅助程序跑一遍（换文件、删旧文件、保留数据、重启新程序）。
-- `cmd/klip-testbed`：测试服务的路径映射和证书。
-- `internal/updatewin`：窗口各状态。
+**程序**：`Klip.exe` 约 13 MB（含 MyGo 的界面引擎），加 `mygo-sqlite3.dll` 1.4 MB；zip 约 6 MB。启动时在 Windows 上取命名互斥体 `maccy_mutex`（安装程序的 `AppMutex` 据此要求关闭正在运行的程序）。
 
 **没有验证的**：Windows 上的任何真实运行——1.0.10 的 PowerShell 脚本吃这个包、辅助程序在 Windows 上等进程退出和重启、Inno 脚本的编译与覆盖安装（`[InstallDelete]` 的通配符）、`go-winres` 嵌入的图标在资源管理器里的样子（只验证了版本信息进了 exe）、未签名程序被 Defender/SmartScreen 拦不拦。这些都列在升级验证方案里，需要一台 Windows 虚拟机。macOS 和 Linux 没有轻量更新：检查更新照常，“立即更新”会给出发布页地址。
 

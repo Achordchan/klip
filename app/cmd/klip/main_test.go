@@ -41,12 +41,12 @@ func TestHelperModeEndToEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	must(os.WriteFile(filepath.Join(install, "maccy.exe"), []byte("old"), 0o755))
+	must(os.WriteFile(filepath.Join(install, "Klip.exe"), []byte("old"), 0o755))
 	must(os.WriteFile(filepath.Join(install, "settings.json"), []byte(`{"MaxItems":7}`), 0o644))
 	must(os.WriteFile(filepath.Join(install, "maccy.dll"), []byte("net"), 0o644))
 
 	newExe := "#!/bin/sh\necho started > '" + marker + "'\n"
-	files := map[string]string{"maccy.exe": newExe, "mygo-sqlite3.dll": "sqlite"}
+	files := map[string]string{"Klip.exe": newExe, "mygo-sqlite3.dll": "sqlite"}
 	pm := update.PackageManifest{AppID: "maccy", Version: "1.0.11", Runtime: "win-x64", LegacyFiles: []string{"maccy.dll"}}
 	var zbuf bytes.Buffer
 	zw := zip.NewWriter(&zbuf)
@@ -79,8 +79,8 @@ func TestHelperModeEndToEnd(t *testing.T) {
 	if got := readFile(filepath.Join(install, "mygo-sqlite3.dll")); got != "sqlite" {
 		t.Errorf("sqlite dll = %q", got)
 	}
-	if got := readFile(filepath.Join(install, "maccy.exe")); got != newExe {
-		t.Errorf("maccy.exe = %q", got)
+	if got := readFile(filepath.Join(install, "Klip.exe")); got != newExe {
+		t.Errorf("Klip.exe = %q", got)
 	}
 	if got := readFile(filepath.Join(install, "settings.json")); got != `{"MaxItems":7}` {
 		t.Errorf("settings.json = %q", got)

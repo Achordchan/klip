@@ -14,13 +14,16 @@ import (
 )
 
 // AppID is the application id in the manifest and the package list. It is
-// "maccy" in every version, so that a package built now is accepted by the
-// clients that exist.
+// "maccy", the id the program had before it was called Klip: an internal key
+// that nobody sees, kept so that the data, the package format and the
+// installer stay one line from the first version on.
 const AppID = "maccy"
 
 // ExeName is the program file that a package must contain and that is
-// started after an update.
-const ExeName = "maccy.exe"
+// started after an update. Klip 1.0.11, the first release from GitHub, is the
+// first to be called so (Klip.exe before): every later version must keep it,
+// as the version installed checks for it.
+const ExeName = "Klip.exe"
 
 // Manifest is docs/updates/manifest.json.
 type Manifest struct {

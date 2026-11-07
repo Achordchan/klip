@@ -61,6 +61,60 @@ func (r Registry) SetEnabled(on bool) error {
 	return r.Key.Set(ValueName, `"`+exe+`"`)
 }
 
+// Repairer is a Service whose entry, when there is one, can name another
+// program file than this one.
+type Repairer interface {
+	// Repair points an entry that exists at this program, and leaves no
+	// entry, or a blank one, as it is.
+	Repair() error
+}
+
+// Repair points the value at this program when it names the program file of
+// the versions before 1.0.11, maccy.exe, which the installer of 1.0.11
+// removes: a value left as it was would start nothing, or, while the file is
+// still there, the old program, which would take the single-instance mutex
+// before Klip. Only the maccy.exe of this program's own folder is: that is
+// the installation this program replaced. A value naming any other file is
+// left alone, whatever this program is (a copy run from elsewhere, a build of
+// go run in a temporary folder, which would be gone at the next sign-in):
+// the installer moves the entry of the installation it replaces itself.
+func (r Registry) Repair() error {
+	v, ok := r.Key.Get(ValueName)
+	if !ok || strings.TrimSpace(v) == "" {
+		return nil
+	}
+	exe := r.Exe
+	if exe == "" {
+		var err error
+		if exe, err = os.Executable(); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(exe) == "" {
+		return nil
+	}
+	named := strings.Trim(strings.TrimSpace(v), `"`)
+	// Split by hand, not by filepath: the value is a Windows path, whatever this is.
+	dir, base, ok := splitPath(named)
+	exeDir, _, exeOK := splitPath(exe)
+	if !ok || !exeOK || !strings.EqualFold(base, "maccy.exe") || !strings.EqualFold(dir, exeDir) {
+		return nil
+	}
+	return r.Key.Set(ValueName, `"`+exe+`"`)
+}
+
+// splitPath splits a Windows path (either slash, whatever system this is)
+// into its folder, without a trailing slash and with backslashes, and its
+// last name. ok is false for a bare name.
+func splitPath(p string) (dir, base string, ok bool) {
+	p = strings.ReplaceAll(p, "/", `\`)
+	cut := strings.LastIndex(p, `\`)
+	if cut < 0 {
+		return "", p, false
+	}
+	return strings.TrimRight(p[:cut], `\`), p[cut+1:], true
+}
+
 // Desktop is an XDG autostart entry (Linux): a .desktop file in the user's
 // autostart folder.
 type Desktop struct {

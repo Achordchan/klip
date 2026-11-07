@@ -1,14 +1,14 @@
 # Windows 上待验证清单
 
-开发在 macOS 上做的，下面这些代码**只验证了能为 Windows 编译**（`GOOS=windows go vet ./...`），逻辑部分在 macOS 上用假对象测过，真实行为需要一台 Windows 10/11（建议虚拟机，先拍快照）。升级专项见 [`upgrade-verification-1.0.11.md`](upgrade-verification-1.0.11.md)，这里是其余的。
+开发在 macOS 上做的，下面这些代码**只验证了能为 Windows 编译**（`GOOS=windows go vet ./...`），逻辑部分在 macOS 上用假对象测过，真实行为需要一台 Windows 10/11（建议虚拟机，先拍快照）。升级由 CI 的端到端测试（`tools/e2e_update.py`）覆盖，这里是其余的。
 
 ## 一、构建
 
 ```bash
 python tools/release_go.py build --version 1.0.11
 ```
-- [ ] 在 `artifacts/publish/win-x64/` 得到 `maccy.exe`（约 13 MB）和 `mygo-sqlite3.dll`；
-- [ ] 资源管理器里 `maccy.exe` 有 Klip 图标，属性 → 详细信息里文件版本 `1.0.11.0`、产品版本 `1.0.11`、原始文件名 `maccy.exe`；
+- [ ] 在 `artifacts/publish/win-x64/` 得到 `Klip.exe`（约 13 MB）和 `mygo-sqlite3.dll`；
+- [ ] 资源管理器里 `Klip.exe` 有 Klip 图标，属性 → 详细信息里文件版本 `1.0.11.0`、产品版本 `1.0.11`、原始文件名 `Klip.exe`；
 - [ ] 双击运行没有黑色控制台窗口（GUI 子系统）。
 
 ## 二、基础
@@ -21,7 +21,7 @@ python tools/release_go.py build --version 1.0.11
 
 ## 三、开机启动与互斥体
 
-- [ ] 偏好设置里勾选“开机启动”：注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 出现值 `maccy`，数据是带引号的 `maccy.exe` 完整路径；取消勾选则删除；与 1.0.10 勾选的是同一项（先用 1.0.10 勾选，再用 1.0.11 打开偏好设置，应该显示已勾选）；
+- [ ] 偏好设置里勾选“开机启动”：注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 出现值 `maccy`，数据是带引号的 `Klip.exe` 完整路径；取消勾选则删除；与 1.0.10 勾选的是同一项（先用 1.0.10 勾选，再用 1.0.11 打开偏好设置，应该显示已勾选）；
 - [ ] 重启后自动启动；
 - [ ] 程序运行时用 `Process Explorer` 或 `handle` 能看到命名互斥体 `maccy_mutex`；安装程序（覆盖安装）提示关闭正在运行的 Klip。
 
@@ -46,7 +46,7 @@ python tools/release_go.py build --version 1.0.11
 - [ ] 偏好设置的各项；主题切换立即作用到所有窗口；
 - [ ] 检查更新：见升级验证文档；
 - [ ] 内存与启动时间：任务管理器里空闲内存、冷启动到托盘出现的时间，与 1.0.10 对比（目标是更省，spike 里 macOS 是 40–80 MB）；
-- [ ] Windows Defender / SmartScreen 对未签名的 `maccy.exe` 与 `mygo-sqlite3.dll` 的反应。
+- [ ] Windows Defender / SmartScreen 对未签名的 `Klip.exe` 与 `mygo-sqlite3.dll` 的反应。
 
 ## 六、已知限制（不算失败）
 
