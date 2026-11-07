@@ -9,8 +9,20 @@ import (
 
 var procCreateMutexW = syscall.NewLazyDLL("kernel32.dll").NewProc("CreateMutexW")
 
-// appMutex is kept for the life of the process.
+// appMutex is kept until the program quits (ReleaseAppMutex).
 var appMutex uintptr
+
+// ReleaseAppMutex lets go of the named mutex. It is called once the program
+// has quit and before it is started again (App.Relaunch, after a storage
+// migration): the new process takes the mutex at its start, while this one
+// may still be ending, and holding it to the end would make the new one take
+// itself for a second instance, say so and leave, and nothing would run.
+func ReleaseAppMutex() {
+	if appMutex != 0 {
+		procCloseHandle.Call(appMutex)
+		appMutex = 0
+	}
+}
 
 // HoldAppMutex takes the named mutex that 1.0.10 and older take and that the
 // installer's AppMutex setting looks for ("maccy_mutex"): while it exists the

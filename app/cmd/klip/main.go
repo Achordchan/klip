@@ -104,6 +104,10 @@ func main() {
 		platform.ShowAlreadyRunning() // another instance, perhaps 1.0.10, holds the named mutex
 		return
 	}
+	// Let go of it once quit: App.Relaunch (after a storage migration) starts
+	// the program again when the quit handlers have run, while this process
+	// is still ending.
+	mygo.App.OnQuit(platform.ReleaseAppMutex)
 	mygo.App.SetActivationPolicy(mygo.ActivationPolicyAccessory)
 	mygo.App.OnWindowAllClosed(func() {})
 	p := &program{}
