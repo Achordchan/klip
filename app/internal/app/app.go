@@ -842,7 +842,9 @@ func (a *App) syncDone(reason string, manual bool, err error) {
 		}
 	}()
 	if errors.Is(err, syncer.ErrSubscriptionExpired) && a.runGen.Load() == a.acctGen.Load() {
-		a.SubscriptionChanged(false)
+		if o := a.runOwner.Load(); o != nil {
+			a.SubscriptionChanged(*o, false) // the account the run was for
+		}
 		return
 	}
 	if a.subscriptionPaused() {

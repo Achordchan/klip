@@ -13,24 +13,46 @@ func (a *App) subscriptionPaused() bool {
 	if a.Settings == nil {
 		return false
 	}
-	var owner string
 	st := a.Settings.Get()
-	_ = json.Unmarshal(st.Extra[subscriptionPauseKey], &owner)
-	return owner != "" && owner == a.owner()
+	return pausedFor(st, ownerOf(st))
 }
 
-// SubscriptionChanged is called only for a confirmed server subscription result.
-// Unknown/network failures must not overwrite an established entitlement state.
-func (a *App) SubscriptionChanged(active bool) {
-	owner := a.owner()
-	if owner == "" {
+// pausedFor says whether sync is paused, in st, for the account owner.
+func pausedFor(st model.Settings, owner string) bool {
+	var paused string
+	_ = json.Unmarshal(st.Extra[subscriptionPauseKey], &paused)
+	return paused != "" && paused == owner
+}
+
+// Owner is the account signed in now ("" for none): a caller that asks the
+// server about the subscription takes it first and gives it back with the
+// answer (SubscriptionChanged).
+func (a *App) Owner() string { return a.owner() }
+
+// SubscriptionChanged is called only for a confirmed server subscription
+// result, for the account owner the question was asked for. Unknown/network
+// failures must not overwrite an established entitlement state.
+//
+// The answer is for that account alone: it is checked against the signed-in
+// account inside the settings update, under its lock, so an answer about an
+// account that was left meanwhile neither pauses nor resumes the next one.
+func (a *App) SubscriptionChanged(owner string, active bool) {
+	if owner == "" || a.Settings == nil {
 		return
 	}
-	was := a.subscriptionPaused()
-	if was == !active {
-		return
+	if st := a.Settings.Get(); ownerOf(st) != owner || pausedFor(st, owner) == !active {
+		return // not this account's, or nothing to change
 	}
+	changed, was := false, false
 	if err := a.Settings.Update(func(st *model.Settings) {
+		if ownerOf(*st) != owner {
+			return // the account changed since the check above
+		}
+		was = pausedFor(*st, owner)
+		if was == !active {
+			return
+		}
+		changed = true
 		extra := make(map[string]json.RawMessage, len(st.Extra)+1)
 		for k, v := range st.Extra {
 			extra[k] = v
@@ -43,6 +65,9 @@ func (a *App) SubscriptionChanged(active bool) {
 		st.Extra = extra
 	}); err != nil {
 		a.cfg.Logf("subscription pause persistence: %v", err)
+	}
+	if !changed || a.owner() != owner {
+		return // the rest is for the account the answer was about, still signed in
 	}
 	if !active {
 		a.mu.Lock()

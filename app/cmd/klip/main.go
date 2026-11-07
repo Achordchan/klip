@@ -404,6 +404,7 @@ func (p *program) showPrefs() {
 		p.prefs.Redraw = p.redraw
 		p.prefs.SyncStatus = p.app.SyncStatus
 		p.prefs.SubscriptionChanged = p.app.SubscriptionChanged
+		p.prefs.Owner = p.app.Owner
 		p.prefs.PreviewTheme = func(value *string) {
 			p.themePreview.Store(value)
 			if value != nil {

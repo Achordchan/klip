@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -708,6 +709,7 @@ func (s *Service) clipboardPNG(stored string, data []byte) string {
 	base := filepath.Base(stored)
 	path := filepath.Join(dir, strings.TrimSuffix(base, filepath.Ext(base))+".png")
 	if got, err := os.ReadFile(path); err == nil && bytes.Equal(got, data) {
+		s.offered(path)
 		return path
 	}
 	f, err := os.CreateTemp(dir, ".klip-png-*")
@@ -723,7 +725,24 @@ func (s *Service) clipboardPNG(stored string, data []byte) string {
 		os.Remove(tmp)
 		return ""
 	}
+	s.offered(path)
 	return path
+}
+
+// How long a PNG copy is kept after it was last offered, and how many are
+// kept at most. A paste may go on reading a copy after the clipboard moved on
+// (a file manager asking whether to replace a file): a copy goes when it is
+// old, not when the next picture is put on the clipboard.
+const (
+	clipboardCopyRetention = 10 * time.Minute
+	clipboardCopyMax       = 32
+)
+
+// offered marks a copy as just offered: its time is what pruneClipboardPNGs
+// goes by.
+func (s *Service) offered(path string) {
+	now := s.Now()
+	_ = os.Chtimes(path, now, now)
 }
 
 func (s *Service) clipboardDir() string {
@@ -733,23 +752,47 @@ func (s *Service) clipboardDir() string {
 	return filepath.Join(os.TempDir(), "klip-clipboard")
 }
 
-// pruneClipboardPNGs removes the copies other than keep ("" for none), and
-// side files left by a write that stopped. It is called once a picture is on
-// the clipboard: until then, the clipboard may still offer the copy before.
+// pruneClipboardPNGs removes the copies, other than keep ("" for none), last
+// offered more than clipboardCopyRetention ago, and side files left by a
+// write that stopped as long ago; of the rest it keeps the clipboardCopyMax
+// newest. It is called once a picture is on the clipboard: until then, the
+// clipboard may still offer the copy before.
 func (s *Service) pruneClipboardPNGs(keep string) {
 	dir := s.clipboardDir()
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	type copyFile struct {
+		path string
+		at   time.Time
+	}
+	var young []copyFile
+	now := s.Now()
 	for _, e := range ents {
 		p := filepath.Join(dir, e.Name())
 		if e.IsDir() || (keep != "" && samePath(p, keep)) {
 			continue
 		}
-		if strings.EqualFold(filepath.Ext(e.Name()), ".png") || strings.HasPrefix(e.Name(), ".klip-png-") {
-			os.Remove(p)
+		if !strings.EqualFold(filepath.Ext(e.Name()), ".png") && !strings.HasPrefix(e.Name(), ".klip-png-") {
+			continue
 		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > clipboardCopyRetention {
+			os.Remove(p)
+			continue
+		}
+		young = append(young, copyFile{p, info.ModTime()})
+	}
+	if len(young) <= clipboardCopyMax {
+		return
+	}
+	sort.Slice(young, func(i, j int) bool { return young[i].at.After(young[j].at) })
+	for _, f := range young[clipboardCopyMax:] {
+		os.Remove(f.path)
 	}
 }
 

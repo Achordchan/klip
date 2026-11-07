@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -121,5 +122,27 @@ func TestUserFileNamedLikeAJournalDoesNotBlockMigration(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dst, "files", "12", "payload-journal.pdf")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMigrationMakesTheTargetPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the DACL is set by makePrivate; the mode bits mean nothing there")
+	}
+	src, dst := t.TempDir(), t.TempDir()
+	if err := os.Chmod(dst, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(src, "history.json"), []byte("[]"), 0600)
+	os.WriteFile(filepath.Join(src, "settings.json"), []byte(`{"AuthRefreshToken":"secret"}`), 0600)
+	if err := Migrate(src, dst, filepath.Join(t.TempDir(), "location.json"), nil); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o700 {
+		t.Fatalf("target mode %v", st.Mode().Perm())
 	}
 }

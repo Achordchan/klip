@@ -41,8 +41,11 @@ type Model struct {
 	// Redraw asks for a frame (any goroutine); may be nil.
 	Redraw func()
 	// SyncStatus is the sync's last result, for the page (may be nil).
-	SyncStatus          func() string
-	SubscriptionChanged func(bool)
+	SyncStatus func() string
+	// SubscriptionChanged reports a confirmed answer about the subscription of
+	// the account Owner gave when the question was asked (both may be nil).
+	SubscriptionChanged func(owner string, active bool)
+	Owner               func() string
 	// PreviewTheme applies a temporary appearance; nil restores saved settings.
 	PreviewTheme  func(*string)
 	previewValue  string
@@ -171,7 +174,8 @@ func (m *Model) async(work func(ctx context.Context) (done func())) {
 func (m *Model) loadSubscription() {
 	m.sub = account.Loading()
 	m.subGen++
-	gen := m.subGen // an answer that comes after the account changed is not for this screen
+	gen := m.subGen    // an answer that comes after the account changed is not for this screen
+	owner := m.owner() // and the account the answer is about
 	m.async(func(ctx context.Context) func() {
 		s := m.Account.Subscription(ctx)
 		return func() {
@@ -180,7 +184,7 @@ func (m *Model) loadSubscription() {
 			}
 			m.sub = s
 			if m.SubscriptionChanged != nil && (s.Subscribed || s.Status == "未订阅") {
-				m.SubscriptionChanged(s.Subscribed)
+				m.SubscriptionChanged(owner, s.Subscribed)
 			}
 			m.refreshAccount() // a token the server refused signs the user out
 		}
@@ -340,6 +344,7 @@ func (m *Model) redeemCard() {
 	m.redeemBusy = true
 	code := m.redeem
 	gen := m.subGen
+	owner := m.owner()
 	m.async(func(ctx context.Context) func() {
 		r := m.Account.Redeem(ctx, code)
 		var s account.Subscription
@@ -354,7 +359,7 @@ func (m *Model) redeemCard() {
 				if gen == m.subGen { // still the account the card was redeemed for
 					m.sub = s
 					if m.SubscriptionChanged != nil && s.Subscribed {
-						m.SubscriptionChanged(true)
+						m.SubscriptionChanged(owner, true)
 					}
 				}
 				// A card may be what the sign-in's first sync was waiting
@@ -376,4 +381,11 @@ func (m *Model) followSettings() {
 	}
 	m.observed = next
 	m.syncThemePreview()
+}
+
+func (m *Model) owner() string {
+	if m.Owner == nil {
+		return ""
+	}
+	return m.Owner()
 }

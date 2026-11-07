@@ -14,6 +14,8 @@ func TestExpiredSubscriptionPausesWithoutFailureAndSurvivesRestart(t *testing.T)
 		s.AuthRefreshToken = model.Ptr("token")
 		s.AuthUserEmail = model.Ptr("expired@example.com")
 	})
+	owner := "expired@example.com"
+	a.runOwner.Store(&owner) // the run that found the subscription expired was for this account
 	a.syncDone("startup", false, syncer.ErrSubscriptionExpired)
 	if !a.subscriptionPaused() || a.Auto.CanSync() {
 		t.Fatal("expired subscription still schedules sync")
@@ -38,10 +40,10 @@ func TestConfirmedRenewalReenablesSync(t *testing.T) {
 		s.AuthRefreshToken = model.Ptr("token")
 		s.AuthUserEmail = model.Ptr("renewed@example.com")
 	})
-	a.SubscriptionChanged(false)
+	a.SubscriptionChanged("renewed@example.com", false)
 	// Prevent a background request in this unit test while checking the state.
 	a.Auto.CanSync = func() bool { return false }
-	a.SubscriptionChanged(true)
+	a.SubscriptionChanged("renewed@example.com", true)
 	if a.subscriptionPaused() {
 		t.Fatal("confirmed renewal did not clear pause")
 	}
@@ -60,5 +62,27 @@ func TestUnconfirmedSubscriptionRetriesOwedUpload(t *testing.T) {
 		if got := uploadAfterUnconfirmed(tc.sub); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.sub.Status, got, tc.want)
 		}
+	}
+}
+
+func TestSubscriptionAnswerOfALeftAccountChangesNothing(t *testing.T) {
+	a := newApp(t, t.TempDir(), &fakeClip{}, "http://127.0.0.1:1")
+	a.Auto.CanSync = func() bool { return false }
+	_ = a.Settings.Update(func(s *model.Settings) {
+		s.AuthRefreshToken = model.Ptr("token")
+		s.AuthUserEmail = model.Ptr("b@example.com")
+	})
+	// An answer about account A comes after B signed in.
+	a.SubscriptionChanged("a@example.com", false)
+	if a.subscriptionPaused() {
+		t.Fatal("A's expired subscription paused B")
+	}
+	a.SubscriptionChanged("b@example.com", false)
+	if !a.subscriptionPaused() {
+		t.Fatal("B's own answer did not pause B")
+	}
+	a.SubscriptionChanged("a@example.com", true)
+	if !a.subscriptionPaused() {
+		t.Fatal("A's renewal resumed B")
 	}
 }

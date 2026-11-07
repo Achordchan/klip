@@ -57,6 +57,11 @@ func Migrate(source, target, selection string, progress func(int, int)) error {
 	if err != nil {
 		return err
 	}
+	// Before anything is copied: the settings, with the login's tokens, must
+	// not inherit what the chosen folder lets others do.
+	if err := makePrivate(dst); err != nil {
+		return fmt.Errorf("无法把新目录设为仅当前用户可访问：%w", err)
+	}
 	src, err := filepath.Abs(source)
 	if err != nil {
 		return err

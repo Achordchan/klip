@@ -1190,34 +1190,85 @@ func TestPictureTooLongForWebPStaysPNG(t *testing.T) {
 	}
 }
 
-func TestClipboardPNGCopiesDoNotAccumulate(t *testing.T) {
-	r := newRig(t)
+func distinctImages(t *testing.T, r *rig, n int) []model.Item {
+	t.Helper()
 	var items []model.Item
-	for i := 0; i < 3; i++ {
+	for i := 0; i < n; i++ {
 		img := image.NewNRGBA(image.Rect(0, 0, 3, 3))
-		img.Pix[0] = uint8(i + 1)
+		img.Pix[0], img.Pix[1] = uint8(i+1), uint8((i+1)>>8)
 		var b bytes.Buffer
 		if err := png.Encode(&b, img); err != nil {
 			t.Fatal(err)
 		}
 		r.clip.formats, r.clip.image = []string{"image/png"}, b.Bytes()
-		r.now = r.now.Add(time.Minute)
+		r.now = r.now.Add(time.Second)
 		r.capture()
 		items = append(items, r.h.Items()[0])
 	}
-	// A side file left by a write that stopped goes too.
-	write(t, filepath.Join(r.s.ClipboardDir, ".klip-png-stale"), []byte("x"))
+	return items
+}
+
+func clipboardCopies(t *testing.T, r *rig) []string {
+	t.Helper()
+	ents, err := os.ReadDir(r.s.ClipboardDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func TestClipboardPNGCopiesOutliveTheNextPasteThenGo(t *testing.T) {
+	r := newRig(t)
+	items := distinctImages(t, r, 3)
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	first := r.clip.wroteWith
+	// A side file left by a write that stopped long ago.
+	stale := write(t, filepath.Join(r.s.ClipboardDir, ".klip-png-stale"), []byte("x"))
+	old := r.now.Add(-time.Hour)
+	os.Chtimes(stale, old, old)
+	// The next pictures come soon after: a paste of the first may still be
+	// reading its copy.
+	for _, it := range items[1:] {
+		r.now = r.now.Add(time.Minute)
+		if err := r.s.Apply(it); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(first); err != nil {
+		t.Fatalf("a copy offered a minute ago went: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("an old side file stayed")
+	}
+	// Once they are old, they go; the one on the clipboard stays.
+	r.now = r.now.Add(clipboardCopyRetention + time.Minute)
+	if err := r.s.Apply(items[2]); err != nil {
+		t.Fatal(err)
+	}
+	if got := clipboardCopies(t, r); len(got) != 1 || filepath.Join(r.s.ClipboardDir, got[0]) != r.clip.wroteWith {
+		t.Fatalf("copies %v, current %s", got, r.clip.wroteWith)
+	}
+}
+
+func TestClipboardPNGCopiesAreCapped(t *testing.T) {
+	r := newRig(t)
+	items := distinctImages(t, r, clipboardCopyMax+5)
 	for _, it := range items {
 		if err := r.s.Apply(it); err != nil {
 			t.Fatal(err)
 		}
-		ents, err := os.ReadDir(r.s.ClipboardDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(ents) != 1 || filepath.Join(r.s.ClipboardDir, ents[0].Name()) != r.clip.wroteWith {
-			t.Fatalf("clipboard copies: %v, current %s", ents, r.clip.wroteWith)
-		}
+	}
+	if got := clipboardCopies(t, r); len(got) != clipboardCopyMax+1 {
+		t.Fatalf("%d copies, want %d", len(got), clipboardCopyMax+1)
+	}
+	if _, err := os.Stat(r.clip.wroteWith); err != nil {
+		t.Fatal("the copy on the clipboard went")
 	}
 }
 
@@ -1248,6 +1299,7 @@ func TestFailedClipboardWriteKeepsTheCopyInUse(t *testing.T) {
 		t.Fatalf("the copy the clipboard still offers went: %v", err)
 	}
 	r.clip.writeErr = nil
+	r.now = r.now.Add(clipboardCopyRetention + time.Minute)
 	if err := r.s.Apply(items[1]); err != nil {
 		t.Fatal(err)
 	}
