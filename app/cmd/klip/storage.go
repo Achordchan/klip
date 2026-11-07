@@ -31,17 +31,17 @@ func (p *program) changeStorage() {
 	if err != nil || len(selected) == 0 {
 		return
 	}
-	target, err := storage.Validate(p.layout.Root, selected[0])
+	selection, err := paths.SelectionPath()
+	if err != nil {
+		return
+	}
+	target, err := storage.Validate(p.layout.Root, selected[0], selection)
 	if err != nil {
 		mygo.Dialog.Message(mygo.MessageOptions{Parent: p.prefsWin, Type: mygo.MessageError, Title: "无法迁移", Message: err.Error()})
 		return
 	}
 	answer, err := mygo.Dialog.Message(mygo.MessageOptions{Parent: p.prefsWin, Type: mygo.MessageQuestion, Title: "迁移存储位置", Message: "将迁移全部历史记录、图片、文件及设置，然后重启 Klip。", Detail: "新位置：" + target + "\n旧目录保留为备份，不会自动删除。", Buttons: []string{"取消", "迁移并重启"}, DefaultButton: 0, CancelButton: 0})
 	if err != nil || answer.Button != 1 {
-		return
-	}
-	selection, err := paths.SelectionPath()
-	if err != nil {
 		return
 	}
 	started = true

@@ -601,8 +601,9 @@ func (s *Service) fileListBytes(id string, files []string) int64 {
 var errStorage = errors.New("capture: cannot store the picture")
 
 // saveImage stores lossless WebP by default, or PNG when disabled, when the
-// picture has more than 8 bits per channel (WebP would lose them) or when it
-// is wider or taller than WebP allows.
+// picture has more than 8 bits per channel (WebP would lose them), when it
+// carries colour information WebP would drop (an ICC profile, a gamma: see
+// imagecodec.PNGColorInfo) or when it is wider or taller than WebP allows.
 //
 // A picture has two possible fingerprints: the hash of its PNG bytes (what
 // C# and earlier versions store, and what a PNG kept as it came gives back
@@ -615,6 +616,7 @@ func (s *Service) saveImage(data []byte) (path, hash string, size int64, err err
 		return "", "", 0, err
 	}
 	var img image.Image
+	colour := imagecodec.PNGColorInfo(data) // of a PNG as it came, before any conversion
 	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
 		var derr error
 		img, _, derr = image.Decode(bytes.NewReader(data))
@@ -637,7 +639,7 @@ func (s *Service) saveImage(data []byte) (path, hash string, size int64, err err
 	legacy := hashOf("img", data)
 	deep := imagecodec.HighDepth(img)
 	s.setMu.RLock()
-	webp := s.storeWebP && !deep && imagecodec.FitsWebP(img.Bounds())
+	webp := s.storeWebP && !deep && !colour && imagecodec.FitsWebP(img.Bounds())
 	s.setMu.RUnlock()
 	hash = legacy
 	if !deep {

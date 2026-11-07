@@ -156,3 +156,38 @@ const WebPMaxDimension = 16384
 func FitsWebP(b image.Rectangle) bool {
 	return b.Dx() > 0 && b.Dy() > 0 && b.Dx() <= WebPMaxDimension && b.Dy() <= WebPMaxDimension
 }
+
+// PNGColorInfo says whether a PNG says how its values are to be shown other
+// than as sRGB: an ICC profile (iCCP; a Display P3 screenshot), primaries
+// (cHRM), coding-independent code points (cICP) or a gamma (gAMA) other than
+// sRGB's. WebP as Klip writes it keeps none of these, so such a picture would
+// be shown in other colours: it is kept as PNG.
+func PNGColorInfo(data []byte) bool {
+	const sig = "\x89PNG\r\n\x1a\n"
+	if len(data) < len(sig) || string(data[:len(sig)]) != sig {
+		return false
+	}
+	for p := len(sig); p+8 <= len(data); {
+		n := int(uint32(data[p])<<24 | uint32(data[p+1])<<16 | uint32(data[p+2])<<8 | uint32(data[p+3]))
+		kind := string(data[p+4 : p+8])
+		body := p + 8
+		if n < 0 || body+n+4 > len(data) {
+			return false
+		}
+		switch kind {
+		case "iCCP", "cHRM", "cICP":
+			return true
+		case "gAMA":
+			if n == 4 {
+				g := uint32(data[body])<<24 | uint32(data[body+1])<<16 | uint32(data[body+2])<<8 | uint32(data[body+3])
+				if g != 45455 { // 1/2.2, what sRGB has
+					return true
+				}
+			}
+		case "IDAT", "IEND":
+			return false // the colour chunks come before the image data
+		}
+		p = body + n + 4
+	}
+	return false
+}

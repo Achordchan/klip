@@ -419,11 +419,14 @@ func (p *program) showPrefs() {
 		p.prefsWin = mygo.NewWindow(mygo.WindowOptions{
 			Title:          "设置",
 			UseContentSize: true,
-			Parent:         p.win,
-			Width:          prefswin.Width,
-			Height:         prefswin.Height,
-			DisableResize:  true,
-			Content:        ui.View(p.prefs.View),
+			// Made hidden: the first opening, like every other, reads the
+			// settings and asks about the subscription (prefs.Open below).
+			Hidden:        true,
+			Parent:        p.win,
+			Width:         prefswin.Width,
+			Height:        prefswin.Height,
+			DisableResize: true,
+			Content:       ui.View(p.prefs.View),
 		})
 		p.prefsWin.OnClose(func(e *mygo.CloseEvent) {
 			if p.quitting.Load() {

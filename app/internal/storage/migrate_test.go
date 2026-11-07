@@ -49,19 +49,23 @@ func TestRejectsOccupiedNestedAndLinkedTargets(t *testing.T) {
 	src := t.TempDir()
 	nested := filepath.Join(src, "nested")
 	os.Mkdir(nested, 0700)
-	if _, err := Validate(src, nested); err == nil {
+	if _, err := Validate(src, nested, ""); err == nil {
 		t.Fatal("nested target accepted")
 	}
 	dst := t.TempDir()
 	os.WriteFile(filepath.Join(dst, "keep"), []byte("user"), 0600)
-	if _, err := Validate(src, dst); err == nil {
+	if _, err := Validate(src, dst, ""); err == nil {
 		t.Fatal("occupied target accepted")
 	}
 }
 func TestSelectionFailureKeepsOldLocationAndCleansCopies(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	os.WriteFile(filepath.Join(src, "payload"), []byte("keep"), 0600)
-	selection := t.TempDir() // replacing a directory must fail
+	// A folder where the selection file goes: replacing it must fail.
+	selection := filepath.Join(t.TempDir(), "location.json")
+	if err := os.Mkdir(selection, 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := Migrate(src, dst, selection, nil); err == nil {
 		t.Fatal("expected selection failure")
 	}
@@ -163,10 +167,10 @@ func TestRejectsTargetInsideSourceSpelledInAnotherCase(t *testing.T) {
 	if err := os.Mkdir(dst, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Validate(src, dst); err == nil {
+	if _, err := Validate(src, dst, ""); err == nil {
 		t.Fatal("a target inside the source, spelled in another case, was accepted")
 	}
-	if _, err := Validate(dst, src); err == nil {
+	if _, err := Validate(dst, src, ""); err == nil {
 		t.Fatal("a source inside the target, spelled in another case, was accepted")
 	}
 }
@@ -199,5 +203,47 @@ func TestHistoryPathsSpelledInAnotherCaseAreMoved(t *testing.T) {
 	want := filepath.Join(canonical, "images", "a.png")
 	if decoded[0]["ImageFilePath"] != want || decoded[0]["FilePaths"].([]any)[0] != want {
 		t.Fatalf("paths not moved: %v", decoded[0])
+	}
+}
+
+func TestRejectsTargetHoldingTheSelection(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	for name, selection := range map[string]string{
+		"the selection's folder":       filepath.Join(dst, "storage-location.json"),
+		"a folder above the selection": filepath.Join(dst, "Klip", "storage-location.json"),
+	} {
+		if _, err := Validate(src, dst, selection); err == nil {
+			t.Errorf("%s accepted as a target", name)
+		}
+		if err := Migrate(src, dst, selection, nil); err == nil {
+			t.Errorf("%s: migration went ahead", name)
+		}
+	}
+	inner := filepath.Join(t.TempDir(), "conf")
+	os.MkdirAll(filepath.Join(inner, "data"), 0700)
+	if _, err := Validate(src, filepath.Join(inner, "data"), filepath.Join(inner, "storage-location.json")); err == nil {
+		t.Error("a folder inside the selection's folder accepted as a target")
+	}
+}
+
+func TestHistoryPathsTakeTheCopiedSpelling(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	os.MkdirAll(filepath.Join(src, "images"), 0700)
+	os.WriteFile(filepath.Join(src, "images", "a.png"), []byte("image"), 0600)
+	saved := filepath.Join(src, "images", "A.PNG") // found on a volume that ignores case
+	items, _ := json.Marshal([]map[string]any{{"ImageFilePath": saved}})
+	os.WriteFile(filepath.Join(src, "history.json"), items, 0600)
+	if err := Migrate(src, dst, filepath.Join(t.TempDir(), "location.json"), nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dst, "history.json"))
+	var decoded []map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	canonical, _ := filepath.EvalSymlinks(dst)
+	if want := filepath.Join(canonical, "images", "a.png"); decoded[0]["ImageFilePath"] != want {
+		t.Fatalf("path %v, want the copied spelling %s", decoded[0]["ImageFilePath"], want)
 	}
 }

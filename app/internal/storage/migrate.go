@@ -16,7 +16,11 @@ import (
 	"klip/internal/paths"
 )
 
-func Validate(source, target string) (string, error) {
+// Validate checks that target can take the data of source: an empty folder,
+// neither inside the other, and apart from the folder of selection (the file
+// that says where the data is). A data folder that held the selection would
+// take it along when deleted as the backup of a later move.
+func Validate(source, target, selection string) (string, error) {
 	src, err := filepath.EvalSymlinks(source)
 	if err != nil {
 		return "", err
@@ -35,6 +39,18 @@ func Validate(source, target string) (string, error) {
 	}
 	if inside(src, dst) || inside(dst, src) || sameOrWithin(src, dst) || sameOrWithin(dst, src) {
 		return "", errors.New("新目录不能与旧目录相同或互相包含")
+	}
+	if selection != "" {
+		selDir, err := filepath.Abs(filepath.Dir(selection))
+		if err != nil {
+			return "", err
+		}
+		if resolved, err := filepath.EvalSymlinks(selDir); err == nil {
+			selDir = resolved
+		}
+		if inside(dst, selDir) || inside(selDir, dst) || sameOrWithin(dst, selDir) || sameOrWithin(selDir, dst) {
+			return "", errors.New("新目录不能是 Klip 记录存储位置的配置目录，也不能与它互相包含")
+		}
 	}
 	entries, err := os.ReadDir(dst)
 	if err != nil {
@@ -101,7 +117,7 @@ func inside(root, path string) bool {
 // Migrate requires all source writers to be stopped. Selection changes last;
 // failed attempts remove only files created by this invocation.
 func Migrate(source, target, selection string, progress func(int, int)) error {
-	dst, err := Validate(source, target)
+	dst, err := Validate(source, target, selection)
 	if err != nil {
 		return err
 	}
@@ -197,9 +213,29 @@ func Migrate(source, target, selection string, progress func(int, int)) error {
 		if err != nil {
 			return err
 		}
+		// The names as they were copied: a saved path may spell a file in
+		// another case than its folder entry (it was found all the same on a
+		// volume that ignores case), and the target may be a volume that
+		// does not. A unique match ignoring case takes the copied spelling.
+		copied := make(map[string]bool, len(files))
+		folded := make(map[string][]string, len(files))
+		for _, rel := range files {
+			copied[rel] = true
+			k := strings.ToLower(filepath.ToSlash(rel))
+			folded[k] = append(folded[k], rel)
+		}
+		spelled := func(rel string) string {
+			if copied[rel] {
+				return rel
+			}
+			if m := folded[strings.ToLower(filepath.ToSlash(rel))]; len(m) == 1 {
+				return m[0]
+			}
+			return rel
+		}
 		remap := func(p string) string {
 			if rel, ok := relUnder(src, srcInfo, p); ok {
-				return filepath.Join(dst, rel)
+				return filepath.Join(dst, spelled(rel))
 			}
 			return p
 		}

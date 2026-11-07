@@ -2,6 +2,8 @@ package imagecodec
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"os"
@@ -68,5 +70,53 @@ func TestExportTellsAnotherCaseFromTheSameFileByTheFileSystem(t *testing.T) {
 	}
 	if !sameFile && err != nil {
 		t.Fatalf("on a volume that tells case apart, Picture.png is another file: %v", err)
+	}
+}
+
+// WithChunk puts a chunk right after the IHDR of a PNG, as an encoder that
+// writes colour information does.
+func withChunk(t *testing.T, png []byte, kind string, body []byte) []byte {
+	t.Helper()
+	const ihdrEnd = 8 + 8 + 13 + 4
+	var c bytes.Buffer
+	binary.Write(&c, binary.BigEndian, uint32(len(body)))
+	c.WriteString(kind)
+	c.Write(body)
+	sum := crc32.NewIEEE()
+	sum.Write([]byte(kind))
+	sum.Write(body)
+	binary.Write(&c, binary.BigEndian, sum.Sum32())
+	out := append([]byte(nil), png[:ihdrEnd]...)
+	out = append(out, c.Bytes()...)
+	return append(out, png[ihdrEnd:]...)
+}
+
+func TestPNGColorInfo(t *testing.T) {
+	plain, err := Encode(image.NewNRGBA(image.Rect(0, 0, 2, 2)), "png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gamma := func(g uint32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, g); return b }
+	for name, tc := range map[string]struct {
+		data []byte
+		want bool
+	}{
+		"plain":       {plain, false},
+		"ICC profile": {withChunk(t, plain, "iCCP", []byte("Display P3\x00\x00xyz")), true},
+		"primaries":   {withChunk(t, plain, "cHRM", make([]byte, 32)), true},
+		"code points": {withChunk(t, plain, "cICP", []byte{12, 13, 0, 1}), true},
+		"gamma 1.8":   {withChunk(t, plain, "gAMA", gamma(55556)), true},
+		"sRGB gamma":  {withChunk(t, plain, "gAMA", gamma(45455)), false},
+		"sRGB":        {withChunk(t, plain, "sRGB", []byte{0}), false},
+		"not a PNG":   {[]byte("GIF89a"), false},
+	} {
+		if got := PNGColorInfo(tc.data); got != tc.want {
+			t.Errorf("%s: %v, want %v", name, got, tc.want)
+		}
+		if tc.want {
+			if _, err := Decode(tc.data); err != nil {
+				t.Fatalf("%s: the test picture does not decode: %v", name, err)
+			}
+		}
 	}
 }

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -1413,5 +1415,31 @@ func TestClipboardFolderIsMadePrivate(t *testing.T) {
 	}
 	if st, _ := os.Stat(r.s.ClipboardDir); st.Mode().Perm() != 0o700 {
 		t.Fatalf("mode %v", st.Mode().Perm())
+	}
+}
+
+func TestPictureWithAColourProfileStaysPNG(t *testing.T) {
+	r := newRig(t)
+	plain := tinyPNG(t)
+	// iCCP right after IHDR, with a correct CRC, as a Display P3 screenshot has.
+	const ihdrEnd = 8 + 8 + 13 + 4
+	body := []byte("Display P3\x00\x00profile")
+	var chunk bytes.Buffer
+	binary.Write(&chunk, binary.BigEndian, uint32(len(body)))
+	chunk.WriteString("iCCP")
+	chunk.Write(body)
+	binary.Write(&chunk, binary.BigEndian, crc32.ChecksumIEEE(append([]byte("iCCP"), body...)))
+	data := append(append(append([]byte(nil), plain[:ihdrEnd]...), chunk.Bytes()...), plain[ihdrEnd:]...)
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture()
+	if r.h.Len() != 1 {
+		t.Fatal("not captured")
+	}
+	p := model.Str(r.h.Items()[0].ImageFilePath)
+	if filepath.Ext(p) != ".png" {
+		t.Fatalf("a picture with a colour profile was stored as %s", p)
+	}
+	if got, _ := os.ReadFile(p); !bytes.Equal(got, data) {
+		t.Fatal("the PNG with its profile was not kept as it came")
 	}
 }
