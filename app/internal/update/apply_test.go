@@ -984,3 +984,97 @@ func TestCleanOldRemovesOldDownloadsAndBackups(t *testing.T) {
 		}
 	}
 }
+
+func TestResultIsWrittenBeforeTheProgramThatReadsItStarts(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	r.plan.Version, r.plan.ResultPath = "1.0.11", filepath.Join(r.root, "result.json")
+	h := r.hooks()
+	var seen *InstallResult
+	h.Launch = func(p string) error {
+		seen, _ = ReadResult(r.plan.ResultPath) // what the new program reads as it starts
+		return nil
+	}
+	if err := RunPlan(r.plan, h); err != nil {
+		t.Fatal(err)
+	}
+	if seen == nil || !seen.OK || seen.Version != "1.0.11" {
+		t.Fatalf("the new program found %+v", seen)
+	}
+	// A new program that will not start: the result says so before the old
+	// one, put back, starts and reads it.
+	r2 := newRig(t, newPkg, nil)
+	r2.plan.Version, r2.plan.ResultPath = "1.0.11", filepath.Join(r2.root, "result.json")
+	h2 := r2.hooks()
+	starts := 0
+	var atOld *InstallResult
+	h2.Launch = func(p string) error {
+		starts++
+		if starts == 1 {
+			return errors.New("blocked")
+		}
+		atOld, _ = ReadResult(r2.plan.ResultPath)
+		return nil
+	}
+	if err := RunPlan(r2.plan, h2); err == nil {
+		t.Fatal("a program that cannot start is a failed update")
+	}
+	if atOld == nil || atOld.OK || !atOld.RolledBack {
+		t.Fatalf("the old program found %+v", atOld)
+	}
+}
+
+func TestInstallerStartedIsPendingNotInstalled(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	p := Plan{PID: 77, Installer: "/tmp/maccy-1.0.12-setup.exe", LogPath: r.plan.LogPath, Version: "1.0.12",
+		ResultPath: filepath.Join(r.root, "result.json"), RestartExe: filepath.Join(r.install, "maccy.exe")}
+	h := r.hooks()
+	var atInstaller *InstallResult
+	h.LaunchInstaller = func(string) error { atInstaller, _ = ReadResult(p.ResultPath); return nil }
+	if err := RunPlan(p, h); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := ReadResult(p.ResultPath)
+	if atInstaller == nil || !atInstaller.Pending || res == nil || res.OK || !res.Pending {
+		t.Fatalf("at the installer %+v, after %+v", atInstaller, res)
+	}
+	// An installer that cannot start: a failure, written before Klip restarts.
+	h = r.hooks()
+	h.LaunchInstaller = func(string) error { return errors.New("blocked") }
+	var atRestart *InstallResult
+	h.Launch = func(string) error { atRestart, _ = ReadResult(p.ResultPath); return nil }
+	if err := RunPlan(p, h); err == nil {
+		t.Fatal("a failing installer must be reported")
+	}
+	if atRestart == nil || atRestart.OK || atRestart.Pending || atRestart.Error == "" {
+		t.Fatalf("Klip restarted with %+v", atRestart)
+	}
+}
+
+func TestCommittedJournalThatCannotBeRemovedDoesNotBlockStartup(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		t.Skip("needs a folder this user cannot remove files from")
+	}
+	r := newRig(t, newPkg, nil)
+	h := r.hooks().fill()
+	var rollback []rollbackItem
+	if err := applyFiles(r.plan, h, logger{r.plan.LogPath, h.Now}, &rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCommitted(r.install, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(r.install, 0o500); err != nil { // the journal cannot be removed
+		t.Fatal(err)
+	}
+	defer os.Chmod(r.install, 0o755)
+	if err := RecoverInterruptedUpdate(r.install); err != nil {
+		t.Fatalf("recovery failed on a finished update: %v", err)
+	}
+	needed, err := StartRecovery(r.install)
+	if needed || err != nil {
+		t.Fatalf("startup would recover a finished update again: %v %v", needed, err)
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+		t.Fatalf("the new version was touched: %q", got)
+	}
+}

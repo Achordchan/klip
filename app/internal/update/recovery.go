@@ -94,10 +94,10 @@ func RecoverInterruptedUpdate(root string) error {
 			return err
 		}
 		if j.Committed {
-			// The new version is whole: keep it, forget the journal.
-			if err := durable.Remove(recoveryPath(root)); err != nil && !os.IsNotExist(err) {
-				return err
-			}
+			// The new version is whole: keep it, forget the journal. One that
+			// cannot be removed is no reason to fail: there is nothing to undo,
+			// and startup passes over a committed journal (journalCommitted).
+			_ = durable.Remove(recoveryPath(root))
 			return nil
 		}
 		entries = j.Entries
@@ -158,12 +158,29 @@ func RecoverInterruptedUpdate(root string) error {
 	return os.Remove(recoveryPath(root))
 }
 
+// journalCommitted says that the journal in root is that of an update that
+// was finished and only not forgotten.
+func journalCommitted(root string) bool {
+	b, err := os.ReadFile(recoveryPath(root))
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(b)), "{") {
+		return false
+	}
+	var j committedJournal
+	return json.Unmarshal(b, &j) == nil && j.Committed
+}
+
 // StartRecovery launches a separate executable so Windows can replace the installed binary.
+// A committed journal needs no recovery: it is removed if it can be, and the
+// program starts either way (were it kept, every start would recover again).
 func StartRecovery(root string) (bool, error) {
 	if _, err := os.Stat(recoveryPath(root)); os.IsNotExist(err) {
 		return false, nil
 	} else if err != nil {
 		return true, err
+	}
+	if journalCommitted(root) {
+		_ = durable.Remove(recoveryPath(root))
+		return false, nil
 	}
 	exe, err := os.Executable()
 	if err != nil {

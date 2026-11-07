@@ -56,6 +56,10 @@ type InstallResult struct {
 	At      time.Time `json:"at"`
 	// RolledBack says that the old version was put back whole.
 	RolledBack bool `json:"rolledBack,omitempty"`
+	// Pending says that the installer was started and the helper does not
+	// know how it ends (the user may cancel it): OK is false, and only the
+	// version that starts next tells whether it was installed.
+	Pending bool `json:"pending,omitempty"`
 }
 
 // ReadResult reads what the helper wrote at path; a missing file is no
@@ -216,17 +220,23 @@ func RunPlan(p Plan, h Hooks) error {
 		// Nobody is there to read a message box: the log and the result say it.
 		h.Alert = func(title, msg string) { lg.say("not shown (quiet): " + title + ": " + msg) }
 	}
-	report := func(err error, rolledBack bool) {
+	// The result is written before any program that reads it at its start is
+	// launched, and written again if that launch fails.
+	write := func(r InstallResult) {
 		if p.ResultPath == "" {
 			return
 		}
-		r := InstallResult{Version: p.Version, OK: err == nil, At: h.Now(), RolledBack: rolledBack}
-		if err != nil {
-			r.Error = err.Error()
-		}
+		r.Version, r.At = p.Version, h.Now()
 		if werr := writeJSON(p.ResultPath, r); werr != nil {
 			lg.say("cannot write the result: " + werr.Error())
 		}
+	}
+	report := func(err error, rolledBack bool) {
+		r := InstallResult{OK: err == nil, RolledBack: rolledBack}
+		if err != nil {
+			r.Error = err.Error()
+		}
+		write(r)
 	}
 	if p.ReadyFile != "" {
 		if err := os.WriteFile(p.ReadyFile, []byte("ready"), 0600); err != nil {
@@ -244,17 +254,17 @@ func RunPlan(p Plan, h Hooks) error {
 	if p.Installer != "" {
 		unlock()
 		lg.say("starting installer " + p.Installer)
+		write(InstallResult{Pending: true}) // the installer may start Klip itself
 		if err := h.LaunchInstaller(p.Installer); err != nil {
 			lg.say("failed: " + err.Error())
+			report(err, true) // nothing was changed: the old version is as it was
 			h.Alert("Klip 更新失败", "无法启动安装程序："+err.Error())
 			// Klip has already exited for this: start it again.
 			if p.RestartExe != "" && fileExists(p.RestartExe) {
 				_ = h.Launch(p.RestartExe)
 			}
-			report(err, true)
 			return err
 		}
-		report(nil, false)
 		return nil
 	}
 
@@ -347,6 +357,7 @@ func RunPlan(p Plan, h Hooks) error {
 			// A committed journal left behind is dropped at the next start.
 			lg.say("journal left committed: " + err.Error())
 		}
+		report(nil, false) // before the new version starts and reads it
 		if lerr := h.Launch(filepath.Join(p.InstallDir, ExeName)); lerr != nil {
 			// The new program will not start (a virus scanner may have taken
 			// it): that is a failed update, and the old files come back.
@@ -372,7 +383,6 @@ func RunPlan(p Plan, h Hooks) error {
 			return err
 		}
 		// Transition backups are retained: ownership of pre-existing paths is unknown.
-		report(nil, false)
 		return nil
 	}
 	lg.say("failed: " + err.Error())
