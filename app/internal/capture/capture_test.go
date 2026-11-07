@@ -240,13 +240,14 @@ func TestImageCapture(t *testing.T) {
 	r.capture()
 	it := r.h.Items()[0]
 	p := model.Str(it.ImageFilePath)
-	if it.Kind != model.KindImage || filepath.Dir(p) != r.l.Images() || !regexp.MustCompile(`^\d+_[0-9a-f]{32}\.png$`).MatchString(filepath.Base(p)) {
+	if it.Kind != model.KindImage || filepath.Dir(p) != r.l.Images() || !regexp.MustCompile(`^\d+_[0-9a-f]{32}\.webp$`).MatchString(filepath.Base(p)) {
 		t.Fatalf("item %+v", it)
 	}
-	if got, _ := os.ReadFile(p); !bytes.Equal(got, data) {
-		t.Error("a PNG is stored as it came")
+	stored, _ := os.ReadFile(p)
+	if !samePicture(stored, data) {
+		t.Error("lossless WebP changed pixels")
 	}
-	if model.Str(it.ContentHash) != "img:"+upperSHA(data) || it.ApproxBytes != int64(len(data)) || it.Text != nil {
+	if model.Str(it.ContentHash) != "img:"+upperSHA(data) || it.ApproxBytes != int64(len(stored)) || it.Text != nil {
 		t.Errorf("item %+v", it)
 	}
 	// The same picture again is a copy of that item, and its second file goes.
@@ -265,8 +266,8 @@ func TestImageCapture(t *testing.T) {
 	r2.clip.formats, r2.clip.image = []string{"image/bmp"}, b.Bytes()
 	r2.capture()
 	got, _ := os.ReadFile(model.Str(r2.h.Items()[0].ImageFilePath))
-	if _, err := png.Decode(bytes.NewReader(got)); err != nil {
-		t.Errorf("the stored image is not a PNG: %v", err)
+	if _, _, err := image.Decode(bytes.NewReader(got)); err != nil {
+		t.Errorf("the stored image cannot be decoded: %v", err)
 	}
 	r3 := newRig(t)
 	r3.clip.formats, r3.clip.image = []string{"image/png"}, []byte("not an image")
@@ -393,8 +394,8 @@ func TestSingleImageFileBecomesAnImage(t *testing.T) {
 		t.Fatalf("kind %v", it.Kind)
 	}
 	got, _ := os.ReadFile(model.Str(it.ImageFilePath))
-	if _, err := png.Decode(bytes.NewReader(got)); err != nil {
-		t.Errorf("not a PNG: %v", err)
+	if _, _, err := image.Decode(bytes.NewReader(got)); err != nil {
+		t.Errorf("not a supported image: %v", err)
 	}
 	if !strings.HasPrefix(model.Str(it.ContentHash), "img:") || filepath.Dir(model.Str(it.ImageFilePath)) != r.l.Images() {
 		t.Errorf("%+v", it)
@@ -1026,5 +1027,29 @@ func TestBlockedOnlyAllowlistDoesNotBecomeUnrestricted(t *testing.T) {
 	if parseExtensions(" , ; ") == nil {
 	} else {
 		t.Fatal("blank configuration should remain unrestricted")
+	}
+}
+
+func TestWebPStorageCanBeDisabledAndClipboardRemainsPNG(t *testing.T) {
+	r := newRig(t)
+	st := model.DefaultSettings()
+	st.SetStoreImagesAsWebP(false)
+	r.s.ApplySettings(st)
+	data := tinyPNG(t)
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture()
+	it := r.h.Items()[0]
+	if filepath.Ext(model.Str(it.ImageFilePath)) != ".png" {
+		t.Fatal("disabled WebP still converted")
+	}
+	r2 := newRig(t)
+	r2.clip.formats, r2.clip.image = []string{"image/png"}, data
+	r2.capture()
+	it = r2.h.Items()[0]
+	if err := r2.s.Apply(it); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(r2.clip.wroteImage, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("clipboard not PNG")
 	}
 }

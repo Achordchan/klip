@@ -32,6 +32,7 @@ import (
 
 	"klip/internal/durable"
 	"klip/internal/history"
+	"klip/internal/imagecodec"
 	"klip/internal/model"
 	"klip/internal/paths"
 	"klip/internal/snapshot"
@@ -61,6 +62,7 @@ type AppIdentity struct{ Name, Path string }
 type retryKey struct{}
 
 type Service struct {
+	storeWebP bool
 	Layout    paths.Layout
 	History   *history.Service
 	Clipboard Clipboard
@@ -119,7 +121,7 @@ type Service struct {
 func New(layout paths.Layout, h *history.Service, c Clipboard) *Service {
 	return &Service{
 		Layout: layout, History: h, Clipboard: c,
-		CaptureText: true, CaptureImages: true, CaptureFiles: true, CaptureFileMaxBytes: 20 << 20,
+		storeWebP: true, CaptureText: true, CaptureImages: true, CaptureFiles: true, CaptureFileMaxBytes: 20 << 20,
 		Now: time.Now, NewID: newGUID,
 		// 250 ms of C# plus one poll of the platform watcher (400 ms): a write
 		// just after a poll is seen one interval later.
@@ -133,6 +135,7 @@ func (s *Service) ApplySettings(st model.Settings) {
 	s.setMu.Lock()
 	s.CaptureText, s.CaptureImages, s.CaptureFiles = st.CaptureText, st.CaptureImages, st.CaptureFiles
 	s.allowed = parseExtensions(st.CaptureFileExtensions)
+	s.storeWebP = st.StoreImagesAsWebP()
 	s.CaptureFileMaxBytes = int64(min(st.CaptureFileMaxMegabytes, st.MaxMegabytes)) * 1024 * 1024
 	s.setMu.Unlock()
 }
@@ -439,7 +442,7 @@ func (s *Service) capture(ctx context.Context, expected *uint64) error {
 		if len(files) > 0 {
 			if opt.images && len(files) == 1 && isImagePath(files[0]) && isFile(files[0]) {
 				if data, err := readBoundedImage(files[0], opt.maxBytes); err == nil {
-					p, h, size, err := s.savePNG(data)
+					p, h, size, err := s.saveImage(data)
 					if err == nil {
 						add(model.Item{ID: s.NewID(), Kind: model.KindImage, ApproxBytes: size, ImageFilePath: &p, CopyCount: 1, ContentHash: &h})
 						return nil
@@ -475,7 +478,7 @@ func (s *Service) capture(ctx context.Context, expected *uint64) error {
 			wantRetry = true // an image is advertised but did not come
 		}
 		if len(data) > 0 {
-			p, h, size, err := s.savePNG(data)
+			p, h, size, err := s.saveImage(data)
 			if err == nil {
 				add(model.Item{ID: s.NewID(), Kind: model.KindImage, ApproxBytes: size, ImageFilePath: &p, CopyCount: 1, ContentHash: &h})
 				return nil
@@ -591,11 +594,10 @@ func (s *Service) fileListBytes(id string, files []string) int64 {
 // full or the folder cannot be written, as against data that is no picture.
 var errStorage = errors.New("capture: cannot store the picture")
 
-// savePNG stores an image in the images folder as <unix ms>_<guid>.png, and
-// returns its path, its content hash ("img:" and the SHA-256 of the file)
-// and its size. A PNG is stored as it is; any other format the standard
-// decoders know is converted.
-func (s *Service) savePNG(data []byte) (path, hash string, size int64, err error) {
+// saveImage stores lossless WebP by default, or PNG when disabled. The
+// fingerprint retains the normalized PNG hash so changing storage format does
+// not create duplicate clipboard entries.
+func (s *Service) saveImage(data []byte) (path, hash string, size int64, err error) {
 	if err := validateImageSize(data); err != nil {
 		return "", "", 0, err
 	}
@@ -614,10 +616,26 @@ func (s *Service) savePNG(data []byte) (path, hash string, size int64, err error
 		// picture that cannot be shown
 		return "", "", 0, derr
 	}
+	canonicalHash := hashOf("img", data)
+	extension := "png"
+	s.setMu.RLock()
+	webp := s.storeWebP
+	s.setMu.RUnlock()
+	if webp {
+		im, err := imagecodec.Decode(data)
+		if err != nil {
+			return "", "", 0, err
+		}
+		data, err = imagecodec.Encode(im, "webp")
+		if err != nil {
+			return "", "", 0, err
+		}
+		extension = "webp"
+	}
 	if err := os.MkdirAll(s.Layout.Images(), 0o700); err != nil {
 		return "", "", 0, fmt.Errorf("%w: %v", errStorage, err)
 	}
-	path = filepath.Join(s.Layout.Images(), fmt.Sprintf("%d_%s.png", s.Now().UnixMilli(), strings.ReplaceAll(newGUID(), "-", "")))
+	path = filepath.Join(s.Layout.Images(), fmt.Sprintf("%d_%s.%s", s.Now().UnixMilli(), strings.ReplaceAll(newGUID(), "-", ""), extension))
 	// To a side file first: a write that stops half way (disk full) must not
 	// leave a broken picture behind.
 	tmp := path + ".part"
@@ -629,7 +647,7 @@ func (s *Service) savePNG(data []byte) (path, hash string, size int64, err error
 		os.Remove(tmp)
 		return "", "", 0, fmt.Errorf("%w: %v", errStorage, err)
 	}
-	return path, hashOf("img", data), int64(len(data)), nil
+	return path, canonicalHash, int64(len(data)), nil
 }
 
 // hashOf is "<prefix>:<SHA-256 in upper case hex>", what C# stores in
@@ -1067,6 +1085,16 @@ func (s *Service) write(it model.Item) (bool, written, error) {
 		data, err := os.ReadFile(p)
 		if err != nil {
 			return false, written{}, err
+		}
+		if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+			im, err := imagecodec.Decode(data)
+			if err != nil {
+				return false, written{}, err
+			}
+			data, err = imagecodec.Encode(im, "png")
+			if err != nil {
+				return false, written{}, err
+			}
 		}
 		return true, written{image: data}, s.Clipboard.WriteImage(data, p)
 	}
