@@ -75,7 +75,7 @@ func newRig(t *testing.T, newFiles map[string]string, legacy []string) *rig {
 
 func (r *rig) hooks() Hooks {
 	return Hooks{
-		WaitExit: func(pid int) { r.waited = append(r.waited, pid) },
+		WaitExit: func(pid int, _ time.Duration) bool { r.waited = append(r.waited, pid); return true },
 		Sleep:    func(time.Duration) {},
 		Launch:   func(p string) error { r.launched = append(r.launched, p); return nil },
 		Alert:    func(title, msg string) { r.alerts = append(r.alerts, title+": "+msg) },
@@ -834,5 +834,349 @@ func TestReadOnlyFileInTheInstallDirMeansTheInstallerIsUsed(t *testing.T) {
 	defer os.Chmod(filepath.Join(dir, "history.json"), 0o644)
 	if !r.c.installDirWritable() {
 		t.Fatal("a read-only data file is not in the update's way")
+	}
+}
+
+func TestHelperGivesUpOnAProgramThatDoesNotExit(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	h := r.hooks()
+	var waitedFor time.Duration
+	h.WaitExit = func(pid int, d time.Duration) bool { waitedFor = d; return false }
+	r.plan.ResultPath = filepath.Join(r.root, "result.json")
+	r.plan.Version = "1.0.11"
+	if err := RunPlan(r.plan, h); !errors.Is(err, errAppDidNotExit) {
+		t.Fatalf("err %v", err)
+	}
+	if waitedFor <= 0 || waitedFor > 10*time.Minute {
+		t.Fatalf("the wait is not bounded: %v", waitedFor)
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+		t.Fatalf("files were touched: %q", got)
+	}
+	if _, err := os.Stat(recoveryPath(r.install)); !os.IsNotExist(err) {
+		t.Fatal("a journal was written for an update that never began")
+	}
+	if len(r.launched) != 0 || len(r.alerts) != 0 {
+		t.Fatalf("launched %v, alerts %v", r.launched, r.alerts)
+	}
+	res, err := ReadResult(r.plan.ResultPath)
+	if err != nil || res == nil || res.OK || res.Version != "1.0.11" {
+		t.Fatalf("result %+v %v", res, err)
+	}
+}
+
+func TestQuietPlanShowsNothingAndWritesTheResult(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		r := newRig(t, newPkg, nil)
+		r.plan.Quiet = true
+		r.plan.Version = "1.0.11"
+		r.plan.ResultPath = filepath.Join(r.root, "result.json")
+		h := r.hooks()
+		if fail {
+			h.Copy = func(src, dst string) error { return errors.New("disk full") }
+		}
+		err := RunPlan(r.plan, h)
+		if (err != nil) != fail {
+			t.Fatalf("fail %v: err %v", fail, err)
+		}
+		if len(r.alerts) != 0 {
+			t.Fatalf("fail %v: a quiet update showed %v", fail, r.alerts)
+		}
+		res, rerr := ReadResult(r.plan.ResultPath)
+		if rerr != nil || res == nil || res.OK == fail || res.Version != "1.0.11" {
+			t.Fatalf("fail %v: result %+v %v", fail, res, rerr)
+		}
+		if fail && !res.RolledBack {
+			t.Fatal("a rolled back update does not say so")
+		}
+		if len(r.launched) != 1 {
+			t.Fatalf("fail %v: launched %v", fail, r.launched)
+		}
+	}
+}
+
+func TestPlanIsWrittenDurablyAndReadBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plan.json")
+	p := Plan{PID: 7, InstallDir: "C:\\Klip", Version: "1.0.12", Quiet: true, ResultPath: "r.json"}
+	if err := WritePlan(path, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadPlan(path)
+	if err != nil || got != p {
+		t.Fatalf("read %+v %v", got, err)
+	}
+	ents, _ := os.ReadDir(filepath.Dir(path))
+	if len(ents) != 1 {
+		t.Fatalf("side files left: %v", ents)
+	}
+}
+
+func TestCommittedJournalKeepsTheNewVersion(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	h := r.hooks()
+	// The power goes after the files are in place and the journal is marked
+	// committed, before it is removed: as if removing it failed for good.
+	var rollback []rollbackItem
+	lg := logger{r.plan.LogPath, h.fill().Now}
+	if err := applyFiles(r.plan, h.fill(), lg, &rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCommitted(r.install, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecoverInterruptedUpdate(r.install); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+		t.Fatalf("a committed update was rolled back: %q", got)
+	}
+	if _, err := os.Stat(recoveryPath(r.install)); !os.IsNotExist(err) {
+		t.Fatal("the committed journal stayed")
+	}
+}
+
+func TestUncommittedJournalStillRollsBack(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	h := r.hooks().fill()
+	var rollback []rollbackItem
+	if err := applyFiles(r.plan, h, logger{r.plan.LogPath, h.Now}, &rollback); err != nil {
+		t.Fatal(err)
+	}
+	// The power went before the update was committed.
+	if err := RecoverInterruptedUpdate(r.install); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+		t.Fatalf("an unfinished update was kept: %q", got)
+	}
+}
+
+func TestCleanOldRemovesOldDownloadsAndBackups(t *testing.T) {
+	r := newCoord(t, "1.0.11")
+	pk := filepath.Join(r.c.Root, "packages")
+	write(t, filepath.Join(pk, "maccy-1.0.10-win-x64.zip"), "old")
+	write(t, filepath.Join(pk, "maccy-1.0.11-win-x64.zip"), "installed")
+	write(t, filepath.Join(pk, "maccy-1.0.12-win-x64.zip"), "next")
+	write(t, filepath.Join(pk, "notes.txt"), "not ours")
+	write(t, filepath.Join(r.c.Root, "maccy-1.0.11-setup.exe"), "installed")
+	write(t, filepath.Join(r.c.Root, "maccy-1.0.12-setup.exe"), "next")
+	for i, name := range []string{"1.0.9-a", "1.0.10-b", "1.0.11-c"} {
+		dir := filepath.Join(r.c.Root, "backups", name)
+		write(t, filepath.Join(dir, "maccy.exe"), "x")
+		at := time.Date(2026, 1, 1+i, 0, 0, 0, 0, time.UTC)
+		os.Chtimes(dir, at, at)
+	}
+	r.c.CleanOld()
+	for rel, want := range map[string]bool{
+		"packages/maccy-1.0.10-win-x64.zip": false,
+		"packages/maccy-1.0.11-win-x64.zip": false,
+		"packages/maccy-1.0.12-win-x64.zip": true,
+		"packages/notes.txt":                true,
+		"maccy-1.0.11-setup.exe":            false,
+		"maccy-1.0.12-setup.exe":            true,
+		"backups/1.0.9-a":                   false,
+		"backups/1.0.10-b":                  false,
+		"backups/1.0.11-c":                  true,
+	} {
+		_, err := os.Stat(filepath.Join(r.c.Root, filepath.FromSlash(rel)))
+		if (err == nil) != want {
+			t.Errorf("%s: present %v, want %v", rel, err == nil, want)
+		}
+	}
+}
+
+func TestResultIsWrittenBeforeTheProgramThatReadsItStarts(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	r.plan.Version, r.plan.ResultPath = "1.0.11", filepath.Join(r.root, "result.json")
+	h := r.hooks()
+	var seen *InstallResult
+	h.Launch = func(p string) error {
+		seen, _ = ReadResult(r.plan.ResultPath) // what the new program reads as it starts
+		return nil
+	}
+	if err := RunPlan(r.plan, h); err != nil {
+		t.Fatal(err)
+	}
+	if seen == nil || !seen.OK || seen.Version != "1.0.11" {
+		t.Fatalf("the new program found %+v", seen)
+	}
+	// A new program that will not start: the result says so before the old
+	// one, put back, starts and reads it.
+	r2 := newRig(t, newPkg, nil)
+	r2.plan.Version, r2.plan.ResultPath = "1.0.11", filepath.Join(r2.root, "result.json")
+	h2 := r2.hooks()
+	starts := 0
+	var atOld *InstallResult
+	h2.Launch = func(p string) error {
+		starts++
+		if starts == 1 {
+			return errors.New("blocked")
+		}
+		atOld, _ = ReadResult(r2.plan.ResultPath)
+		return nil
+	}
+	if err := RunPlan(r2.plan, h2); err == nil {
+		t.Fatal("a program that cannot start is a failed update")
+	}
+	if atOld == nil || atOld.OK || !atOld.RolledBack {
+		t.Fatalf("the old program found %+v", atOld)
+	}
+}
+
+func TestInstallerStartedIsPendingNotInstalled(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	p := Plan{PID: 77, Installer: "/tmp/maccy-1.0.12-setup.exe", LogPath: r.plan.LogPath, Version: "1.0.12",
+		ResultPath: filepath.Join(r.root, "result.json"), RestartExe: filepath.Join(r.install, "maccy.exe")}
+	h := r.hooks()
+	var atInstaller *InstallResult
+	h.LaunchInstaller = func(string) error { atInstaller, _ = ReadResult(p.ResultPath); return nil }
+	if err := RunPlan(p, h); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := ReadResult(p.ResultPath)
+	if atInstaller == nil || !atInstaller.Pending || res == nil || res.OK || !res.Pending {
+		t.Fatalf("at the installer %+v, after %+v", atInstaller, res)
+	}
+	// An installer that cannot start: a failure, written before Klip restarts.
+	h = r.hooks()
+	h.LaunchInstaller = func(string) error { return errors.New("blocked") }
+	var atRestart *InstallResult
+	h.Launch = func(string) error { atRestart, _ = ReadResult(p.ResultPath); return nil }
+	if err := RunPlan(p, h); err == nil {
+		t.Fatal("a failing installer must be reported")
+	}
+	if atRestart == nil || atRestart.OK || atRestart.Pending || atRestart.Error == "" {
+		t.Fatalf("Klip restarted with %+v", atRestart)
+	}
+}
+
+func TestCommittedJournalThatCannotBeRemovedDoesNotBlockStartup(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		t.Skip("needs a folder this user cannot remove files from")
+	}
+	r := newRig(t, newPkg, nil)
+	h := r.hooks().fill()
+	var rollback []rollbackItem
+	if err := applyFiles(r.plan, h, logger{r.plan.LogPath, h.Now}, &rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCommitted(r.install, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(r.install, 0o500); err != nil { // the journal cannot be removed
+		t.Fatal(err)
+	}
+	defer os.Chmod(r.install, 0o755)
+	if err := RecoverInterruptedUpdate(r.install); err != nil {
+		t.Fatalf("recovery failed on a finished update: %v", err)
+	}
+	needed, err := StartRecovery(r.install)
+	if needed || err != nil {
+		t.Fatalf("startup would recover a finished update again: %v %v", needed, err)
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+		t.Fatalf("the new version was touched: %q", got)
+	}
+}
+
+func TestFailedLaunchIsUndoneEvenWhenTheCommittedJournalIsStuck(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	// Once committed, the journal can be neither removed nor replaced (a
+	// scanner holds it).
+	committed := false
+	prevWrite, prevRemove := writeJournal, removeJournal
+	defer func() { writeJournal, removeJournal = prevWrite, prevRemove }()
+	writeJournal = func(root string, b []byte) error {
+		if committed {
+			return errors.New("journal held")
+		}
+		committed = strings.Contains(string(b), `"committed":true`)
+		return prevWrite(root, b)
+	}
+	removeJournal = func(string) error { return errors.New("journal held") }
+	h := r.hooks()
+	starts := 0
+	h.Launch = func(p string) error {
+		starts++
+		if starts == 1 {
+			return errors.New("the new program will not start")
+		}
+		r.launched = append(r.launched, p)
+		return nil
+	}
+	if err := RunPlan(r.plan, h); err == nil {
+		t.Fatal("a program that cannot start is a failed update")
+	}
+	if !committed {
+		t.Fatal("the test did not reach the committed journal")
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+		t.Fatalf("the version that does not start was kept: %q", got)
+	}
+	if len(r.launched) != 1 {
+		t.Fatalf("the old program was not started again: %v", r.launched)
+	}
+	if _, err := os.Stat(rollbackPath(r.install)); !os.IsNotExist(err) {
+		t.Fatal("the rollback marker stayed after a whole undo")
+	}
+}
+
+func TestRollbackMarkerIsHonouredOverACommittedJournal(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	h := r.hooks().fill()
+	var rollback []rollbackItem
+	if err := applyFiles(r.plan, h, logger{r.plan.LogPath, h.Now}, &rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCommitted(r.install, rollback); err != nil {
+		t.Fatal(err)
+	}
+	// The undo was begun, recorded by the marker, and cut short.
+	if err := saveRollback(r.install, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if needed, err := recoveryNeeded(r.install); !needed || err != nil {
+		t.Fatalf("startup passes over a rollback marker: %v %v", needed, err)
+	}
+	if err := RecoverInterruptedUpdate(r.install); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+		t.Fatalf("the undo was not finished: %q", got)
+	}
+	for _, p := range []string{rollbackPath(r.install), recoveryPath(r.install)} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s stayed", filepath.Base(p))
+		}
+	}
+	if needed, _ := recoveryNeeded(r.install); needed {
+		t.Fatal("recovery is asked for again")
+	}
+}
+
+func TestNoUndoWithoutARecordOfIt(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	committed := false
+	prevWrite, prevRemove, prevRollback := writeJournal, removeJournal, writeRollback
+	defer func() { writeJournal, removeJournal, writeRollback = prevWrite, prevRemove, prevRollback }()
+	writeJournal = func(root string, b []byte) error {
+		if committed {
+			return errors.New("journal held")
+		}
+		committed = strings.Contains(string(b), `"committed":true`)
+		return prevWrite(root, b)
+	}
+	removeJournal = func(string) error { return errors.New("journal held") }
+	writeRollback = func(string, []rollbackItem) error { return errors.New("folder held") }
+	h := r.hooks()
+	h.Launch = func(string) error { return errors.New("the new program will not start") }
+	if err := RunPlan(r.plan, h); err == nil {
+		t.Fatal("a program that cannot start is a failed update")
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+		t.Fatalf("files were undone with no record of it: %q", got)
+	}
+	if len(r.alerts) != 1 || !strings.Contains(r.alerts[0], "没有回滚") {
+		t.Fatalf("alerts %v", r.alerts)
 	}
 }

@@ -10,11 +10,16 @@ import (
 	"time"
 )
 
-// waitExit polls until the process is gone.
-func waitExit(pid int) {
+// waitExit polls until the process is gone, or for timeout at most (none:
+// for ever), and says whether it is gone.
+func waitExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
 	for {
 		if err := syscall.Kill(pid, 0); err != nil {
-			return
+			return true
+		}
+		if timeout > 0 && !time.Now().Before(deadline) {
+			return false
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

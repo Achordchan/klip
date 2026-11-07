@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 const (
 	synchronize     = 0x00100000
 	infinite        = 0xFFFFFFFF
+	waitObject0     = 0x00000000
 	createNoWindow  = 0x08000000
 	detachedProcess = 0x00000008
 	mbOK            = 0x0
@@ -28,15 +30,21 @@ var (
 	procShellExecW  = syscall.NewLazyDLL("shell32.dll").NewProc("ShellExecuteW")
 )
 
-// waitExit blocks until the process is gone; one that cannot be opened is
-// taken to be gone already.
-func waitExit(pid int) {
+// waitExit blocks until the process is gone, or for timeout at most (none:
+// for ever), and says whether it is gone; one that cannot be opened is taken
+// to be gone already.
+func waitExit(pid int, timeout time.Duration) bool {
 	h, _, _ := procOpenProcess.Call(synchronize, 0, uintptr(pid))
 	if h == 0 {
-		return
+		return true
 	}
 	defer procCloseHandle.Call(h)
-	procWait.Call(h, infinite)
+	ms := uintptr(infinite)
+	if timeout > 0 {
+		ms = uintptr(timeout / time.Millisecond)
+	}
+	r, _, _ := procWait.Call(h, ms)
+	return r == waitObject0
 }
 
 // launch starts a program, detached and without a console window. Its own

@@ -381,6 +381,27 @@ func (a *App) Start() {
 	// check for a new version, a little after the start and every 12 hours,
 	// without a word to the user.
 	go func() {
+		// How the last update went, as its helper wrote it: told once.
+		if r, err := update.ReadResult(a.Updates.ResultPath()); err != nil {
+			a.cfg.Logf("last update result: %v", err)
+		} else if r != nil {
+			if r.Pending {
+				// The installer was started; whether it finished is what is
+				// running now.
+				installed := false
+				if want, ok := update.ParseVersion(update.NormalizeVersion(r.Version)); ok {
+					if have, ok := update.ParseVersion(update.NormalizeVersion(version.Version)); ok {
+						installed = have.Compare(want) >= 0
+					}
+				}
+				a.cfg.Logf("installer of %s started at %s; installed: %v", r.Version, r.At.Format(time.RFC3339), installed)
+			} else if r.OK {
+				a.cfg.Logf("update to %s installed at %s", r.Version, r.At.Format(time.RFC3339))
+			} else {
+				a.cfg.Logf("update to %s failed at %s (rolled back: %v): %s", r.Version, r.At.Format(time.RFC3339), r.RolledBack, r.Error)
+			}
+			_ = os.Remove(a.Updates.ResultPath())
+		}
 		a.Updates.CleanOld()
 		installDir := filepath.Dir(a.Updates.Exe)
 		if removed, err := update.CleanLegacy(installDir, filepath.Join(a.Updates.Root, "installed-package-files.json")); err != nil {
