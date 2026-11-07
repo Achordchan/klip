@@ -53,10 +53,15 @@ func (c *Coordinator) Prepare(ctx context.Context) error {
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); c.preparing = false; c.mu.Unlock() }()
 
-	// The folders this uses are the ones CleanOld and Apply use.
+	// The folders this uses are the ones CleanOld and Apply use. The lock is
+	// held until the package is published: a CleanOld in between would remove
+	// its files and leave a preparation that points at nothing.
 	c.fsMu.Lock()
+	defer c.fsMu.Unlock()
 	prep, err := c.Client.DownloadPackage(ctx, want, c.Root, nil)
-	c.fsMu.Unlock()
+	if c.afterDownload != nil {
+		c.afterDownload()
+	}
 	if err != nil {
 		return err
 	}
@@ -97,13 +102,23 @@ func (c *Coordinator) takePrepared(version string) *Prepared {
 	return p
 }
 
+// errCalledOff is a quiet install that decide did not let go on.
+var errCalledOff = errors.New("the quiet install was called off")
+
 // InstallPrepared installs the update Prepare made ready, quietly: no window,
 // no message box (Plan.Quiet), and the new version, started by the helper,
 // does not show itself (QuietRelaunch). The attempt is counted before the
 // helper starts, so that a version that fails is not tried for ever: after
-// MaxAutoAttempts it waits for the user. On success the program is asked to
-// quit (Shutdown).
-func (c *Coordinator) InstallPrepared() error {
+// MaxAutoAttempts it waits for the user.
+//
+// The moment was chosen before this was called, and preparing the helper
+// takes a while: decide has the last word. It is called once the helper
+// waits, with commit, which writes the quiet marker and asks the program to
+// quit (Shutdown); decide calls it, on the UI thread right after looking
+// again that nobody came back, or returns without it to call the install
+// off. Called off, the attempt is given back, and the helper, whose program
+// does not exit, gives up without touching anything (exitWait).
+func (c *Coordinator) InstallPrepared(decide func(commit func())) error {
 	c.mu.Lock()
 	if !c.readyLocked() || c.attempts(c.prepared.Version) >= MaxAutoAttempts {
 		c.mu.Unlock()
@@ -127,11 +142,19 @@ func (c *Coordinator) InstallPrepared() error {
 	if err := c.startPackage(prep, true); err != nil {
 		return fail(err)
 	}
-	// The helper waits for this process: the new one is told to keep quiet.
-	if err := writeJSON(c.quietMarkerPath(), quietMarker{Version: prep.Version, At: c.now()}); err != nil {
-		_ = err // a start that shows the panel is all that is lost
+	committed := false
+	decide(func() {
+		committed = true
+		// The helper waits for this process: the new one is told to keep quiet.
+		if err := writeJSON(c.quietMarkerPath(), quietMarker{Version: prep.Version, At: c.now()}); err != nil {
+			_ = err // a start that shows the panel is all that is lost
+		}
+		c.done()
+	})
+	if !committed {
+		c.uncountAttempt(prep.Version)
+		return fail(errCalledOff)
 	}
-	c.done()
 	return nil
 }
 
@@ -163,6 +186,14 @@ func (c *Coordinator) countAttempt(version string) error {
 		return err
 	}
 	return writeJSON(c.attemptsPath(), map[string]int{v: n + 1})
+}
+
+// uncountAttempt gives back an attempt that was counted and not made.
+func (c *Coordinator) uncountAttempt(version string) {
+	v := NormalizeVersion(version)
+	if n := c.readAttempts()[v]; n > 0 {
+		_ = writeJSON(c.attemptsPath(), map[string]int{v: n - 1})
+	}
 }
 
 // ---- quiet relaunch

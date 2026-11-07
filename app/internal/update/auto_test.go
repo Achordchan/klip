@@ -27,7 +27,7 @@ func TestPrepareIsSilentAndInstallIsQuiet(t *testing.T) {
 	if len(seen) != 0 || r.c.State().Phase != Available {
 		t.Fatalf("preparing showed itself: %v, %+v", seen, r.c.State())
 	}
-	if err := r.c.InstallPrepared(); err != nil {
+	if err := r.c.InstallPrepared(commitAlways); err != nil {
 		t.Fatal(err)
 	}
 	if r.shut != 1 || len(r.spawn) != 1 {
@@ -108,7 +108,7 @@ func TestAVersionThatFailsTwiceWaitsForTheUser(t *testing.T) {
 		if err := r.c.Prepare(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.c.InstallPrepared(); err != nil {
+		if err := r.c.InstallPrepared(commitAlways); err != nil {
 			t.Fatalf("attempt %d: %v", i+1, err)
 		}
 		// The helper rolled it back and the old version started again.
@@ -122,7 +122,7 @@ func TestAVersionThatFailsTwiceWaitsForTheUser(t *testing.T) {
 	if r.c.Ready() {
 		t.Fatal("a version that failed twice is made ready again")
 	}
-	if err := r.c.InstallPrepared(); err == nil {
+	if err := r.c.InstallPrepared(commitAlways); err == nil {
 		t.Fatal("a version that failed twice is installed again")
 	}
 	if r.c.Available() == nil {
@@ -151,7 +151,7 @@ func TestStalePreparationIsNotInstalled(t *testing.T) {
 	if r.c.Ready() {
 		t.Fatal("the package of 1.0.11 counts as ready for 1.0.12")
 	}
-	if err := r.c.InstallPrepared(); err == nil {
+	if err := r.c.InstallPrepared(commitAlways); err == nil {
 		t.Fatal("an older preparation was installed")
 	}
 }
@@ -195,7 +195,7 @@ func TestCleanOldAfterPrepareDoesNotLeaveAPreparationWithoutFiles(t *testing.T) 
 	if r.c.Ready() {
 		t.Fatal("a preparation whose files were cleaned counts as ready")
 	}
-	if err := r.c.InstallPrepared(); err == nil || len(r.spawn) != 0 {
+	if err := r.c.InstallPrepared(commitAlways); err == nil || len(r.spawn) != 0 {
 		t.Fatalf("a helper was started for files that are gone: %v %v", err, r.spawn)
 	}
 	// Made ready again from the kept zip, without a download.
@@ -225,5 +225,63 @@ func TestUnwritableInstallFolderIsNotPreparedForAQuietInstall(t *testing.T) {
 	}
 	if r.c.Ready() {
 		t.Fatal("an install folder that needs rights is made ready for a quiet install")
+	}
+}
+
+func commitAlways(commit func()) { commit() }
+
+func TestCalledOffInstallQuitsNothingAndGivesTheAttemptBack(t *testing.T) {
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	if err := r.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The user came back while the helper was being prepared.
+	if err := r.c.InstallPrepared(func(func()) {}); err == nil {
+		t.Fatal("a called-off install succeeded")
+	}
+	if r.shut != 0 {
+		t.Fatal("the program quit although the install was called off")
+	}
+	if r.c.QuietRelaunch() {
+		t.Fatal("a quiet marker was written for an install that did not happen")
+	}
+	if n := r.c.attempts("1.0.11"); n != 0 {
+		t.Fatalf("a called-off install used an attempt: %d", n)
+	}
+	r.c.mu.Lock()
+	applying := r.c.applying
+	r.c.mu.Unlock()
+	if applying {
+		t.Fatal("still applying")
+	}
+	// It is tried again later, from the kept zip.
+	if err := r.c.Prepare(context.Background()); err != nil || !r.c.Ready() {
+		t.Fatalf("not made ready again: %v", err)
+	}
+}
+
+func TestCleanOldDuringPrepareCannotLeaveAPreparationWithoutFiles(t *testing.T) {
+	r := newCoord(t, "1.0.10")
+	r.publish(t, "1.0.11", zipOf(t, "1.0.11", "win-x64", newPkg, nil), true)
+	r.c.Refresh(context.Background())
+	cleaned := make(chan struct{})
+	r.c.afterDownload = func() {
+		// CleanOld comes in between the download and the publication.
+		go func() { r.c.CleanOld(); close(cleaned) }()
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := r.c.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-cleaned
+	r.c.mu.Lock()
+	prep := r.c.prepared
+	r.c.mu.Unlock()
+	if prep != nil {
+		if _, err := os.Stat(prep.StagingPath); err != nil {
+			t.Fatal("a preparation whose files were removed is published")
+		}
 	}
 }

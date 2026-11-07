@@ -78,6 +78,9 @@ type Coordinator struct {
 	// the windows must not show it.
 	prepared  *Prepared
 	preparing bool
+	// afterDownload, for tests, runs in Prepare between the download and the
+	// publication of what it made.
+	afterDownload func()
 }
 
 // NewCoordinator returns a Coordinator for the running program.

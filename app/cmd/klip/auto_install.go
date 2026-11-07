@@ -54,12 +54,9 @@ func (p *program) watchAutoInstall() {
 	}()
 }
 
-// autoInstallNow installs the waiting update if now is the moment. UI thread.
-func (p *program) autoInstallNow() {
-	if p.quitting.Load() || p.app == nil {
-		return
-	}
-	g := autoInstallGate{
+// gate is the state the moment is judged by. UI thread.
+func (p *program) gate() autoInstallGate {
+	return autoInstallGate{
 		ready:     p.app.Updates.Ready(),
 		panel:     p.win != nil && p.win.IsVisible(),
 		prefs:     p.prefsWin != nil && p.prefsWin.IsVisible(),
@@ -70,13 +67,36 @@ func (p *program) autoInstallNow() {
 		syncing:   p.app.Syncing(),
 		idle:      systemIdle(),
 	}
-	if !shouldAutoInstall(g) {
+}
+
+// autoInstallNow installs the waiting update if now is the moment. UI thread.
+func (p *program) autoInstallNow() {
+	if p.quitting.Load() || p.app == nil || !shouldAutoInstall(p.gate()) {
 		return
 	}
 	go func() {
-		// It quits the program through quitForUpdate once the helper runs.
-		if err := p.app.Updates.InstallPrepared(); err != nil {
+		err := p.app.Updates.InstallPrepared(p.decideAutoInstall)
+		if err != nil {
 			log.Println("auto update:", err)
 		}
 	}()
+}
+
+// decideAutoInstall is the last word on a quiet install, once its helper
+// waits: on the UI thread, where the user's clicks are handled, the moment is
+// judged again and, if it still holds, the program quits for the update in
+// the same step, with no click in between. Otherwise nothing happens (the
+// user came back, a sync or a migration began). Any goroutine but the UI
+// thread: it waits for it.
+func (p *program) decideAutoInstall(commit func()) {
+	done := make(chan struct{})
+	mygo.RunOnMain(func() {
+		defer close(done)
+		g := p.gate()
+		g.ready = true // the update is being handed over, no longer "ready"
+		if !p.quitting.Load() && shouldAutoInstall(g) {
+			commit() // quits, through quitForUpdate
+		}
+	})
+	<-done
 }
