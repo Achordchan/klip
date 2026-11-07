@@ -1,0 +1,132 @@
+{
+  "note": "The files of the C# program (Klip/Maccy 1.0.9 and 1.0.10, win-x64), from the maccy-package.json of their light-update zips. The installer of the Go program deletes them from the program folder (tools/release_go.py, --legacy-from).",
+  "appId": "maccy",
+  "files": [
+    {
+      "path": "av_libglesv2.dll"
+    },
+    {
+      "path": "Avalonia.Base.dll"
+    },
+    {
+      "path": "Avalonia.Controls.dll"
+    },
+    {
+      "path": "Avalonia.DesignerSupport.dll"
+    },
+    {
+      "path": "Avalonia.Desktop.dll"
+    },
+    {
+      "path": "Avalonia.Dialogs.dll"
+    },
+    {
+      "path": "Avalonia.dll"
+    },
+    {
+      "path": "Avalonia.Fonts.Inter.dll"
+    },
+    {
+      "path": "Avalonia.FreeDesktop.dll"
+    },
+    {
+      "path": "Avalonia.Markup.dll"
+    },
+    {
+      "path": "Avalonia.Markup.Xaml.dll"
+    },
+    {
+      "path": "Avalonia.Metal.dll"
+    },
+    {
+      "path": "Avalonia.MicroCom.dll"
+    },
+    {
+      "path": "Avalonia.Native.dll"
+    },
+    {
+      "path": "Avalonia.OpenGL.dll"
+    },
+    {
+      "path": "Avalonia.Remote.Protocol.dll"
+    },
+    {
+      "path": "Avalonia.Skia.dll"
+    },
+    {
+      "path": "Avalonia.Themes.Fluent.dll"
+    },
+    {
+      "path": "Avalonia.Vulkan.dll"
+    },
+    {
+      "path": "Avalonia.Win32.Automation.dll"
+    },
+    {
+      "path": "Avalonia.Win32.dll"
+    },
+    {
+      "path": "Avalonia.X11.dll"
+    },
+    {
+      "path": "CommunityToolkit.Mvvm.dll"
+    },
+    {
+      "path": "e_sqlite3.dll"
+    },
+    {
+      "path": "HarfBuzzSharp.dll"
+    },
+    {
+      "path": "libHarfBuzzSharp.dll"
+    },
+    {
+      "path": "libSkiaSharp.dll"
+    },
+    {
+      "path": "maccy.deps.json"
+    },
+    {
+      "path": "maccy.dll"
+    },
+    {
+      "path": "maccy.exe"
+    },
+    {
+      "path": "maccy.pdb"
+    },
+    {
+      "path": "maccy.runtimeconfig.json"
+    },
+    {
+      "path": "MicroCom.Runtime.dll"
+    },
+    {
+      "path": "Microsoft.Data.Sqlite.dll"
+    },
+    {
+      "path": "Microsoft.Win32.SystemEvents.dll"
+    },
+    {
+      "path": "SkiaSharp.dll"
+    },
+    {
+      "path": "SQLitePCLRaw.batteries_v2.dll"
+    },
+    {
+      "path": "SQLitePCLRaw.core.dll"
+    },
+    {
+      "path": "SQLitePCLRaw.provider.e_sqlite3.dll"
+    },
+    {
+      "path": "System.Drawing.Common.dll"
+    },
+    {
+      "path": "System.IO.Pipelines.dll"
+    },
+    {
+      "path": "Tmds.DBus.Protocol.dll"
+    }
+  ]
+}

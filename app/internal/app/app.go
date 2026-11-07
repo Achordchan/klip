@@ -70,9 +70,13 @@ type Config struct {
 	Logf  func(format string, args ...any)
 }
 
-// UpdateManifestURL is where the update manifest is published: the address
-// that 1.0.10 and older read, which stays the release channel.
-const UpdateManifestURL = "https://gitee.com/Achordchan/maccy/raw/master/docs/updates/manifest.json"
+// UpdateManifestURL is where the update manifest is published: an asset of
+// the newest GitHub release (drafts and prereleases are not "latest"), so
+// that a release and what it tells the installed versions go out together.
+// Every version from 1.0.11 on reads this address: it must not move. It is a
+// variable only so that a test build can be pointed at a local server
+// (-ldflags -X, see tools/e2e_update.py); the releases never set it.
+var UpdateManifestURL = "https://github.com/Achordchan/klip/releases/latest/download/manifest.json"
 
 // App is the program without windows.
 type App struct {

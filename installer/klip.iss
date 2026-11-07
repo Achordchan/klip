@@ -1,6 +1,6 @@
 #define MyAppName "Klip"
 #define MyAppPublisher "Achord Chan"
-#define MyAppExeName "maccy.exe"
+#define MyAppExeName "Klip.exe"
 #ifndef MyPublishDir
   #define MyPublishDir SourcePath + "..\artifacts\publish\win-x64"
 #endif
@@ -22,7 +22,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=..\artifacts\installer
-OutputBaseFilename=maccy-{#MyAppVersionShort}-setup
+OutputBaseFilename=Klip-{#MyAppVersionShort}-setup
 SetupIconFile=..\klip\Assets\avalonia-logo.ico
 Compression=lzma
 SolidCompression=yes

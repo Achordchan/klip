@@ -31,7 +31,7 @@ func releaseTool(t *testing.T) string {
 func TestReleaseToolPackageIsAcceptedByTheClient(t *testing.T) {
 	tool := releaseTool(t)
 	pub := t.TempDir()
-	write(t, filepath.Join(pub, "maccy.exe"), "NEW EXE")
+	write(t, filepath.Join(pub, "Klip.exe"), "NEW EXE")
 	write(t, filepath.Join(pub, "mygo-sqlite3.dll"), "SQLITE")
 	write(t, filepath.Join(pub, "res", "a.txt"), "A")
 
@@ -66,7 +66,7 @@ func TestReleaseToolPackageIsAcceptedByTheClient(t *testing.T) {
 	if err := json.Unmarshal(res, &made); err != nil {
 		t.Fatalf("%v\n%s", err, res)
 	}
-	if filepath.Base(made.Path) != "maccy-1.0.11-win-x64.zip" {
+	if filepath.Base(made.Path) != "Klip-1.0.11-win-x64.zip" {
 		t.Fatalf("name: %s", made.Path)
 	}
 	if got, _ := SHA256File(made.Path); got != made.SHA256 {
@@ -85,7 +85,7 @@ func TestReleaseToolPackageIsAcceptedByTheClient(t *testing.T) {
 	// The old program's files are listed for removal, but not what is still
 	// needed (the same name), and never the user's data.
 	got := strings.Join(prep.Manifest.LegacyFiles, ",")
-	if got != "Avalonia.Base.dll,maccy.dll,runtimes/win-x64/native/libSkiaSharp.dll" {
+	if got != "Avalonia.Base.dll,maccy.dll,maccy.exe,runtimes/win-x64/native/libSkiaSharp.dll" {
 		t.Errorf("legacy files: %s", got)
 	}
 
@@ -102,7 +102,7 @@ func TestReleaseToolPackageIsAcceptedByTheClient(t *testing.T) {
 func TestReleaseToolRefusesUserData(t *testing.T) {
 	tool := releaseTool(t)
 	pub := t.TempDir()
-	write(t, filepath.Join(pub, "maccy.exe"), "EXE")
+	write(t, filepath.Join(pub, "Klip.exe"), "EXE")
 	write(t, filepath.Join(pub, "settings.json"), "{}")
 	res, err := exec.Command("python3", tool, "package", "--version", "1.0.11", "--publish-dir", pub, "--out-dir", t.TempDir()).CombinedOutput()
 	if err == nil || !strings.Contains(string(res), "user data") {
@@ -110,7 +110,7 @@ func TestReleaseToolRefusesUserData(t *testing.T) {
 	}
 	empty := t.TempDir()
 	write(t, filepath.Join(empty, "other.dll"), "x")
-	if res, err := exec.Command("python3", tool, "package", "--version", "1.0.11", "--publish-dir", empty, "--out-dir", t.TempDir()).CombinedOutput(); err == nil || !strings.Contains(string(res), "no maccy.exe") {
+	if res, err := exec.Command("python3", tool, "package", "--version", "1.0.11", "--publish-dir", empty, "--out-dir", t.TempDir()).CombinedOutput(); err == nil || !strings.Contains(string(res), "no Klip.exe") {
 		t.Fatalf("a folder without the program was packaged: %v\n%s", err, res)
 	}
 }
@@ -119,23 +119,22 @@ func TestReleaseToolManifestIsReadByTheClient(t *testing.T) {
 	tool := releaseTool(t)
 	dir := t.TempDir()
 	manifest := filepath.Join(dir, "manifest.json")
-	// The manifest of 1.0.10, as it is in the repository.
-	orig, err := os.ReadFile("../../../docs/updates/manifest.json")
-	if err != nil {
-		t.Skip("no manifest in the repo")
-	}
-	write(t, manifest, string(orig))
+	installer := filepath.Join(dir, "Klip-1.0.12-setup.exe")
+	pkg := filepath.Join(dir, "Klip-1.0.12-win-x64.zip")
+	write(t, installer, "SETUP")
+	write(t, pkg, "ZIP")
 	// The folder of the tool goes in as an argument, not as text in the script.
 	script := `
-import sys, json
+import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[2])
-import release
-release._update_manifest(Path(sys.argv[1]), version="1.0.11", mandatory=False, notes="line one\nline two",
-    base_url="https://gitee.com/Achordchan/maccy/releases/download", sha256="AB"*32, size=1234,
-    package_sha256="CD"*32, package_size=5678, package_runtime="win-x64")
+import release_go
+d = Path(sys.argv[1])
+release_go.write_manifest(d / "manifest.json", version="1.0.12", mandatory=False, notes="line one\nline two",
+    base_url=release_go.RELEASES, installer=d / "Klip-1.0.12-setup.exe", package=d / "Klip-1.0.12-win-x64.zip",
+    runtime="win-x64")
 `
-	if res, err := exec.Command("python3", "-c", script, manifest, filepath.Dir(tool)).CombinedOutput(); err != nil {
+	if res, err := exec.Command("python3", "-c", script, dir, filepath.Dir(tool)).CombinedOutput(); err != nil {
 		t.Fatalf("%v\n%s", err, res)
 	}
 	data, _ := os.ReadFile(manifest)
@@ -143,14 +142,16 @@ release._update_manifest(Path(sys.argv[1]), version="1.0.11", mandatory=False, n
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.AppID != "maccy" || m.Latest.Version != "1.0.11" || m.Latest.Notes != "line one\nline two" ||
-		m.Latest.Installer.URL != "https://gitee.com/Achordchan/maccy/releases/download/v1.0.11/maccy-1.0.11-setup.exe" ||
-		m.Latest.Package == nil || m.Latest.Package.URL != "https://gitee.com/Achordchan/maccy/releases/download/v1.0.11/maccy-1.0.11-win-x64.zip" ||
-		m.Latest.Package.Kind != "zip" || m.Latest.Package.Runtime != "win-x64" || m.Latest.Package.Size != 5678 {
+	sha, _ := SHA256File(pkg)
+	if m.AppID != AppID || m.Latest.Version != "1.0.12" || m.Latest.Notes != "line one\nline two" ||
+		m.Latest.Installer.URL != "https://github.com/Achordchan/klip/releases/download/v1.0.12/Klip-1.0.12-setup.exe" ||
+		m.Latest.Package == nil || m.Latest.Package.URL != "https://github.com/Achordchan/klip/releases/download/v1.0.12/Klip-1.0.12-win-x64.zip" ||
+		m.Latest.Package.Kind != "zip" || m.Latest.Package.Runtime != "win-x64" || m.Latest.Package.Size != 3 ||
+		!strings.EqualFold(m.Latest.Package.SHA256, sha) {
 		t.Fatalf("%+v", m.Latest)
 	}
-	// The client of 1.0.10, running, sees 1.0.11 as newer.
-	c := &Client{Current: "1.0.10", Runtime: "win-x64"}
+	// The version installed (1.0.11) sees 1.0.12 as newer, and can install it.
+	c := &Client{Current: "1.0.11", Runtime: "win-x64"}
 	if r := c.decide(m); r.Status != UpdateAvailable || !r.Info.HasSupportedPackage("win-x64") {
 		t.Fatalf("%+v", r)
 	}
@@ -165,15 +166,30 @@ release._update_manifest(Path(sys.argv[1]), version="1.0.11", mandatory=False, n
 	}
 }
 
-func TestReleaseToolNeedsADownloadAddress(t *testing.T) {
+// The address built into the program is the one the releases are made for:
+// the manifest asset of the newest release of this repository.
+func TestTheManifestAddressIsTheNewestGitHubRelease(t *testing.T) {
 	tool := releaseTool(t)
-	manifest := filepath.Join(t.TempDir(), "manifest.json")
-	if err := os.WriteFile(manifest, []byte(`{}`), 0o644); err != nil {
+	res, err := exec.Command("python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import release_go; print(release_go.RELEASES)", filepath.Dir(tool)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, res)
+	}
+	releases := strings.TrimSpace(string(res))
+	src, err := os.ReadFile("../app/app.go")
+	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := exec.Command("python3", tool, "release", "--version", "1.0.11", "--manifest", manifest).CombinedOutput()
+	want := strings.TrimSuffix(releases, "/download") + "/latest/download/manifest.json"
+	if !strings.Contains(string(src), `var UpdateManifestURL = "`+want+`"`) {
+		t.Fatalf("app.UpdateManifestURL is not %s", want)
+	}
+}
+
+func TestReleaseToolNeedsAnHTTPSDownloadAddress(t *testing.T) {
+	tool := releaseTool(t)
+	res, err := exec.Command("python3", tool, "release", "--version", "1.0.11", "--base-url", "http://example.com/x").CombinedOutput()
 	if err == nil || !strings.Contains(string(res), "--base-url") {
-		t.Fatalf("a release with no place to be downloaded from must stop before building: %v %s", err, res)
+		t.Fatalf("a release with a plain-http download address must stop before building: %v %s", err, res)
 	}
 }
 
@@ -181,12 +197,12 @@ func TestInstallerDeletesOnlyNamedLegacyFiles(t *testing.T) {
 	tool := releaseTool(t)
 	dir := t.TempDir()
 	pub := filepath.Join(dir, "pub")
-	write(t, filepath.Join(pub, "maccy.exe"), "NEW")
+	write(t, filepath.Join(pub, "Klip.exe"), "NEW")
 	old := filepath.Join(dir, "old.zip")
 	var b bytes.Buffer
 	zw := zip.NewWriter(&b)
 	w, _ := zw.Create("maccy-package.json")
-	_, _ = w.Write([]byte(`{"appId":"maccy","version":"1.0.10","runtime":"win-x64","files":[{"path":"maccy.exe"},{"path":"maccy.dll"},{"path":"runtimes/win-x64/native/x.dll"},{"path":"settings.json"},{"path":"../history.json"},{"path":"*.dll"},{"path":"{userdocs}/x.txt"},{"path":"C:/Windows/x.dll"},{"path":"a.dll."}]}`))
+	_, _ = w.Write([]byte(`{"appId":"maccy","version":"1.0.10","runtime":"win-x64","files":[{"path":"Klip.exe"},{"path":"maccy.exe"},{"path":"maccy.dll"},{"path":"runtimes/win-x64/native/x.dll"},{"path":"settings.json"},{"path":"../history.json"},{"path":"*.dll"},{"path":"{userdocs}/x.txt"},{"path":"C:/Windows/x.dll"},{"path":"a.dll."}]}`))
 	_ = zw.Close()
 	if err := os.WriteFile(old, b.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
@@ -209,7 +225,11 @@ release_go.write_legacy_delete(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 			t.Errorf("missing %s in:\n%s", want, text)
 		}
 	}
-	for _, bad := range []string{"*.dll", "history.json", "{userdocs}", "C:", "a.dll.", "settings.json", "maccy.exe"} {
+	// The old program file goes whatever the list says, and once.
+	if n := strings.Count(text, `DeleteLegacy('maccy.exe');`); n != 1 {
+		t.Errorf("maccy.exe deleted %d times:\n%s", n, text)
+	}
+	for _, bad := range []string{"*.dll", "history.json", "{userdocs}", "C:", "a.dll.", "settings.json", "Klip.exe"} {
 		if strings.Contains(text, bad) {
 			t.Errorf("%s must not be deleted:\n%s", bad, text)
 		}
@@ -219,13 +239,13 @@ release_go.write_legacy_delete(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 func TestPackageIntoTheSameFolderTwiceDoesNotContainItself(t *testing.T) {
 	tool := releaseTool(t)
 	pub := t.TempDir()
-	write(t, filepath.Join(pub, "maccy.exe"), "EXE")
+	write(t, filepath.Join(pub, "Klip.exe"), "EXE")
 	for i := 0; i < 2; i++ {
 		if res, err := exec.Command("python3", tool, "package", "--version", "1.0.11", "--publish-dir", pub, "--out-dir", pub).CombinedOutput(); err != nil {
 			t.Fatalf("run %d: %v\n%s", i, err, res)
 		}
 	}
-	zr, err := zip.OpenReader(filepath.Join(pub, "maccy-1.0.11-win-x64.zip"))
+	zr, err := zip.OpenReader(filepath.Join(pub, "Klip-1.0.11-win-x64.zip"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,13 +260,13 @@ func TestPackageIntoTheSameFolderTwiceDoesNotContainItself(t *testing.T) {
 func TestPackagesOfDifferentVersionsInOneFolderDoNotNest(t *testing.T) {
 	tool := releaseTool(t)
 	pub := t.TempDir()
-	write(t, filepath.Join(pub, "maccy.exe"), "EXE")
+	write(t, filepath.Join(pub, "Klip.exe"), "EXE")
 	for _, v := range []string{"1.0.11", "1.0.12"} {
 		if res, err := exec.Command("python3", tool, "package", "--version", v, "--publish-dir", pub, "--out-dir", pub).CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", v, err, res)
 		}
 	}
-	zr, err := zip.OpenReader(filepath.Join(pub, "maccy-1.0.12-win-x64.zip"))
+	zr, err := zip.OpenReader(filepath.Join(pub, "Klip-1.0.12-win-x64.zip"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,19 +309,19 @@ else:
 		t.Error("a folder of somebody's files without a build in it was offered for clearing")
 	}
 	inst := t.TempDir()
-	write(t, filepath.Join(inst, "maccy.exe"), "EXE")
+	write(t, filepath.Join(inst, "Klip.exe"), "EXE")
 	write(t, filepath.Join(inst, "history.json"), "[]")
 	if check(inst) != "REFUSED" {
 		t.Error("an installation with the user's data was offered for clearing")
 	}
 	mixed := t.TempDir()
-	write(t, filepath.Join(mixed, "maccy.exe"), "EXE")
+	write(t, filepath.Join(mixed, "Klip.exe"), "EXE")
 	write(t, filepath.Join(mixed, "notes.txt"), "mine")
 	if check(mixed) != "REFUSED" {
 		t.Error("a build next to somebody's file was offered for clearing")
 	}
 	build := t.TempDir()
-	write(t, filepath.Join(build, "maccy.exe"), "EXE")
+	write(t, filepath.Join(build, "Klip.exe"), "EXE")
 	write(t, filepath.Join(build, "mygo-sqlite3.dll"), "DLL")
 	if check(build) != "ALLOWED" || check(filepath.Join(build, "none")) != "ALLOWED" {
 		t.Error("the leftover of a build, or an empty folder, should be fine")

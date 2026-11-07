@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Release pipeline of the Go program (Klip 1.0.11 and later).
+"""Release pipeline of Klip (the Go program, 1.0.11 and later).
 
-It makes what the C# pipeline (release.py) makes and what the clients that
-exist expect: the program folder (maccy.exe and mygo-sqlite3.dll), the Inno
-Setup installer, the light-update zip with its maccy-package.json, and the
-entry in docs/updates/manifest.json. release.py's helpers for Inno Setup, the
-manifest and Gitee are used as they are.
+It makes the program folder (Klip.exe and mygo-sqlite3.dll), the Inno Setup
+installer, the light-update zip with its maccy-package.json, and the update
+manifest, all for a GitHub release (.github/workflows/release.yml uploads
+them): the installed versions read the manifest from the newest release.
 
     release_go.py build    --version 1.0.11                  # artifacts/publish/win-x64
-    release_go.py package  --version 1.0.11 --legacy-from manifest
-    release_go.py release  --version 1.0.11 --notes-file notes.txt --legacy-from manifest
-    release_go.py release  ... --publish-gitee --yes          # also upload and push
+    release_go.py package  --version 1.0.11
+    release_go.py release  --version 1.0.11 --notes-file notes.md   # artifacts/release
 
 Run it on any system with Go: the program is cross-compiled. The installer
 needs Inno Setup, so `release` is for Windows; `build` and `package` are not.
@@ -18,6 +16,7 @@ needs Inno Setup, so `release` is for Windows; `build` and `package` are not.
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import io
 import json
@@ -38,6 +37,11 @@ REPO = HERE.parent
 APP = REPO / "app"
 GO_ARCH = {"win-x64": "amd64", "win-arm64": "arm64"}
 WINRES = "github.com/tc-hib/go-winres@v0.3.3"
+EXE = "Klip.exe"  # update.ExeName: every version from 1.0.11 on checks for it
+RELEASES = "https://github.com/Achordchan/klip/releases/download"
+# The files of the C# program, which the installer removes from a folder it
+# installs over (the 1.0.9 and 1.0.10 packages, the last ones it had).
+LEGACY_CSHARP = REPO / "installer" / "legacy-csharp-files.json"
 
 # What a package must never hold: the user's data, as UpdateService.cs lists it.
 PROTECTED_ROOTS = ("images", "files", "blobs", "sync", "updates")
@@ -98,9 +102,9 @@ def fetch_sqlite(runtime: str, dest_dir: Path, cache: Path) -> Path:
     return dest
 
 
-GENERATED_PACKAGE = re.compile(r"maccy-[^/]+-(?:" + "|".join(re.escape(r) for r in GO_ARCH) + r")\.zip")
+GENERATED_PACKAGE = re.compile(r"(?:maccy|Klip)-[^/]+-(?:" + "|".join(re.escape(r) for r in GO_ARCH) + r")\.zip")
 
-BUILD_OUTPUT = re.compile(r"maccy\.exe|maccy-package\.json|mygo-sqlite3[^/]*\.dll|" + GENERATED_PACKAGE.pattern)
+BUILD_OUTPUT = re.compile(r"Klip\.exe|maccy-package\.json|mygo-sqlite3[^/]*\.dll|" + GENERATED_PACKAGE.pattern)
 
 
 def check_disposable(publish_dir: Path) -> None:
@@ -117,8 +121,8 @@ def check_disposable(publish_dir: Path) -> None:
     entries = list(pub.rglob("*"))
     if not entries:
         return
-    if not (pub / "maccy.exe").is_file():
-        raise RuntimeError(f"refusing to clear {pub}: it holds files but no maccy.exe from an earlier build")
+    if not (pub / EXE).is_file():
+        raise RuntimeError(f"refusing to clear {pub}: it holds files but no {EXE} from an earlier build")
     # Only what a build puts there, nothing else: the program, the SQLite
     # library, a package made from it. A folder with anything more is somebody's.
     for path in entries:
@@ -127,9 +131,11 @@ def check_disposable(publish_dir: Path) -> None:
             raise RuntimeError(f"refusing to clear {pub}: {rel} is not something a build makes")
 
 
-def build_publish(version: str, runtime: str, publish_dir: Path) -> None:
-    """maccy.exe (a Windows GUI program with icon and version) and the SQLite
-    library, in publish_dir."""
+def build_publish(version: str, runtime: str, publish_dir: Path, manifest_url: str = "") -> None:
+    """Klip.exe (a Windows GUI program with icon and version) and the SQLite
+    library, in publish_dir. manifest_url is for a test build only (the end to
+    end test of an update, tools/e2e_update.py): a release reads the address
+    built into the program."""
     if runtime not in GO_ARCH:
         raise ValueError("runtime must be one of " + ", ".join(GO_ARCH))
     arch = GO_ARCH[runtime]
@@ -144,9 +150,11 @@ def build_publish(version: str, runtime: str, publish_dir: Path) -> None:
     try:
         run(["go", "run", WINRES, "make", "--in", "winres/winres.json", "--out", "rsrc", "--arch", arch,
              "--product-version", version, "--file-version", version + ".0"], cwd=cmd_dir)
-        run(["go", "build", "-trimpath",
-             "-ldflags", f"-s -w -H=windowsgui -X klip/internal/version.Version={version}",
-             "-o", str(publish_dir / "maccy.exe"), "./cmd/klip"],
+        ldflags = f"-s -w -H=windowsgui -X klip/internal/version.Version={version}"
+        if manifest_url:
+            ldflags += f" -X klip/internal/app.UpdateManifestURL={manifest_url}"
+        run(["go", "build", "-trimpath", "-ldflags", ldflags,
+             "-o", str(publish_dir / EXE), "./cmd/klip"],
             cwd=APP, env={"GOOS": "windows", "GOARCH": arch, "CGO_ENABLED": "0"})
     finally:
         for syso in cmd_dir.glob("*.syso"):
@@ -170,15 +178,16 @@ def package_file_list(publish_dir: Path, exclude: Path | None = None) -> list[di
         if is_protected(rel):
             raise RuntimeError("publish folder holds user data, not for a package: " + rel)
         files.append({"path": rel, "sha256": sha256_file(path), "size": path.stat().st_size})
-    if not any(f["path"].lower() == "maccy.exe" for f in files):
-        raise RuntimeError("publish folder has no maccy.exe")
+    if not any(f["path"].lower() == EXE.lower() for f in files):
+        raise RuntimeError("publish folder has no " + EXE)
     return files
 
 
 def legacy_files_from(source: str, new_paths: set[str]) -> list[str]:
     """The files of the earlier program: the list of an earlier package
-    (a zip path or URL, or "manifest[:path]" for the package the manifest
-    names now), without what the new package has and without user data."""
+    (a zip path or URL, a package list as JSON, or "manifest[:path]" for the
+    package the manifest names now), without what the new package has and
+    without user data."""
     if source == "manifest" or source.startswith("manifest:"):
         mpath = Path(source.split(":", 1)[1]) if ":" in source else REPO / "docs" / "updates" / "manifest.json"
         data = json.loads(mpath.read_text(encoding="utf-8"))
@@ -189,7 +198,10 @@ def legacy_files_from(source: str, new_paths: set[str]) -> list[str]:
         want_sha = str(pkg.get("sha256") or "").strip().lower()
     else:
         want_sha = ""
-    if re.match(r"^https?://", source):
+    if source.lower().endswith(".json"):
+        listed = json.loads(Path(source).read_text(encoding="utf-8-sig"))
+        zf = None
+    elif re.match(r"^https?://", source):
         print("downloading", source, flush=True)
         with urllib.request.urlopen(source, timeout=300) as r:
             blob = r.read()
@@ -198,8 +210,9 @@ def legacy_files_from(source: str, new_paths: set[str]) -> list[str]:
         zf = zipfile.ZipFile(io.BytesIO(blob))
     else:
         zf = zipfile.ZipFile(source)
-    with zf:
-        listed = json.loads(zf.read("maccy-package.json").decode("utf-8-sig"))
+    if zf is not None:
+        with zf:
+            listed = json.loads(zf.read("maccy-package.json").decode("utf-8-sig"))
     out = []
     lowered = {p.lower() for p in new_paths}
     # The files of that package, and the old files it was still carrying out of
@@ -218,7 +231,7 @@ def legacy_files_from(source: str, new_paths: set[str]) -> list[str]:
 
 def create_package(publish_dir: Path, output_dir: Path, *, version: str, runtime: str,
                    legacy_from: str | None = None) -> Path:
-    package = output_dir / f"maccy-{version}-{runtime}.zip"
+    package = output_dir / f"Klip-{version}-{runtime}.zip"
     # The archive being made may sit in the folder it is made from (and a
     # second run finds the first one's result there): it is not one of its own files.
     files = package_file_list(publish_dir, exclude=package)
@@ -259,13 +272,19 @@ def write_legacy_delete(publish_dir: Path, legacy_from: str | None, out: Path | 
     earlier program (the list of its package), none when it is not known.
     Wildcards would also take what is not ours."""
     path = out or REPO / "installer" / "legacy-delete.iss"
-    lines = ["// written by tools/release_go.py: the files of the earlier program, by name"]
+    lines = ["// written by tools/release_go.py: the files of the earlier program, by name",
+             # The program file of every version before 1.0.11, known or not:
+             # left, the sign-in entry of the C# program (which names it) would
+             # start the old program, which takes the single-instance mutex first.
+             "DeleteLegacy('maccy.exe');"]
     if legacy_from:
         new_paths = {f["path"] for f in package_file_list(publish_dir)}
         for rel in legacy_files_from(legacy_from, new_paths):
             if not safe_legacy_path(rel):
                 print("not deleted by the installer (unsafe name): " + rel, flush=True)
                 continue
+            if rel.lower() == "maccy.exe":
+                continue  # named above
             name = rel.replace("/", "\\").replace("'", "''")
             lines.append("DeleteLegacy('" + name + "');")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -282,73 +301,64 @@ def build_installer(version: str, runtime: str, iscc_arg: str | None, publish_di
     base._set_iss_version(iss, version)
     write_legacy_delete(publish_dir, legacy_from)
     run([str(iscc), "/DGoBuild", f"/DMyPublishDir={publish_dir.resolve()}", str(iss)], cwd=REPO)
-    out = REPO / "artifacts" / "installer" / f"maccy-{version}-setup.exe"
+    out = REPO / "artifacts" / "installer" / f"Klip-{version}-setup.exe"
     if not out.exists():
         raise FileNotFoundError(str(out))
     return out
 
 
+def write_manifest(path: Path, *, version: str, mandatory: bool, notes: str, base_url: str,
+                   installer: Path, package: Path, runtime: str) -> None:
+    """The update manifest (update.Manifest) of this release, with the
+    addresses of its own files: base_url/v<version>/<file name>. Never the
+    "latest" address: a client that read this manifest must get these very
+    files, whatever has been released since."""
+    root = base_url.rstrip("/") + f"/v{version}/"
+    data = {
+        "appId": "maccy",
+        "latest": {
+            "version": version,
+            "mandatory": bool(mandatory),
+            "notes": notes,
+            "publishedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "installer": {"url": root + installer.name, "sha256": sha256_file(installer), "size": installer.stat().st_size},
+            "package": {"kind": "zip", "runtime": runtime, "url": root + package.name,
+                        "sha256": sha256_file(package), "size": package.stat().st_size},
+        },
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def cmd_release(a: argparse.Namespace) -> int:
+    """The files of a GitHub release, in out_dir: the installer, the package
+    and manifest.json."""
     version = base._validate_version(a.version)
     notes = a.notes
     if a.notes_file:
         notes = Path(a.notes_file).read_text(encoding="utf-8")
-    notes = notes.replace("\r\n", "\n").rstrip("\n")
-    manifest = Path(a.manifest)
-    # Where the downloads will be: needed before anything is built, as the
-    # manifest is rewritten with it. Gitee fills it in itself when publishing.
-    base_url = a.base_url or base._infer_base_url_from_manifest(manifest)
-    if not a.publish_gitee and not base_url:
-        raise ValueError("give --base-url (the manifest has none to take it from), or use --publish-gitee")
-    publish_dir = (REPO / "artifacts" / "publish" / a.runtime).resolve()
-    installer_dir = REPO / "artifacts" / "installer"
+    notes = notes.replace("\r\n", "\n").strip("\n")
+    if not re.match(r"^https://", a.base_url):
+        raise ValueError("--base-url must be an https address")
+    publish_dir = (Path(a.publish_dir) if a.publish_dir else REPO / "artifacts" / "publish" / a.runtime).resolve()
+    out_dir = (Path(a.out_dir) if a.out_dir else REPO / "artifacts" / "release").resolve()
+    legacy = a.legacy_from or None
 
-    print(f"[1/5] build the program ({a.runtime})")
+    print(f"[1/4] build the program ({a.runtime})")
     build_publish(version, a.runtime, publish_dir)
-    print("[2/5] installer (Inno Setup)")
-    installer = build_installer(version, a.runtime, a.iscc, publish_dir, a.legacy_from or None)
-    print("[3/5] light-update package")
-    package = create_package(publish_dir, installer_dir, version=version, runtime=a.runtime, legacy_from=a.legacy_from)
-    sha, size = sha256_file(installer), installer.stat().st_size
-    psha, psize = sha256_file(package), package.stat().st_size
-
-    installer_url = package_url = None
-    if a.publish_gitee:
-        if not a.yes:
-            raise ValueError("--publish-gitee needs --yes")
-        owner, repo_name = a.gitee_owner, a.gitee_repo
-        inferred = base._infer_repo_from_git(REPO)
-        if inferred:
-            owner, repo_name = owner or inferred[0], repo_name or inferred[1]
-        token = a.gitee_token or os.environ.get("GITEE_TOKEN", "")
-        if not (owner and repo_name and token):
-            raise ValueError("missing gitee owner/repo/token")
-        print("[4/5] publish to Gitee")
-        published = base._publish_to_gitee(REPO, owner=owner, repo_name=repo_name, token=token, version=version,
-                                           notes=notes, installer_path=installer, package_path=package)
-        installer_url, package_url = published.get("installer"), published.get("package")
-
-    print("[5/5] manifest")
-    base._update_manifest(manifest, version=version, mandatory=a.mandatory, notes=notes,
-                          base_url=base_url or "https://gitee.com", sha256=sha, size=size, installer_url=installer_url,
-                          package_sha256=psha, package_size=psize, package_runtime=a.runtime, package_url=package_url)
-    if a.publish_gitee:
-        base._git(REPO, ["add", str(manifest)])
-        commit_manifest(REPO, version)
-        base._push_current_to_upstream(REPO)
-    print(json.dumps({"installer": str(installer), "sha256": sha, "size": size,
-                      "package": str(package), "package_sha256": psha, "package_size": psize}, indent=2))
+    print("[2/4] installer (Inno Setup)")
+    installer = build_installer(version, a.runtime, a.iscc, publish_dir, legacy)
+    print("[3/4] light-update package")
+    package = create_package(publish_dir, out_dir, version=version, runtime=a.runtime, legacy_from=legacy)
+    print("[4/4] manifest")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_installer = out_dir / installer.name
+    if final_installer.resolve() != installer.resolve():
+        shutil.copyfile(installer, final_installer)
+    manifest = out_dir / "manifest.json"
+    write_manifest(manifest, version=version, mandatory=a.mandatory, notes=notes, base_url=a.base_url,
+                   installer=final_installer, package=package, runtime=a.runtime)
+    print(json.dumps({"installer": str(final_installer), "package": str(package), "manifest": str(manifest)}, indent=2))
     return 0
-
-
-def commit_manifest(repo: Path, version: str) -> None:
-    """Skip an empty index, but never suppress a rejected commit."""
-    result = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo)
-    if result.returncode == 0:
-        return
-    if result.returncode != 1:
-        raise SystemExit(result.returncode)
-    base._git(repo, ["commit", "-m", "update manifest for v" + version])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -359,35 +369,33 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--version", required=True)
         p.add_argument("--runtime", default="win-x64")
 
-    b = sub.add_parser("build", help="maccy.exe and the SQLite library into artifacts/publish/<runtime>")
+    b = sub.add_parser("build", help="Klip.exe and the SQLite library into artifacts/publish/<runtime>")
     common(b)
     b.add_argument("--publish-dir", default="")
+    b.add_argument("--manifest-url", default="", help="test builds only: the update manifest to read")
 
     pk = sub.add_parser("package", help="the light-update zip from a publish folder")
     common(pk)
     pk.add_argument("--publish-dir", default="")
     pk.add_argument("--out-dir", default="")
-    pk.add_argument("--legacy-from", default="", help='zip path or URL of the earlier package, or "manifest"')
+    pk.add_argument("--legacy-from", default="", help='zip path or URL of the earlier package, a package list (.json), or "manifest"')
 
-    r = sub.add_parser("release", help="build, installer, package, manifest (and Gitee)")
+    r = sub.add_parser("release", help="build, installer, package and manifest of a GitHub release")
     common(r)
     r.add_argument("--notes", default="")
     r.add_argument("--notes-file", default="")
     r.add_argument("--mandatory", action="store_true")
-    r.add_argument("--base-url", default="")
+    r.add_argument("--base-url", default=RELEASES, help="where the release's files are downloaded from (<base>/v<version>/<file>)")
     r.add_argument("--iscc", default="")
-    r.add_argument("--legacy-from", default="", help='zip path or URL of the earlier package, or "manifest"')
-    r.add_argument("--manifest", default=str(REPO / "docs" / "updates" / "manifest.json"))
-    r.add_argument("--publish-gitee", action="store_true")
-    r.add_argument("--yes", action="store_true")
-    r.add_argument("--gitee-owner", default="")
-    r.add_argument("--gitee-repo", default="")
-    r.add_argument("--gitee-token", default="")
+    r.add_argument("--legacy-from", default=str(LEGACY_CSHARP), help="the earlier program's files, for the installer to remove")
+    r.add_argument("--publish-dir", default="")
+    r.add_argument("--out-dir", default="")
 
     a = ap.parse_args(argv)
     version = base._validate_version(a.version)
     if a.cmd == "build":
-        build_publish(version, a.runtime, (Path(a.publish_dir) if a.publish_dir else REPO / "artifacts" / "publish" / a.runtime).resolve())
+        build_publish(version, a.runtime, (Path(a.publish_dir) if a.publish_dir else REPO / "artifacts" / "publish" / a.runtime).resolve(),
+                      a.manifest_url)
         return 0
     if a.cmd == "package":
         pub = (Path(a.publish_dir) if a.publish_dir else REPO / "artifacts" / "publish" / a.runtime).resolve()
