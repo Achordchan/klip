@@ -46,9 +46,9 @@ func (mg *Manager) sync(reshow bool) {
 		}
 		w.SetTitle(mg.Model.Title(want))
 		if mg.cur != want || (reshow && !w.IsVisible()) {
-			size := Sizes[want]
+			width, height := w.Size()
 			wa := mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint()).WorkArea
-			w.SetPosition(wa.X+(wa.Width-size[0])/2, wa.Y+(wa.Height-size[1])/2)
+			w.SetPosition(wa.X+(wa.Width-width)/2, wa.Y+(wa.Height-height)/2)
 			w.Show()
 			if want != Check {
 				w.Focus()
@@ -63,16 +63,17 @@ func (mg *Manager) open(k Kind) *mygo.Window {
 	size := Sizes[k]
 	view := map[Kind]func(*ui.Context){Check: mg.Model.ViewCheck, Prompt: mg.Model.ViewPrompt, Progress: mg.Model.ViewProgress, Message: mg.Model.ViewMessage}[k]
 	w := mygo.NewWindow(mygo.WindowOptions{
-		Title:         mg.Model.Title(k),
-		Width:         size[0],
-		Height:        size[1],
-		DisableResize: true,
-		AlwaysOnTop:   true,
-		SkipTaskbar:   k == Check,
-		Frameless:     k == Check,
-		Transparent:   k == Check,
-		Hidden:        true,
-		Content:       ui.View(view),
+		Title:          mg.Model.Title(k),
+		Width:          size[0],
+		Height:         size[1],
+		UseContentSize: true,
+		DisableResize:  true,
+		AlwaysOnTop:    true,
+		SkipTaskbar:    k == Check,
+		Frameless:      k == Check,
+		Transparent:    k == Check,
+		Hidden:         true,
+		Content:        ui.View(view),
 	})
 	w.OnClose(func(e *mygo.CloseEvent) {
 		if mg.quitting() {

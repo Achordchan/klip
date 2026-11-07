@@ -12,9 +12,10 @@ import (
 
 // View is the window's content.
 func (m *Model) View(c *ui.Context) {
+	ApplyTypography(c)
 	m.refresh()
 	p := PaletteFor(c.Theme().Dark)
-	c.Root().Background(ui.Transparent)
+	c.Root().Background(WindowBackdrop(p.Background))
 
 	var act *action
 	if m.dlg == nil {
@@ -134,7 +135,7 @@ func Button(c *ui.Context, p Palette, label string, padV, padH, font float32) ui
 	case b.Hovered():
 		bg = p.Hover
 	}
-	return b.Padding(padV, padH).Radius(4).Border(1, p.Border).Background(bg).Center().Children(func() {
+	return b.Padding(padV, padH).Radius(6).Border(1, p.Border).Background(bg).Center().Children(func() {
 		ui.Text(c, label).FontSize(font).TextColor(p.Text).SingleLine()
 	})
 }
@@ -149,7 +150,7 @@ func (m *Model) topBar(c *ui.Context, p Palette) {
 			bg = p.Hover
 		}
 		about.Padding(4, 10).Radius(8).Border(1, p.Border).Background(bg).Cursor(ui.CursorPointer).Label("关于").Justify(ui.Center).Children(func() {
-			ui.Text(c, "About").FontSize(12).TextColor(p.Muted)
+			ui.Text(c, "关于").FontSize(12).TextColor(p.Muted)
 		})
 		if about.Clicked() {
 			m.Host.ShowAbout(about.Bounds())

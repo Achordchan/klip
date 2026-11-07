@@ -54,6 +54,7 @@ func TestShot(t *testing.T) {
 		t.Skip("set KLIP_SHOT=file.png")
 	}
 	m := &Model{Version: "v1.0.11"}
+	m.LoadAvatar()
 	tt := ui.NewTester(m.View, Width, Height)
 	if os.Getenv("KLIP_DARK") == "1" {
 		tt.SetDark(true)
@@ -62,4 +63,30 @@ func TestShot(t *testing.T) {
 	f, _ := os.Create(out)
 	defer f.Close()
 	_ = png.Encode(f, tt.Image())
+}
+
+func TestBundledAvatarDecodesWithoutNetwork(t *testing.T) {
+	m := &Model{}
+	m.LoadAvatar()
+	if m.avatar == nil {
+		t.Fatal("embedded author image did not decode")
+	}
+	first := m.avatar
+	m.LoadAvatar()
+	if first != m.avatar {
+		t.Fatal("avatar was decoded repeatedly")
+	}
+}
+
+func TestAboutContentFitsWindow(t *testing.T) {
+	m := &Model{Version: "v1.0.17"}
+	m.LoadAvatar()
+	tt := ui.NewTester(m.View, Width, Height)
+	tt.Frame()
+	for _, label := range []string{Email, "Achord Chan", "项目主页", "隐私条款", "开源许可", "赞助作者"} {
+		r, ok := tt.Find(label)
+		if !ok || r.X < 0 || r.Y < 0 || r.X+r.W > Width || r.Y+r.H > Height {
+			t.Fatalf("%s clipped: %+v", label, r)
+		}
+	}
 }
