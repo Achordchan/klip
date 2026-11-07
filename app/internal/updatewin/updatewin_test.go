@@ -259,3 +259,22 @@ func TestPromptFitsItsWindow(t *testing.T) {
 		}
 	}
 }
+
+func TestLatestVersionMessageButtonFitsContentArea(t *testing.T) {
+	r := newRig(t, "1.0.11", update.Release{Version: "1.0.11"})
+	r.m.CheckNow()
+	r.wait()
+	if r.m.Kind() != Message {
+		t.Fatalf("expected message, got %v", r.m.Kind())
+	}
+	w, h := Sizes[Message][0], Sizes[Message][1]
+	tt := ui.NewTester(r.m.ViewMessage, w, h)
+	tt.Frame()
+	full := ui.NewTester(r.m.ViewMessage, w, h+400)
+	full.Frame()
+	button, ok := tt.Find("确定")
+	expected, fullOK := full.Find("确定")
+	if !ok || !fullOK || button.H < expected.H || button.Y+button.H > float32(h)-16 || button.X+button.W > float32(w)-16 {
+		t.Fatalf("button clipped: %+v, full %+v, content %dx%d", button, expected, w, h)
+	}
+}

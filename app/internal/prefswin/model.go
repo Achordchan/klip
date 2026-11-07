@@ -18,6 +18,8 @@ import (
 type Host interface {
 	// OpenStorage shows the data folder in the file manager.
 	OpenStorage()
+	ChangeStorage()
+	StorageLocation() string
 	// CheckUpdates starts the update check (may be nil).
 	CheckUpdates() func()
 	// SyncNow starts a sync the user asked for.
@@ -40,12 +42,25 @@ type Model struct {
 	Redraw func()
 	// SyncStatus is the sync's last result, for the page (may be nil).
 	SyncStatus func() string
+	// SubscriptionChanged reports a confirmed answer about the subscription
+	// to the question BeginSubscriptionCheck named when it was asked (both
+	// may be nil).
+	SubscriptionChanged    func(c account.SubscriptionCheck, active bool)
+	BeginSubscriptionCheck func() account.SubscriptionCheck
+	// PreviewTheme applies a temporary appearance; nil restores saved settings.
+	PreviewTheme  func(*string)
+	previewValue  string
+	previewActive bool
 	// Now is time.Now unless a test sets it.
 	Now func() time.Time
 
-	tab      int
-	v        prefs.View
-	observed prefs.View
+	tab          int
+	v            prefs.View
+	observed     prefs.View
+	confirmClose bool
+	// quitAfter, while the unsaved dialog is up for a quit, finishes the quit
+	// once the edits are saved or discarded (RequestQuit).
+	quitAfter func()
 
 	// account page
 	email, password string
@@ -65,7 +80,6 @@ type Model struct {
 
 	mu     sync.Mutex
 	toasts []string
-	later  time.Time // when the debounced "设置已生效" is due; zero: none
 
 	toastMsg   string
 	toastUntil time.Time
@@ -104,8 +118,10 @@ func (m *Model) takeToasts() []string {
 // Open is for each time the window is shown: it reads the settings again,
 // and, when signed in, asks the server about the plan.
 func (m *Model) Open() {
-	m.v = m.Prefs.Open()
+	m.v = m.Prefs.CurrentView()
 	m.observed = m.v
+	m.syncThemePreview()
+	m.confirmClose = false
 	m.refreshAccount()
 	m.closeDialogs()
 	m.sub = account.None("未登录")
@@ -159,7 +175,8 @@ func (m *Model) async(work func(ctx context.Context) (done func())) {
 func (m *Model) loadSubscription() {
 	m.sub = account.Loading()
 	m.subGen++
-	gen := m.subGen // an answer that comes after the account changed is not for this screen
+	gen := m.subGen         // an answer that comes after the account changed is not for this screen
+	check := m.beginCheck() // and the account and the order of the question
 	m.async(func(ctx context.Context) func() {
 		s := m.Account.Subscription(ctx)
 		return func() {
@@ -167,6 +184,9 @@ func (m *Model) loadSubscription() {
 				return
 			}
 			m.sub = s
+			if m.SubscriptionChanged != nil && (s.Subscribed || s.Status == "未订阅") {
+				m.SubscriptionChanged(check, s.Subscribed)
+			}
 			m.refreshAccount() // a token the server refused signs the user out
 		}
 	})
@@ -328,7 +348,9 @@ func (m *Model) redeemCard() {
 	m.async(func(ctx context.Context) func() {
 		r := m.Account.Redeem(ctx, code)
 		var s account.Subscription
+		var check account.SubscriptionCheck
 		if r.OK {
+			check = m.beginCheck() // asked after the card went through
 			s = m.Account.Subscription(ctx)
 		}
 		return func() {
@@ -338,6 +360,9 @@ func (m *Model) redeemCard() {
 				m.redeem = ""
 				if gen == m.subGen { // still the account the card was redeemed for
 					m.sub = s
+					if m.SubscriptionChanged != nil && s.Subscribed {
+						m.SubscriptionChanged(check, true)
+					}
 				}
 				// A card may be what the sign-in's first sync was waiting
 				// for (no subscription): sync now, as after a sign-in.
@@ -357,4 +382,12 @@ func (m *Model) followSettings() {
 		}
 	}
 	m.observed = next
+	m.syncThemePreview()
+}
+
+func (m *Model) beginCheck() account.SubscriptionCheck {
+	if m.BeginSubscriptionCheck == nil {
+		return account.SubscriptionCheck{}
+	}
+	return m.BeginSubscriptionCheck()
 }

@@ -57,16 +57,21 @@ type program struct {
 	about   *aboutwin.Manager
 	preview *previewwin.Manager
 
-	shelves *shelfwin.Manager
-	shelf   *shelf.Service
-	layout  paths.Layout
+	shelves      *shelfwin.Manager
+	shelf        *shelf.Service
+	layout       paths.Layout
+	themePreview atomic.Pointer[string]
 
 	lastTrayClick time.Time
 
 	redrawPending  atomic.Bool // a redraw is queued for the UI thread
 	followShelf    func()      // starts or stops the shelf as the settings say
 	mandatoryShown atomic.Bool // the window for a mandatory update was put up
-	quitting       atomic.Bool // set when the program is quitting, see OnBeforeQuit
+	storageMoving  atomic.Bool
+	migrating      atomic.Bool  // the data is being copied, see changeStorage
+	migrationWin   *mygo.Window // its progress window
+	quitting       atomic.Bool  // set when the program is quitting, see OnBeforeQuit
+	quitConfirmed  atomic.Bool  // unsaved preferences were dealt with, see beforeQuit
 }
 
 func main() {
@@ -107,7 +112,7 @@ func main() {
 			p.show()
 		}
 	})
-	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { p.quitting.Store(true) })
+	mygo.App.OnBeforeQuit(p.beforeQuit)
 	mygo.App.WhenReady(p.ready)
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
@@ -115,7 +120,7 @@ func main() {
 }
 
 func (p *program) ready() {
-	layout, err := paths.Default()
+	layout, err := paths.Current()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -125,7 +130,7 @@ func (p *program) ready() {
 		Foreground: platform.ForegroundApp,
 		ChangeSeq:  platform.ChangeSeq,
 		Autostart:  platform.Autostart(),
-		Quit:       func() { mygo.App.Quit() },
+		Quit:       p.quitForUpdate,
 		Changed: func() {
 			p.redraw()
 			p.gateMandatory()
@@ -147,7 +152,11 @@ func (p *program) ready() {
 	p.layout = layout
 	applyTheme(p.app.Settings.Get().Theme)
 	p.app.Settings.OnChange(func(st model.Settings) {
-		applyTheme(st.Theme)
+		if preview := p.themePreview.Load(); preview != nil {
+			applyTheme(*preview)
+		} else {
+			applyTheme(st.Theme)
+		}
 		p.redraw() // a window shows the settings (the login among them)
 	})
 	p.model = panel.New(p.app.History, host{p})
@@ -174,7 +183,8 @@ func (p *program) ready() {
 		e.PreventDefault()
 		p.hide()
 	})
-	p.win.OnBlur(p.hide)
+	p.win.OnBlur(p.onWindowBlur)
+	p.about.Parent = p.win
 
 	registered := ""
 	for _, s := range shortcuts {
@@ -224,6 +234,7 @@ func (p *program) ready() {
 	mygo.App.OnQuit(p.stopShelf)
 	mygo.App.OnQuit(p.app.Stop)
 	p.app.Start()
+	p.showCentered()
 }
 
 // startShelf makes the shelf follow the settings. It is a Windows feature: it
@@ -373,6 +384,9 @@ func (p *program) showUpdate() {
 // checkUpdates is the user asking (the tray, the preferences): the windows
 // show the check and what it finds.
 func (p *program) checkUpdates() {
+	if p.storageMoving.Load() {
+		return
+	}
 	p.updates().CheckNow()
 	p.updWins.Reshow() // asked for: a window closed while a download goes on comes back
 }
@@ -380,6 +394,9 @@ func (p *program) checkUpdates() {
 // showPrefs opens the preferences window, made on first use and then only
 // hidden when closed.
 func (p *program) showPrefs() {
+	if p.storageMoving.Load() {
+		return
+	}
 	if p.mandatoryPending() {
 		return
 	}
@@ -388,8 +405,24 @@ func (p *program) showPrefs() {
 		p.prefs.Post = func(f func()) { p.prefsWin.Update(f) }
 		p.prefs.Redraw = p.redraw
 		p.prefs.SyncStatus = p.app.SyncStatus
+		p.prefs.SubscriptionChanged = p.app.SubscriptionChanged
+		p.prefs.BeginSubscriptionCheck = p.app.BeginSubscriptionCheck
+		p.prefs.PreviewTheme = func(value *string) {
+			p.themePreview.Store(value)
+			if value != nil {
+				applyTheme(*value)
+			} else {
+				applyTheme(p.app.Settings.Get().Theme)
+			}
+			p.redraw()
+		}
 		p.prefsWin = mygo.NewWindow(mygo.WindowOptions{
-			Title:         "设置",
+			Title:          "设置",
+			UseContentSize: true,
+			// Made hidden: the first opening, like every other, reads the
+			// settings and asks about the subscription (prefs.Open below).
+			Hidden:        true,
+			Parent:        p.win,
 			Width:         prefswin.Width,
 			Height:        prefswin.Height,
 			DisableResize: true,
@@ -400,11 +433,12 @@ func (p *program) showPrefs() {
 				return
 			}
 			e.PreventDefault()
-			p.prefsWin.Hide()
+			p.prefs.RequestClose()
 		})
 	}
-	p.hide()
-	p.prefs.Open()
+	if !p.prefsWin.IsVisible() {
+		p.prefs.Open()
+	}
 	p.prefsWin.Show()
 	p.prefsWin.Focus()
 }
@@ -412,6 +446,9 @@ func (p *program) showPrefs() {
 // show opens the window near the cursor (the shortcut), a little below and
 // to the right of it, kept inside the work area of its display.
 func (p *program) show() {
+	if p.storageMoving.Load() {
+		return
+	}
 	if p.mandatoryPending() {
 		return // the update window is up: nothing else until it is dealt with
 	}
@@ -426,6 +463,9 @@ func (p *program) show() {
 // showCentered opens the window in the middle of the display the cursor is on
 // (the tray).
 func (p *program) showCentered() {
+	if p.storageMoving.Load() {
+		return
+	}
 	if p.mandatoryPending() {
 		return // the update window is up: nothing else until it is dealt with
 	}
@@ -498,9 +538,48 @@ func (h prefsHost) OpenStorage()           { _ = mygo.Shell.OpenPath(h.p.layout.
 func (h prefsHost) CheckUpdates() func()   { return h.p.checkUpdates }
 func (h prefsHost) SyncNow()               { h.p.app.SyncNow() }
 func (h prefsHost) AccountChanged(in bool) { h.p.app.AccountChanged(in) }
-func (h prefsHost) Close()                 { h.p.prefsWin.Hide() }
+func (h prefsHost) Close()                 { h.p.closePreferences() }
 
 // updHost is what the update windows ask of the program.
 type updHost struct{ p *program }
 
 func (h updHost) Quit() { mygo.App.Quit() }
+
+func (h prefsHost) ChangeStorage()          { h.p.changeStorage() }
+func (h prefsHost) StorageLocation() string { return h.p.layout.Root }
+
+// beforeQuit holds a quit while the data is being migrated (the migration
+// relaunches the program when it is done), and while the preferences window
+// has unsaved edits: the window asks to save or discard them, and quits once
+// that is done (or not at all, for "继续编辑"). Once quitting is set, the
+// windows close without asking.
+func (p *program) beforeQuit(e *mygo.QuitEvent) {
+	if p.migrating.Load() {
+		e.PreventDefault() // the migration relaunches the program when it is done
+		if p.migrationWin != nil {
+			p.migrationWin.Show()
+			p.migrationWin.Focus()
+		}
+		return
+	}
+	if !p.quitConfirmed.Load() && p.prefs != nil && p.prefsWin != nil && p.prefsWin.IsVisible() {
+		if p.prefs.RequestQuit(func() {
+			p.quitConfirmed.Store(true)
+			mygo.App.Quit()
+		}) {
+			e.PreventDefault()
+			p.prefsWin.Show()
+			p.prefsWin.Focus()
+			return
+		}
+	}
+	p.quitting.Store(true)
+}
+
+// quitForUpdate is the quit an update needs to be installed. It does not wait
+// for unsaved preferences: the update helper is already waiting for this
+// process to end, and the user started the install.
+func (p *program) quitForUpdate() {
+	p.quitConfirmed.Store(true)
+	mygo.App.Quit()
+}

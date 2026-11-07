@@ -24,7 +24,8 @@ const (
 // progress bar of a sync the user asked for, and the text of the icon's tip.
 type SyncView struct {
 	// Cloud says that the history is synchronized with an account.
-	Cloud bool
+	Cloud              bool
+	SubscriptionPaused bool
 	// Syncing is true while a sync runs, of either kind.
 	Syncing bool
 	// Progress is shown for a sync the user asked for; Text and Percent say
@@ -63,6 +64,9 @@ func (v SyncView) ProgressText() string {
 
 // Tip is the tool tip of the cloud icon.
 func (v SyncView) Tip() string {
+	if v.SubscriptionPaused {
+		return "云同步已暂停（未订阅或已到期）"
+	}
 	if v.Syncing {
 		working := strings.TrimSpace(v.LastStatus)
 		if working == "" {
@@ -111,7 +115,8 @@ func itoa(n int) string {
 // Sync returns the state of the sync for the window.
 func (a *App) Sync() SyncView {
 	v := a.copyView()
-	v.Cloud = a.Syncer.CanAutoSync()
+	v.SubscriptionPaused = a.subscriptionPaused()
+	v.Cloud = a.Syncer.CanAutoSync() && !v.SubscriptionPaused
 	return v
 }
 
@@ -336,7 +341,33 @@ func (a *App) remove(pick func(items []model.Item) []model.Item) {
 				return
 			}
 			// The upload, once through, tells the deletions it took (Uploaded).
+			if a.subscriptionPaused() {
+				return
+			}
+			check := a.subscriptionCheck(owner)
+			subscription := a.Account.Subscription(ctx)
+			if ctx.Err() != nil || gen != a.acctGen.Load() {
+				return
+			}
+			if !subscription.Subscribed {
+				switch uploadAfterUnconfirmed(subscription) {
+				case pauseSync:
+					a.SubscriptionChanged(check, false)
+				case retrySync:
+					// Unknown (a network failure, a server error): the deletion is
+					// still owed, as after a failed upload.
+					a.cfg.Logf("upload after change: subscription %s", subscription.Status)
+					a.retryLater()
+				}
+				return
+			}
+			a.SubscriptionChanged(check, true)
+			upload := a.subscriptionCheck(owner) // the upload is asked after the check
 			if _, err := a.Syncer.UploadAfterLocalMutation(ctx); err != nil && ctx.Err() == nil {
+				if errors.Is(err, syncer.ErrSubscriptionExpired) {
+					a.SubscriptionChanged(upload, false)
+					return
+				}
 				a.cfg.Logf("upload after change: %v", err)
 				a.retryLater()
 			}
@@ -401,6 +432,9 @@ func idsOf(items []model.Item) []string {
 // are owed. A program that was not started has nobody to ask; its next start
 // syncs.
 func (a *App) retryLater() {
+	if a.subscriptionPaused() {
+		return
+	}
 	a.mu.Lock()
 	started := a.started
 	a.mu.Unlock()

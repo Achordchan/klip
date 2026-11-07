@@ -225,3 +225,112 @@ func TestAutostartReconcilesPortableSetting(t *testing.T) {
 		t.Fatalf("OS entry not enabled: %+v", e)
 	}
 }
+
+func TestFailedSaveRollsBackOnlyItsOwnFields(t *testing.T) {
+	c, m, _, path := newCtl(t)
+	base := c.CurrentView()
+	// The file cannot be written: a directory stands where it goes.
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Somebody else (a sync) changes another setting while the save is under
+	// way, after its update and before its rollback.
+	once := false
+	m.OnChange(func(st model.Settings) {
+		if once {
+			return
+		}
+		once = true
+		_ = m.Update(func(s *model.Settings) { s.MaxItems = 777 })
+	})
+	draft := base
+	draft.CaptureText = !base.CaptureText
+	draft.StoreImagesAsWebP = !base.StoreImagesAsWebP
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("a save that cannot be written succeeded")
+	}
+	got := m.Get()
+	if got.CaptureText != base.CaptureText || got.StoreImagesAsWebP() != base.StoreImagesAsWebP {
+		t.Fatalf("own fields not rolled back: %+v", got)
+	}
+	if got.MaxItems != 777 {
+		t.Fatalf("rollback undid a concurrent change: MaxItems %d", got.MaxItems)
+	}
+}
+
+func TestSaveValidatesLimitsMergedWithNewerSettings(t *testing.T) {
+	c, m, _, _ := newCtl(t)
+	base := c.CurrentView()
+	// A sync lowers the total limit after the window read the settings.
+	_ = m.Update(func(s *model.Settings) { s.MaxMegabytes = 50 })
+	draft := base
+	draft.CaptureFileMaxMegabytes = "100"
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("a file limit above the newer total limit was saved")
+	}
+	if got := m.Get(); got.CaptureFileMaxMegabytes != 20 || got.MaxMegabytes != 50 {
+		t.Fatalf("settings changed: %d / %d", got.CaptureFileMaxMegabytes, got.MaxMegabytes)
+	}
+	// An unrelated edit still saves while the limits stay as they are.
+	draft = c.CurrentView()
+	next := draft
+	next.CaptureText = !draft.CaptureText
+	if err := c.Save(draft, next); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSaveRechecksLimitsUnderTheLock(t *testing.T) {
+	c, m, a, _ := newCtl(t)
+	base := c.CurrentView()
+	// The total limit is lowered between the first check and the update: the
+	// autostart change, which comes in between, does it.
+	a2 := &raceAuto{fakeAuto: a, race: func() { _ = m.Update(func(s *model.Settings) { s.MaxMegabytes = 50 }) }}
+	c.Autostart = a2
+	draft := base
+	draft.StartWithWindows = !base.StartWithWindows
+	draft.CaptureFileMaxMegabytes = "100"
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("a file limit above the newer total limit was saved")
+	}
+	if got := m.Get(); got.CaptureFileMaxMegabytes != 20 || got.StartWithWindows != base.StartWithWindows {
+		t.Fatalf("settings changed: %+v", got)
+	}
+	if a.on != base.StartWithWindows {
+		t.Fatal("autostart not rolled back")
+	}
+}
+
+type raceAuto struct {
+	*fakeAuto
+	race func()
+}
+
+func (r *raceAuto) SetEnabled(on bool) error {
+	if r.race != nil {
+		r.race()
+		r.race = nil
+	}
+	return r.fakeAuto.SetEnabled(on)
+}
+
+func TestSaveLeavesUntouchedNumbersAlone(t *testing.T) {
+	c, m, _, _ := newCtl(t)
+	_ = m.Update(func(s *model.Settings) { s.MaxItems = 2147483647 }) // "no limit", set elsewhere
+	base := c.CurrentView()
+	draft := base
+	draft.CaptureText = !base.CaptureText
+	if err := c.Save(base, draft); err != nil {
+		t.Fatalf("an unrelated edit failed on an untouched number: %v", err)
+	}
+	if got := m.Get(); got.MaxItems != 2147483647 || got.CaptureText == base.CaptureText {
+		t.Fatalf("settings %+v", got)
+	}
+	// A number the window changes is still checked.
+	base = c.CurrentView()
+	draft = base
+	draft.MaxItems = "0"
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("an invalid edited number was saved")
+	}
+}

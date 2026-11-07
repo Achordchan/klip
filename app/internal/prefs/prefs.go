@@ -47,6 +47,7 @@ type View struct {
 	MaxMegabytes            string
 	CaptureText             bool
 	CaptureImages           bool
+	StoreImagesAsWebP       bool
 	CaptureFiles            bool
 	CaptureFileExtensions   string
 	CaptureFileMaxMegabytes string
@@ -105,6 +106,7 @@ func (c *Controller) CurrentView() View {
 		MaxMegabytes:            strconv.Itoa(int(st.MaxMegabytes)),
 		CaptureText:             st.CaptureText,
 		CaptureImages:           st.CaptureImages,
+		StoreImagesAsWebP:       st.StoreImagesAsWebP(),
 		CaptureFiles:            st.CaptureFiles,
 		CaptureFileExtensions:   ext,
 		CaptureFileMaxMegabytes: strconv.Itoa(int(st.CaptureFileMaxMegabytes)),

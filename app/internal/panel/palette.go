@@ -53,10 +53,10 @@ func PaletteFor(dark bool) Palette {
 		p.ToastBg, p.ToastText = ui.Hex("#333333CC"), ui.Hex("#F0F0F0")
 		return p
 	}
-	p.Background, p.Panel = ui.Hex("#F6F6F6"), ui.Hex("#FFFFFF")
+	p.Background, p.Panel = ui.Hex("#F3F5F7"), ui.Hex("#FFFFFF")
 	p.Control, p.Hover, p.Pressed = ui.Hex("#FFFFFF"), ui.Hex("#F0F0F0"), ui.Hex("#E8E8E8")
-	p.Border, p.Divider = ui.Hex("#DDDDDD"), ui.Hex("#E5E5E5")
-	p.Text, p.Muted, p.Muted2 = ui.Hex("#1A1A1A"), ui.Hex("#4A4A4A"), ui.Hex("#6A6A6A")
+	p.Border, p.Divider = ui.Hex("#DCE1E7"), ui.Hex("#E7EBF0")
+	p.Text, p.Muted, p.Muted2 = ui.Hex("#202A36"), ui.Hex("#576575"), ui.Hex("#738090")
 	p.PreviewBg = ui.Hex("#FFFFFFEE")
 	p.ToastBg, p.ToastText = ui.Hex("#111111CC"), ui.Hex("#FFFFFF")
 	return p

@@ -29,6 +29,9 @@ type Model struct {
 	MetaLine string
 	// Open opens the original of an image.
 	Open func(path string)
+	// Reveal selects the stored image in the native file manager.
+	Reveal func(path string)
+	SaveAs func(path string)
 	// Left is called when the pointer, which was over the window, left it.
 	Left func()
 
@@ -231,8 +234,9 @@ func (m *Model) Text() string {
 
 // View is the window's content.
 func (m *Model) View(c *ui.Context) {
+	panel.ApplyTypography(c)
 	p := panel.PaletteFor(c.Theme().Dark)
-	c.Root().Background(ui.Transparent)
+	c.Root().Background(panel.WindowBackdrop(p.Background))
 	it := m.Item
 
 	root := ui.Column(c).Fill().Padding(10).Background(p.PreviewBg).Border(1, p.Divider).Radius(12).Clip()
@@ -262,17 +266,24 @@ func (m *Model) View(c *ui.Context) {
 		}
 		ui.Column(c).FillWidth().Gap(4).Children(func() {
 			if it.Kind == model.KindImage && m.openable() {
-				b := ui.ButtonBase(c)
-				bg := p.PreviewBtn
-				if b.Hovered() {
-					bg = p.PreviewBtn.Alpha(0.5)
-				}
-				b.Padding(4, 10).Radius(8).Border(1, p.Divider).Background(bg).Label("查看原图").Children(func() {
-					ui.Text(c, "查看原图").FontSize(12).TextColor(p.Text)
+				ui.Row(c).FillWidth().Gap(8).Children(func() {
+					for _, action := range []struct {
+						label string
+						run   func(string)
+					}{{"查看原图", m.Open}, {"定位文件", m.Reveal}, {"另存为", m.SaveAs}} {
+						b := ui.ButtonBase(c)
+						bg := p.Control
+						if b.Hovered() {
+							bg = p.Hover
+						}
+						b.Padding(4, 10).Radius(8).Border(1, p.Divider).Background(bg).Label(action.label).Children(func() {
+							ui.Text(c, action.label).FontSize(panel.FontCaption).TextColor(p.Text)
+						})
+						if b.Clicked() && action.run != nil {
+							action.run(model.Str(it.ImageFilePath))
+						}
+					}
 				})
-				if b.Clicked() && m.Open != nil {
-					m.Open(model.Str(it.ImageFilePath))
-				}
 			}
 			if src := m.Source(); src != "" || model.Str(it.SourceAppPath) != "" {
 				if src == "" {

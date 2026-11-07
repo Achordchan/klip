@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 
 	"klip/internal/durable"
 	"klip/internal/history"
+	"klip/internal/imagecodec"
 	"klip/internal/model"
 	"klip/internal/paths"
 	"klip/internal/snapshot"
@@ -61,9 +63,15 @@ type AppIdentity struct{ Name, Path string }
 type retryKey struct{}
 
 type Service struct {
-	Layout    paths.Layout
-	History   *history.Service
-	Clipboard Clipboard
+	storeWebP bool
+	// ClipboardDir holds the PNG copies offered as files when a picture kept
+	// in another format is put on the clipboard; empty is a folder in the
+	// user's own cache directory (never the shared temporary directory, where
+	// another user could put a link of their choosing in its place).
+	ClipboardDir string
+	Layout       paths.Layout
+	History      *history.Service
+	Clipboard    Clipboard
 	// ForegroundApp says which program is in front, or nil. May be nil.
 	ForegroundApp func() *AppIdentity
 
@@ -119,7 +127,7 @@ type Service struct {
 func New(layout paths.Layout, h *history.Service, c Clipboard) *Service {
 	return &Service{
 		Layout: layout, History: h, Clipboard: c,
-		CaptureText: true, CaptureImages: true, CaptureFiles: true, CaptureFileMaxBytes: 20 << 20,
+		storeWebP: true, CaptureText: true, CaptureImages: true, CaptureFiles: true, CaptureFileMaxBytes: 20 << 20,
 		Now: time.Now, NewID: newGUID,
 		// 250 ms of C# plus one poll of the platform watcher (400 ms): a write
 		// just after a poll is seen one interval later.
@@ -133,6 +141,7 @@ func (s *Service) ApplySettings(st model.Settings) {
 	s.setMu.Lock()
 	s.CaptureText, s.CaptureImages, s.CaptureFiles = st.CaptureText, st.CaptureImages, st.CaptureFiles
 	s.allowed = parseExtensions(st.CaptureFileExtensions)
+	s.storeWebP = st.StoreImagesAsWebP()
 	s.CaptureFileMaxBytes = int64(min(st.CaptureFileMaxMegabytes, st.MaxMegabytes)) * 1024 * 1024
 	s.setMu.Unlock()
 }
@@ -439,7 +448,7 @@ func (s *Service) capture(ctx context.Context, expected *uint64) error {
 		if len(files) > 0 {
 			if opt.images && len(files) == 1 && isImagePath(files[0]) && isFile(files[0]) {
 				if data, err := readBoundedImage(files[0], opt.maxBytes); err == nil {
-					p, h, size, err := s.savePNG(data)
+					p, h, size, err := s.saveImage(data)
 					if err == nil {
 						add(model.Item{ID: s.NewID(), Kind: model.KindImage, ApproxBytes: size, ImageFilePath: &p, CopyCount: 1, ContentHash: &h})
 						return nil
@@ -475,7 +484,7 @@ func (s *Service) capture(ctx context.Context, expected *uint64) error {
 			wantRetry = true // an image is advertised but did not come
 		}
 		if len(data) > 0 {
-			p, h, size, err := s.savePNG(data)
+			p, h, size, err := s.saveImage(data)
 			if err == nil {
 				add(model.Item{ID: s.NewID(), Kind: model.KindImage, ApproxBytes: size, ImageFilePath: &p, CopyCount: 1, ContentHash: &h})
 				return nil
@@ -591,16 +600,26 @@ func (s *Service) fileListBytes(id string, files []string) int64 {
 // full or the folder cannot be written, as against data that is no picture.
 var errStorage = errors.New("capture: cannot store the picture")
 
-// savePNG stores an image in the images folder as <unix ms>_<guid>.png, and
-// returns its path, its content hash ("img:" and the SHA-256 of the file)
-// and its size. A PNG is stored as it is; any other format the standard
-// decoders know is converted.
-func (s *Service) savePNG(data []byte) (path, hash string, size int64, err error) {
+// saveImage stores lossless WebP by default, or PNG when disabled, when the
+// picture has more than 8 bits per channel (WebP would lose them), when it
+// carries colour information WebP would drop (an ICC profile, a gamma: see
+// imagecodec.PNGColorInfo) or when it is wider or taller than WebP allows.
+//
+// A picture has two possible fingerprints: the hash of its PNG bytes (what
+// C# and earlier versions store, and what a PNG kept as it came gives back
+// on the clipboard) and the hash of its canonical PNG (what a WebP picture
+// gives back, see imagecodec.CanonicalPNG). An item already in the history
+// under either keeps its fingerprint, so neither a round trip through the
+// clipboard nor a change of the setting makes a duplicate.
+func (s *Service) saveImage(data []byte) (path, hash string, size int64, err error) {
 	if err := validateImageSize(data); err != nil {
 		return "", "", 0, err
 	}
+	var img image.Image
+	colour := imagecodec.PNGColorInfo(data) // of a PNG as it came, before any conversion
 	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
-		img, _, derr := image.Decode(bytes.NewReader(data))
+		var derr error
+		img, _, derr = image.Decode(bytes.NewReader(data))
 		if derr != nil {
 			return "", "", 0, derr
 		}
@@ -609,15 +628,45 @@ func (s *Service) savePNG(data []byte) (path, hash string, size int64, err error
 			return "", "", 0, err
 		}
 		data = b.Bytes()
-	} else if _, derr := png.Decode(bytes.NewReader(data)); derr != nil {
-		// the header alone is not enough: a cut-off file must not become a
-		// picture that cannot be shown
-		return "", "", 0, derr
+	} else {
+		var derr error
+		if img, derr = png.Decode(bytes.NewReader(data)); derr != nil {
+			// the header alone is not enough: a cut-off file must not become a
+			// picture that cannot be shown
+			return "", "", 0, derr
+		}
+	}
+	legacy := hashOf("img", data)
+	deep := imagecodec.HighDepth(img)
+	s.setMu.RLock()
+	webp := s.storeWebP && !deep && !colour && imagecodec.FitsWebP(img.Bounds())
+	s.setMu.RUnlock()
+	hash = legacy
+	// A picture with colour information has no canonical form: its pixels
+	// without the profile are another picture, which may look different. It
+	// is known by its bytes alone.
+	if !deep && !colour {
+		canonical, err := imagecodec.CanonicalPNG(img)
+		if err != nil {
+			return "", "", 0, err
+		}
+		if webp {
+			hash = hashOf("img", canonical)
+		}
+		hash = s.knownImageHash(hash, legacy, hashOf("img", canonical))
+	}
+	extension := "png"
+	if webp {
+		data, err = imagecodec.Encode(imagecodec.Normalize(img), "webp")
+		if err != nil {
+			return "", "", 0, err
+		}
+		extension = "webp"
 	}
 	if err := os.MkdirAll(s.Layout.Images(), 0o700); err != nil {
 		return "", "", 0, fmt.Errorf("%w: %v", errStorage, err)
 	}
-	path = filepath.Join(s.Layout.Images(), fmt.Sprintf("%d_%s.png", s.Now().UnixMilli(), strings.ReplaceAll(newGUID(), "-", "")))
+	path = filepath.Join(s.Layout.Images(), fmt.Sprintf("%d_%s.%s", s.Now().UnixMilli(), strings.ReplaceAll(newGUID(), "-", ""), extension))
 	// To a side file first: a write that stops half way (disk full) must not
 	// leave a broken picture behind.
 	tmp := path + ".part"
@@ -629,7 +678,167 @@ func (s *Service) savePNG(data []byte) (path, hash string, size int64, err error
 		os.Remove(tmp)
 		return "", "", 0, fmt.Errorf("%w: %v", errStorage, err)
 	}
-	return path, hashOf("img", data), int64(len(data)), nil
+	return path, hash, int64(len(data)), nil
+}
+
+// knownImageHash is the fingerprint of an image item of the history that has
+// one of the candidates, or fallback when none has.
+//
+// It is taken over only for the capture to be merged into that item, whose
+// picture file then stays. Without merging the capture is an item of its own
+// and keeps fallback, the fingerprint its own file gives back on the
+// clipboard: a WebP item given the PNG-bytes hash of an older item could not
+// be found again from its canonical PNG once merging is turned on.
+func (s *Service) knownImageHash(fallback string, candidates ...string) string {
+	if s.History == nil || !s.History.Limits().MergeDuplicates {
+		return fallback
+	}
+	for _, it := range s.History.Items() {
+		if it.Kind != model.KindImage || !isFile(model.Str(it.ImageFilePath)) {
+			continue // a picture that is gone is replaced by the new file: fallback fits that
+		}
+		for _, c := range candidates {
+			if strings.EqualFold(model.Str(it.ContentHash), c) {
+				return model.Str(it.ContentHash)
+			}
+		}
+	}
+	return fallback
+}
+
+// clipboardPNG writes the PNG of a picture kept in another format, so that a
+// paste as a file gets a PNG as before. It returns "" when it cannot: the
+// picture then goes without a file.
+//
+// Once the picture is on the clipboard, the copies of the ones before it are
+// needed by nobody and go (pruneClipboardPNGs): the folder holds the copy the
+// clipboard offers, and at most one more after a write that failed.
+func (s *Service) clipboardPNG(stored string, data []byte) string {
+	dir, err := s.clipboardDir()
+	if err != nil {
+		return ""
+	}
+	base := filepath.Base(stored)
+	path := filepath.Join(dir, strings.TrimSuffix(base, filepath.Ext(base))+".png")
+	if got, err := os.ReadFile(path); err == nil && bytes.Equal(got, data) {
+		s.offered(path)
+		return path
+	}
+	f, err := os.CreateTemp(dir, ".klip-png-*")
+	if err != nil {
+		return ""
+	}
+	tmp := f.Name()
+	_, werr := f.Write(data)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil || os.Rename(tmp, path) != nil {
+		os.Remove(tmp)
+		return ""
+	}
+	s.offered(path)
+	return path
+}
+
+// How long a PNG copy is kept after it was last offered, and how many are
+// kept at most. A paste may go on reading a copy after the clipboard moved on
+// (a file manager asking whether to replace a file): a copy goes when it is
+// old, not when the next picture is put on the clipboard.
+const (
+	clipboardCopyRetention = 10 * time.Minute
+	clipboardCopyMax       = 32
+)
+
+// offered marks a copy as just offered: its time is what pruneClipboardPNGs
+// goes by.
+func (s *Service) offered(path string) {
+	now := s.Now()
+	_ = os.Chtimes(path, now, now)
+}
+
+// clipboardDir is the folder of the PNG copies, made if need be. It must be a
+// folder of this user's that only they can enter: a link, or a folder of
+// somebody else, is refused, as writing into it, and pruning it, would act on
+// files that are not Klip's.
+func (s *Service) clipboardDir() (string, error) {
+	dir := s.ClipboardDir
+	if dir == "" {
+		base, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(base, "Klip", "clipboard-png")
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
+		return "", err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("capture: the clipboard folder is not a plain folder")
+	}
+	if !ownedByMe(info) {
+		return "", errors.New("capture: the clipboard folder belongs to another user")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
+}
+
+// pruneClipboardPNGs removes the copies, other than keep ("" for none), last
+// offered more than clipboardCopyRetention ago, and side files left by a
+// write that stopped as long ago; of the rest it keeps the clipboardCopyMax
+// newest. It is called once a picture is on the clipboard: until then, the
+// clipboard may still offer the copy before.
+func (s *Service) pruneClipboardPNGs(keep string) {
+	dir, err := s.clipboardDir()
+	if err != nil {
+		return
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type copyFile struct {
+		path string
+		at   time.Time
+	}
+	var young []copyFile
+	now := s.Now()
+	for _, e := range ents {
+		p := filepath.Join(dir, e.Name())
+		if !e.Type().IsRegular() || (keep != "" && samePath(p, keep)) {
+			continue // a folder or a link is not a copy Klip made
+		}
+		if !strings.EqualFold(filepath.Ext(e.Name()), ".png") && !strings.HasPrefix(e.Name(), ".klip-png-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > clipboardCopyRetention {
+			os.Remove(p)
+			continue
+		}
+		young = append(young, copyFile{p, info.ModTime()})
+	}
+	if len(young) <= clipboardCopyMax {
+		return
+	}
+	sort.Slice(young, func(i, j int) bool { return young[i].at.After(young[j].at) })
+	for _, f := range young[clipboardCopyMax:] {
+		os.Remove(f.path)
+	}
 }
 
 // hashOf is "<prefix>:<SHA-256 in upper case hex>", what C# stores in
@@ -1068,7 +1277,30 @@ func (s *Service) write(it model.Item) (bool, written, error) {
 		if err != nil {
 			return false, written{}, err
 		}
-		return true, written{image: data}, s.Clipboard.WriteImage(data, p)
+		file := p
+		if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+			im, err := imagecodec.Decode(data)
+			if err != nil {
+				return false, written{}, err
+			}
+			// The canonical PNG: copied back, it has the fingerprint the item
+			// was given (saveImage).
+			data, err = imagecodec.CanonicalPNG(im)
+			if err != nil {
+				return false, written{}, err
+			}
+			// The file offered with the picture must be a PNG too: the stored
+			// one is not, and a folder or a chat would get a WebP.
+			file = s.clipboardPNG(p, data)
+		}
+		if err := s.Clipboard.WriteImage(data, file); err != nil {
+			return true, written{image: data}, err
+		}
+		if file == p {
+			file = "" // a stored PNG is offered: no copy is in use
+		}
+		s.pruneClipboardPNGs(file)
+		return true, written{image: data}, nil
 	}
 	return false, written{}, errors.New("capture: unknown item kind")
 }

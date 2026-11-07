@@ -547,14 +547,24 @@ func (s *Service) passwordUpdated(email string, epoch int64) Result {
 	return Result{OK: true, Message: "密码已更新，请使用新密码重新登录"}
 }
 
+// SubscriptionCheck names one question to the server about the subscription:
+// the account it was asked for and its place among all such questions. It is
+// taken before the question is sent and given back with the answer, so that
+// an answer is applied only for its account and never over a newer one.
+type SubscriptionCheck struct {
+	Owner string
+	Seq   uint64
+}
+
 // Subscription is what the cloud tab shows about the plan.
 type Subscription struct {
-	Status    string // 订阅至 2026-01-02, 已订阅, 未订阅, 未登录, 查询失败, 正在读取中...
-	Tier      string
-	Storage   string
-	Retention string
-	Limit     string // 正常 / 已超限（可能影响同步）
-	OverLimit bool
+	Subscribed bool   // True only after the server confirms an active subscription.
+	Status     string // 订阅至 2026-01-02, 已订阅, 未订阅, 未登录, 查询失败, 正在读取中...
+	Tier       string
+	Storage    string
+	Retention  string
+	Limit      string // 正常 / 已超限（可能影响同步）
+	OverLimit  bool
 }
 
 // Loading is the placeholder while the server is asked.
@@ -590,7 +600,7 @@ func (s *Service) Subscription(ctx context.Context) Subscription {
 	if !st.Subscribed {
 		return None("未订阅")
 	}
-	out := Subscription{Status: "已订阅"}
+	out := Subscription{Subscribed: true, Status: "已订阅"}
 	if st.ExpiresAt != nil {
 		if t, ok := parseTime(*st.ExpiresAt); ok {
 			out.Status = "订阅至 " + t.Format("2006-01-02")

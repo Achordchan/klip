@@ -26,7 +26,7 @@ const (
 	Message  Kind = "message"
 )
 
-// Sizes of the windows (the Width and Height of the .axaml files).
+// Sizes are content-area dimensions; native title bars are added by the window backend.
 var Sizes = map[Kind][2]int{
 	Check: {420, 148}, Prompt: {520, 360}, Progress: {520, 170}, Message: {480, 220},
 }
@@ -160,7 +160,7 @@ func frame(c *ui.Context, p panel.Palette, body func()) {
 }
 
 func button(c *ui.Context, p panel.Palette, label string) bool {
-	return panel.Button(c, p, label, 5, 11, 14).Label(label).Clicked()
+	return panel.Button(c, p, label, 5, 11, panel.FontBody).Label(label).Clicked()
 }
 
 func primary(c *ui.Context, label string) bool { return ui.PrimaryButton(c, label).Clicked() }
@@ -179,6 +179,7 @@ func buttonRow(c *ui.Context, p panel.Palette, buttons func()) {
 
 // ViewCheck is the small window of a check under way.
 func (m *Model) ViewCheck(c *ui.Context) {
+	panel.ApplyTypography(c)
 	p := panel.PaletteFor(c.Theme().Dark)
 	c.Root().Background(ui.Transparent)
 	st := m.Coordinator.State()
@@ -187,7 +188,7 @@ func (m *Model) ViewCheck(c *ui.Context) {
 		msg = "正在连接更新服务器，请稍候..."
 	}
 	ui.Column(c).Fill().Padding(16).Gap(12).Background(p.Panel).Border(1, p.Border).Radius(14).Children(func() {
-		ui.Text(c, "检查更新中").FontSize(16).FontWeight(600).TextColor(p.Text)
+		ui.Text(c, "检查更新中").FontSize(panel.FontTitle).FontWeight(600).TextColor(p.Text)
 		ui.Progress(c, -1).FillWidth().Height(10).Label("检查更新")
 		ui.Text(c, msg).FontSize(12).TextColor(p.Muted).Wrap()
 	})
@@ -195,13 +196,14 @@ func (m *Model) ViewCheck(c *ui.Context) {
 
 // ViewPrompt is the notice of a new version.
 func (m *Model) ViewPrompt(c *ui.Context) {
+	panel.ApplyTypography(c)
 	p := panel.PaletteFor(c.Theme().Dark)
 	info := m.Coordinator.State().Info
 	if info == nil {
 		return
 	}
 	frame(c, p, func() {
-		ui.Text(c, m.Title(Prompt)).FontSize(16).FontWeight(600).TextColor(p.Text)
+		ui.Text(c, m.Title(Prompt)).FontSize(panel.FontTitle).FontWeight(600).TextColor(p.Text)
 		// The notes take what the window has left above the buttons: the window
 		// is of a fixed size, and the buttons must stay inside it.
 		ui.Column(c).FillWidth().Grow(1).MinHeight(0).Padding(12).Gap(8).Background(p.Panel).Border(1, p.Border).Radius(10).Children(func() {
@@ -238,6 +240,7 @@ func (m *Model) ViewPrompt(c *ui.Context) {
 
 // ViewProgress is the download.
 func (m *Model) ViewProgress(c *ui.Context) {
+	panel.ApplyTypography(c)
 	p := panel.PaletteFor(c.Theme().Dark)
 	st := m.Coordinator.State()
 	frame(c, p, func() {
@@ -264,10 +267,11 @@ func (m *Model) ViewProgress(c *ui.Context) {
 
 // ViewMessage is a message: that there is nothing newer, or what went wrong.
 func (m *Model) ViewMessage(c *ui.Context) {
+	panel.ApplyTypography(c)
 	p := panel.PaletteFor(c.Theme().Dark)
 	st := m.Coordinator.State()
 	frame(c, p, func() {
-		ui.Text(c, st.Title).FontSize(16).FontWeight(600).TextColor(p.Text)
+		ui.Text(c, st.Title).FontSize(panel.FontTitle).FontWeight(600).TextColor(p.Text)
 		ui.Column(c).FillWidth().Padding(12).Background(p.Panel).Border(1, p.Border).Radius(10).Children(func() {
 			ui.Scroll(c).FillWidth().Height(60).Children(func() {
 				ui.Text(c, st.Detail).TextColor(p.Text).Wrap().FillWidth().Selectable()

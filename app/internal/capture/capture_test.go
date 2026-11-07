@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -22,6 +24,7 @@ import (
 	"golang.org/x/image/bmp"
 
 	"klip/internal/history"
+	"klip/internal/imagecodec"
 	"klip/internal/model"
 	"klip/internal/paths"
 )
@@ -36,6 +39,7 @@ type fakeClip struct {
 	wroteFiles []string
 	wroteImage []byte
 	wroteWith  string
+	writeErr   error
 	reads      int
 	filesErr   error
 	onRead     func() // runs inside ReadText, as a write that comes during a read
@@ -54,6 +58,9 @@ func (c *fakeClip) ReadImage() []byte            { c.reads++; return c.image }
 func (c *fakeClip) WriteText(s string) error     { c.wroteText = &s; return nil }
 func (c *fakeClip) WriteFiles(p []string) error  { c.wroteFiles = p; return nil }
 func (c *fakeClip) WriteImage(b []byte, f string) error {
+	if c.writeErr != nil {
+		return c.writeErr
+	}
 	c.wroteImage, c.wroteWith = b, f
 	return nil
 }
@@ -72,6 +79,7 @@ func newRig(t *testing.T) *rig {
 	r := &rig{t: t, l: paths.Layout{Root: t.TempDir()}, clip: &fakeClip{}, now: time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)}
 	r.h = history.NewService(r.l)
 	r.s = New(r.l, r.h, r.clip)
+	r.s.ClipboardDir = filepath.Join(r.l.Root, "clipboard-png")
 	r.s.Now = func() time.Time { return r.now }
 	r.s.NewID = func() string {
 		r.n++
@@ -240,13 +248,14 @@ func TestImageCapture(t *testing.T) {
 	r.capture()
 	it := r.h.Items()[0]
 	p := model.Str(it.ImageFilePath)
-	if it.Kind != model.KindImage || filepath.Dir(p) != r.l.Images() || !regexp.MustCompile(`^\d+_[0-9a-f]{32}\.png$`).MatchString(filepath.Base(p)) {
+	if it.Kind != model.KindImage || filepath.Dir(p) != r.l.Images() || !regexp.MustCompile(`^\d+_[0-9a-f]{32}\.webp$`).MatchString(filepath.Base(p)) {
 		t.Fatalf("item %+v", it)
 	}
-	if got, _ := os.ReadFile(p); !bytes.Equal(got, data) {
-		t.Error("a PNG is stored as it came")
+	stored, _ := os.ReadFile(p)
+	if !samePicture(stored, data) {
+		t.Error("lossless WebP changed pixels")
 	}
-	if model.Str(it.ContentHash) != "img:"+upperSHA(data) || it.ApproxBytes != int64(len(data)) || it.Text != nil {
+	if model.Str(it.ContentHash) != "img:"+upperSHA(data) || it.ApproxBytes != int64(len(stored)) || it.Text != nil {
 		t.Errorf("item %+v", it)
 	}
 	// The same picture again is a copy of that item, and its second file goes.
@@ -265,8 +274,8 @@ func TestImageCapture(t *testing.T) {
 	r2.clip.formats, r2.clip.image = []string{"image/bmp"}, b.Bytes()
 	r2.capture()
 	got, _ := os.ReadFile(model.Str(r2.h.Items()[0].ImageFilePath))
-	if _, err := png.Decode(bytes.NewReader(got)); err != nil {
-		t.Errorf("the stored image is not a PNG: %v", err)
+	if _, _, err := image.Decode(bytes.NewReader(got)); err != nil {
+		t.Errorf("the stored image cannot be decoded: %v", err)
 	}
 	r3 := newRig(t)
 	r3.clip.formats, r3.clip.image = []string{"image/png"}, []byte("not an image")
@@ -393,8 +402,8 @@ func TestSingleImageFileBecomesAnImage(t *testing.T) {
 		t.Fatalf("kind %v", it.Kind)
 	}
 	got, _ := os.ReadFile(model.Str(it.ImageFilePath))
-	if _, err := png.Decode(bytes.NewReader(got)); err != nil {
-		t.Errorf("not a PNG: %v", err)
+	if _, _, err := image.Decode(bytes.NewReader(got)); err != nil {
+		t.Errorf("not a supported image: %v", err)
 	}
 	if !strings.HasPrefix(model.Str(it.ContentHash), "img:") || filepath.Dir(model.Str(it.ImageFilePath)) != r.l.Images() {
 		t.Errorf("%+v", it)
@@ -1026,5 +1035,435 @@ func TestBlockedOnlyAllowlistDoesNotBecomeUnrestricted(t *testing.T) {
 	if parseExtensions(" , ; ") == nil {
 	} else {
 		t.Fatal("blank configuration should remain unrestricted")
+	}
+}
+
+func TestWebPStorageCanBeDisabledAndClipboardRemainsPNG(t *testing.T) {
+	r := newRig(t)
+	st := model.DefaultSettings()
+	st.SetStoreImagesAsWebP(false)
+	r.s.ApplySettings(st)
+	data := tinyPNG(t)
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture()
+	it := r.h.Items()[0]
+	if filepath.Ext(model.Str(it.ImageFilePath)) != ".png" {
+		t.Fatal("disabled WebP still converted")
+	}
+	r2 := newRig(t)
+	r2.clip.formats, r2.clip.image = []string{"image/png"}, data
+	r2.capture()
+	it = r2.h.Items()[0]
+	if err := r2.s.Apply(it); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(r2.clip.wroteImage, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("clipboard not PNG")
+	}
+}
+
+// noncanonicalPNG is a picture with translucent pixels, encoded otherwise
+// than Klip encodes it (another compression level and a palette), as another
+// program might.
+func noncanonicalPNG(t *testing.T) []byte {
+	t.Helper()
+	pal := color.Palette{color.NRGBA{0, 0, 0, 0}, color.NRGBA{200, 10, 10, 128}, color.NRGBA{10, 200, 10, 255}}
+	img := image.NewPaletted(image.Rect(0, 0, 8, 8), pal)
+	for i := range img.Pix {
+		img.Pix[i] = uint8(i % 3)
+	}
+	var b bytes.Buffer
+	if err := (&png.Encoder{CompressionLevel: png.BestSpeed}).Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	if canonical, _ := imagecodec.CanonicalPNG(img); bytes.Equal(canonical, b.Bytes()) {
+		t.Fatal("the test picture is canonical")
+	}
+	return b.Bytes()
+}
+
+// copyBack puts what Klip wrote on the clipboard as if another program had
+// copied it, after Klip's own write is no longer ignored.
+func (r *rig) copyBack() {
+	r.t.Helper()
+	r.clip.formats, r.clip.image = []string{"image/png"}, append([]byte(nil), r.clip.wroteImage...)
+	r.s.setOwn(0, 0, 0, nil) // another program copied it: the write is no longer ours
+	r.now = r.now.Add(time.Minute)
+	r.capture()
+}
+
+func TestWebPItemCopiedBackIsTheSameItem(t *testing.T) {
+	r := newRig(t)
+	r.clip.formats, r.clip.image = []string{"image/png"}, noncanonicalPNG(t)
+	r.capture()
+	it := r.h.Items()[0]
+	if filepath.Ext(model.Str(it.ImageFilePath)) != ".webp" {
+		t.Fatalf("not stored as WebP: %s", model.Str(it.ImageFilePath))
+	}
+	if err := r.s.Apply(it); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(r.clip.wroteImage, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("clipboard not PNG")
+	}
+	// The file offered with the picture is a PNG of the same bytes.
+	if filepath.Ext(r.clip.wroteWith) != ".png" {
+		t.Fatalf("file offered: %q", r.clip.wroteWith)
+	}
+	if got, err := os.ReadFile(r.clip.wroteWith); err != nil || !bytes.Equal(got, r.clip.wroteImage) {
+		t.Fatalf("offered file differs from the clipboard picture: %v", err)
+	}
+	r.copyBack()
+	if r.h.Len() != 1 || r.h.Items()[0].CopyCount != 2 {
+		t.Fatalf("copied back: %d items, copy count %d", r.h.Len(), r.h.Items()[0].CopyCount)
+	}
+}
+
+func TestChangingImageFormatKeepsExistingItem(t *testing.T) {
+	for _, webpFirst := range []bool{false, true} {
+		r := newRig(t)
+		data := noncanonicalPNG(t)
+		st := model.DefaultSettings()
+		st.SetStoreImagesAsWebP(webpFirst)
+		r.s.ApplySettings(st)
+		r.clip.formats, r.clip.image = []string{"image/png"}, data
+		r.capture()
+		st.SetStoreImagesAsWebP(!webpFirst)
+		r.s.ApplySettings(st)
+		r.now = r.now.Add(time.Minute)
+		r.capture()
+		if r.h.Len() != 1 || r.h.Items()[0].CopyCount != 2 {
+			t.Fatalf("webp first %v: %d items", webpFirst, r.h.Len())
+		}
+		// And the item, written and copied back, is still that item.
+		if err := r.s.Apply(r.h.Items()[0]); err != nil {
+			t.Fatal(err)
+		}
+		r.copyBack()
+		if r.h.Len() != 1 {
+			t.Fatalf("webp first %v: copied back made %d items", webpFirst, r.h.Len())
+		}
+	}
+}
+
+func TestHighBitDepthImageStaysPNG(t *testing.T) {
+	r := newRig(t)
+	img := image.NewRGBA64(image.Rect(0, 0, 4, 4))
+	for i := 0; i < 16; i++ {
+		img.SetRGBA64(i%4, i/4, color.RGBA64{uint16(i*4099 + 1), 0x1234, 0xFEDC, 0xFFFF})
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	data := b.Bytes()
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture()
+	it := r.h.Items()[0]
+	p := model.Str(it.ImageFilePath)
+	if filepath.Ext(p) != ".png" {
+		t.Fatalf("16-bit picture stored as %s", p)
+	}
+	if got, _ := os.ReadFile(p); !bytes.Equal(got, data) {
+		t.Fatal("16-bit PNG not kept as it came")
+	}
+	if model.Str(it.ContentHash) != "img:"+upperSHA(data) {
+		t.Fatalf("hash %s", model.Str(it.ContentHash))
+	}
+}
+
+func TestPictureTooLongForWebPStaysPNG(t *testing.T) {
+	r := newRig(t)
+	img := image.NewNRGBA(image.Rect(0, 0, 2, imagecodec.WebPMaxDimension+1))
+	for i := range img.Pix {
+		img.Pix[i] = uint8(i)
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	r.clip.formats, r.clip.image = []string{"image/png"}, b.Bytes()
+	r.capture()
+	if r.h.Len() != 1 {
+		t.Fatal("a long screenshot was not captured")
+	}
+	if p := model.Str(r.h.Items()[0].ImageFilePath); filepath.Ext(p) != ".png" {
+		t.Fatalf("stored as %s", p)
+	}
+}
+
+func distinctImages(t *testing.T, r *rig, n int) []model.Item {
+	t.Helper()
+	var items []model.Item
+	for i := 0; i < n; i++ {
+		img := image.NewNRGBA(image.Rect(0, 0, 3, 3))
+		img.Pix[0], img.Pix[1] = uint8(i+1), uint8((i+1)>>8)
+		var b bytes.Buffer
+		if err := png.Encode(&b, img); err != nil {
+			t.Fatal(err)
+		}
+		r.clip.formats, r.clip.image = []string{"image/png"}, b.Bytes()
+		r.now = r.now.Add(time.Second)
+		r.capture()
+		items = append(items, r.h.Items()[0])
+	}
+	return items
+}
+
+func clipboardCopies(t *testing.T, r *rig) []string {
+	t.Helper()
+	ents, err := os.ReadDir(r.s.ClipboardDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func TestClipboardPNGCopiesOutliveTheNextPasteThenGo(t *testing.T) {
+	r := newRig(t)
+	items := distinctImages(t, r, 3)
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	first := r.clip.wroteWith
+	// A side file left by a write that stopped long ago.
+	stale := write(t, filepath.Join(r.s.ClipboardDir, ".klip-png-stale"), []byte("x"))
+	old := r.now.Add(-time.Hour)
+	os.Chtimes(stale, old, old)
+	// The next pictures come soon after: a paste of the first may still be
+	// reading its copy.
+	for _, it := range items[1:] {
+		r.now = r.now.Add(time.Minute)
+		if err := r.s.Apply(it); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(first); err != nil {
+		t.Fatalf("a copy offered a minute ago went: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("an old side file stayed")
+	}
+	// Once they are old, they go; the one on the clipboard stays.
+	r.now = r.now.Add(clipboardCopyRetention + time.Minute)
+	if err := r.s.Apply(items[2]); err != nil {
+		t.Fatal(err)
+	}
+	if got := clipboardCopies(t, r); len(got) != 1 || filepath.Join(r.s.ClipboardDir, got[0]) != r.clip.wroteWith {
+		t.Fatalf("copies %v, current %s", got, r.clip.wroteWith)
+	}
+}
+
+func TestClipboardPNGCopiesAreCapped(t *testing.T) {
+	r := newRig(t)
+	items := distinctImages(t, r, clipboardCopyMax+5)
+	for _, it := range items {
+		if err := r.s.Apply(it); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := clipboardCopies(t, r); len(got) != clipboardCopyMax+1 {
+		t.Fatalf("%d copies, want %d", len(got), clipboardCopyMax+1)
+	}
+	if _, err := os.Stat(r.clip.wroteWith); err != nil {
+		t.Fatal("the copy on the clipboard went")
+	}
+}
+
+func TestFailedClipboardWriteKeepsTheCopyInUse(t *testing.T) {
+	r := newRig(t)
+	var items []model.Item
+	for i := 0; i < 2; i++ {
+		img := image.NewNRGBA(image.Rect(0, 0, 3, 3))
+		img.Pix[0] = uint8(i + 1)
+		var b bytes.Buffer
+		if err := png.Encode(&b, img); err != nil {
+			t.Fatal(err)
+		}
+		r.clip.formats, r.clip.image = []string{"image/png"}, b.Bytes()
+		r.now = r.now.Add(time.Minute)
+		r.capture()
+		items = append(items, r.h.Items()[0])
+	}
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	inUse := r.clip.wroteWith
+	r.clip.writeErr = errors.New("the clipboard is held by another program")
+	if err := r.s.Apply(items[1]); err == nil {
+		t.Fatal("a failed write succeeded")
+	}
+	if _, err := os.Stat(inUse); err != nil {
+		t.Fatalf("the copy the clipboard still offers went: %v", err)
+	}
+	r.clip.writeErr = nil
+	r.now = r.now.Add(clipboardCopyRetention + time.Minute)
+	if err := r.s.Apply(items[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inUse); !os.IsNotExist(err) {
+		t.Fatal("the copy no longer offered stayed")
+	}
+}
+
+func TestSeparateWebPItemIsFoundAgainOnceMergingIsOn(t *testing.T) {
+	r := newRig(t)
+	limits := r.h.Limits()
+	limits.MergeDuplicates = false
+	r.h.SetLimits(limits)
+	data := noncanonicalPNG(t)
+	st := model.DefaultSettings()
+	st.SetStoreImagesAsWebP(false)
+	r.s.ApplySettings(st)
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture() // a PNG item, under the hash of its bytes
+	st.SetStoreImagesAsWebP(true)
+	r.s.ApplySettings(st)
+	r.now = r.now.Add(time.Minute)
+	r.capture() // the same picture again, an item of its own, as WebP
+	if r.h.Len() != 2 {
+		t.Fatalf("%d items without merging", r.h.Len())
+	}
+	webp := r.h.Items()[0]
+	if filepath.Ext(model.Str(webp.ImageFilePath)) != ".webp" {
+		t.Fatal("the second capture is not WebP")
+	}
+	limits.MergeDuplicates = true
+	r.h.SetLimits(limits)
+	if err := r.s.Apply(webp); err != nil {
+		t.Fatal(err)
+	}
+	r.copyBack()
+	if r.h.Len() != 2 {
+		t.Fatalf("the WebP item copied back made a third item: %d", r.h.Len())
+	}
+}
+
+func TestClipboardFolderThatIsALinkIsNotUsed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("links need privileges there")
+	}
+	r := newRig(t)
+	items := distinctImages(t, r, 1)
+	// Somebody put a link to the user's pictures where the folder goes.
+	victim := t.TempDir()
+	photo := write(t, filepath.Join(victim, "holiday.png"), []byte("photo"))
+	old := r.now.Add(-24 * time.Hour)
+	os.Chtimes(photo, old, old)
+	link := filepath.Join(t.TempDir(), "clipboard-png")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	r.s.ClipboardDir = link
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if r.clip.wroteWith != "" {
+		t.Fatalf("a copy was written through the link: %s", r.clip.wroteWith)
+	}
+	if _, err := os.Stat(photo); err != nil {
+		t.Fatal("a file behind the link was deleted")
+	}
+	if ents, _ := os.ReadDir(victim); len(ents) != 1 {
+		t.Fatalf("files written behind the link: %v", ents)
+	}
+}
+
+func TestPruneLeavesLinksInTheFolderAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("links need privileges there")
+	}
+	r := newRig(t)
+	items := distinctImages(t, r, 1)
+	if err := r.s.Apply(items[0]); err != nil { // makes the folder
+		t.Fatal(err)
+	}
+	victim := write(t, filepath.Join(t.TempDir(), "holiday.png"), []byte("photo"))
+	planted := filepath.Join(r.s.ClipboardDir, "planted.png")
+	if err := os.Symlink(victim, planted); err != nil {
+		t.Fatal(err)
+	}
+	// The link was made just now, by the clock of the system: look at it from
+	// a day later, when it is long past the time a copy is kept.
+	r.now = time.Now().Add(24 * time.Hour)
+	if err := r.s.Apply(items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(planted); err != nil {
+		t.Fatal("a link in the folder was removed")
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatal("the file a link points to was removed")
+	}
+}
+
+func TestClipboardFolderIsMadePrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits")
+	}
+	r := newRig(t)
+	if err := os.Mkdir(r.s.ClipboardDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(r.s.ClipboardDir, 0o777)
+	if err := r.s.Apply(distinctImages(t, r, 1)[0]); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(r.s.ClipboardDir); st.Mode().Perm() != 0o700 {
+		t.Fatalf("mode %v", st.Mode().Perm())
+	}
+}
+
+func TestPictureWithAColourProfileStaysPNG(t *testing.T) {
+	r := newRig(t)
+	plain := tinyPNG(t)
+	// iCCP right after IHDR, with a correct CRC, as a Display P3 screenshot has.
+	const ihdrEnd = 8 + 8 + 13 + 4
+	body := []byte("Display P3\x00\x00profile")
+	var chunk bytes.Buffer
+	binary.Write(&chunk, binary.BigEndian, uint32(len(body)))
+	chunk.WriteString("iCCP")
+	chunk.Write(body)
+	binary.Write(&chunk, binary.BigEndian, crc32.ChecksumIEEE(append([]byte("iCCP"), body...)))
+	data := append(append(append([]byte(nil), plain[:ihdrEnd]...), chunk.Bytes()...), plain[ihdrEnd:]...)
+	r.clip.formats, r.clip.image = []string{"image/png"}, data
+	r.capture()
+	if r.h.Len() != 1 {
+		t.Fatal("not captured")
+	}
+	p := model.Str(r.h.Items()[0].ImageFilePath)
+	if filepath.Ext(p) != ".png" {
+		t.Fatalf("a picture with a colour profile was stored as %s", p)
+	}
+	if got, _ := os.ReadFile(p); !bytes.Equal(got, data) {
+		t.Fatal("the PNG with its profile was not kept as it came")
+	}
+}
+
+func TestColourManagedPictureIsNotMergedIntoAnUntaggedOne(t *testing.T) {
+	r := newRig(t)
+	plain := tinyPNG(t)
+	r.clip.formats, r.clip.image = []string{"image/png"}, plain
+	r.capture() // untagged: WebP, under its canonical hash
+	const ihdrEnd = 8 + 8 + 13 + 4
+	body := []byte("Display P3\x00\x00profile")
+	var chunk bytes.Buffer
+	binary.Write(&chunk, binary.BigEndian, uint32(len(body)))
+	chunk.WriteString("iCCP")
+	chunk.Write(body)
+	binary.Write(&chunk, binary.BigEndian, crc32.ChecksumIEEE(append([]byte("iCCP"), body...)))
+	tagged := append(append(append([]byte(nil), plain[:ihdrEnd]...), chunk.Bytes()...), plain[ihdrEnd:]...)
+	r.clip.image = tagged
+	r.now = r.now.Add(time.Minute)
+	r.capture() // the same values, another colour space
+	if r.h.Len() != 2 {
+		t.Fatalf("the colour-managed picture was merged into the untagged one: %d items", r.h.Len())
+	}
+	if got, _ := os.ReadFile(model.Str(r.h.Items()[0].ImageFilePath)); !bytes.Equal(got, tagged) {
+		t.Fatal("the colour-managed picture was not kept")
 	}
 }

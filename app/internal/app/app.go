@@ -103,18 +103,23 @@ type App struct {
 	remoteDuringSync  atomic.Bool     // another device uploaded while a sync ran
 	acctCtx           context.Context
 	acctCancel        context.CancelFunc
-	changedDuringSync atomic.Bool               // the history changed while a sync ran
-	acctGen           atomic.Int64              // moves when the account changes
-	runGen            atomic.Int64              // the account generation the running sync started under
-	runOwner          atomic.Pointer[string]    // the account the running sync started for
-	retrying          atomic.Bool               // the loop that tries the first sync again is running
-	loginWanted       atomic.Bool               // a sync for a new sign-in is owed (one was running when it was asked for)
-	initialOK         atomic.Bool               // a background sync has gone through
-	runEntered        atomic.Bool               // the sync that syncDone is told about did start (Run was entered)
-	pending           pendingDeletes            // what the user deleted here, by account
-	login             atomic.Pointer[loginSeen] // see ownerLearned
-	failStreak        atomic.Int32              // background syncs that failed in a row since the initial one
-	stopWatch         context.CancelFunc        // ends the event stream of the current account
+	changedDuringSync atomic.Bool                               // the history changed while a sync ran
+	acctGen           atomic.Int64                              // moves when the account changes
+	runGen            atomic.Int64                              // the account generation the running sync started under
+	runOwner          atomic.Pointer[string]                    // the account the running sync started for
+	runSubCheck       atomic.Pointer[account.SubscriptionCheck] // the subscription question of the running sync
+
+	subMu       sync.Mutex                // orders the answers about the subscription (SubscriptionChanged)
+	subSeq      atomic.Uint64             // the last question handed out
+	subApplied  uint64                    // the newest question whose answer was applied; under subMu
+	retrying    atomic.Bool               // the loop that tries the first sync again is running
+	loginWanted atomic.Bool               // a sync for a new sign-in is owed (one was running when it was asked for)
+	initialOK   atomic.Bool               // a background sync has gone through
+	runEntered  atomic.Bool               // the sync that syncDone is told about did start (Run was entered)
+	pending     pendingDeletes            // what the user deleted here, by account
+	login       atomic.Pointer[loginSeen] // see ownerLearned
+	failStreak  atomic.Int32              // background syncs that failed in a row since the initial one
+	stopWatch   context.CancelFunc        // ends the event stream of the current account
 }
 
 // New reads the settings and the history and connects the parts. A settings
@@ -220,6 +225,7 @@ func New(cfg Config) (*App, error) {
 		},
 	})
 	a.Auto = syncer.NewAuto(a.Syncer, a.syncDone)
+	a.Auto.CanSync = func() bool { return a.Syncer.CanAutoSync() && !a.subscriptionPaused() }
 	// Every sync is counted while it runs, so that Stop can wait for them (they
 	// start their own goroutines inside Auto).
 	a.Auto.Begin = a.syncBegin
@@ -242,7 +248,24 @@ func New(cfg Config) (*App, error) {
 		}
 		a.runGen.Store(gen) // which account this sync is for
 		a.runOwner.Store(&owner)
+		a.runSubCheck.Store(nil)
 		a.replayOwnerMoves()
+		if a.subscriptionPaused() {
+			return syncer.ErrSubscriptionExpired
+		}
+		check := a.subscriptionCheck(owner)
+		a.runSubCheck.Store(&check)
+		subscription := a.Account.Subscription(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if gen != a.acctGen.Load() {
+			return syncer.ErrSessionChanged
+		}
+		if err := a.afterPreflight(owner, check, subscription); err != nil {
+			return err
+		}
+
 		if err := a.pending.Ready(); err != nil {
 			return err
 		}
@@ -401,6 +424,9 @@ const stopWait = 3 * time.Second
 // only starts after it, and a program started offline would otherwise wait for
 // another device to speak first.
 func (a *App) retryStartup(ctx context.Context) {
+	if a.subscriptionPaused() {
+		return
+	}
 	if !a.retrying.CompareAndSwap(false, true) {
 		return // one loop is enough
 	}
@@ -411,7 +437,7 @@ func (a *App) retryStartup(ctx context.Context) {
 			a.retrying.Store(false)
 			// A sign-in may have asked for a loop while this one was ending: look
 			// again after letting go, so that one of the two is always left.
-			if ctx.Err() == nil && !a.initialOK.Load() {
+			if ctx.Err() == nil && !a.initialOK.Load() && !a.subscriptionPaused() {
 				a.retryStartup(ctx)
 			}
 		}()
@@ -425,7 +451,7 @@ func (a *App) retryStartup(ctx context.Context) {
 				return
 			case <-time.After(wait):
 			}
-			if a.initialOK.Load() {
+			if a.initialOK.Load() || a.subscriptionPaused() {
 				return
 			}
 			a.Auto.Trigger(a.acct(), "startup", false)
@@ -446,6 +472,10 @@ func (a *App) watchRemote(ctx context.Context) {
 	}
 	a.stopWatch = cancel
 	a.mu.Unlock()
+	if a.subscriptionPaused() {
+		cancel()
+		return
+	}
 	a.done.Add(1)
 	go func() {
 		defer a.done.Done()
@@ -722,6 +752,9 @@ func (a *App) Apply(it model.Item) error {
 
 // SyncNow is the user asking for a sync.
 func (a *App) SyncNow() {
+	if a.subscriptionPaused() {
+		return
+	}
 	// The status and the bar are set when the run starts (Auto.Begin): a request
 	// that is turned away because one is still unwinding changes nothing.
 	a.Auto.Trigger(a.acct(), "manual", true)
@@ -810,6 +843,20 @@ func (a *App) syncDone(reason string, manual bool, err error) {
 			a.syncing.Add(-1)
 		}
 	}()
+	if errors.Is(err, syncer.ErrSubscriptionExpired) && a.runGen.Load() == a.acctGen.Load() {
+		// The question the run asked, for the account it was for. A run that
+		// found sync already paused asked nothing and has nothing to tell.
+		if c := a.runSubCheck.Load(); c != nil {
+			a.SubscriptionChanged(*c, false)
+		}
+		// Not paused now: a newer answer said the subscription is active, and
+		// this one was out of date. The run ends as any run that failed does
+		// (below), its display included.
+	}
+	if a.subscriptionPaused() {
+		a.endPausedRun()
+		return
+	}
 	a.syncMu.Lock()
 	changed, remote := a.changedDuringSync.Load(), a.remoteDuringSync.Load()
 	if err == nil {

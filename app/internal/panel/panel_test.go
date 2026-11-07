@@ -134,14 +134,14 @@ func TestImageInfo(t *testing.T) {
 
 func TestPalettes(t *testing.T) {
 	d, l := PaletteFor(true), PaletteFor(false)
-	if d.Background != ui.Hex("#1E1E1E") || l.Background != ui.Hex("#F6F6F6") || d.Panel != ui.Hex("#171717") {
+	if d.Background != ui.Hex("#1E1E1E") || l.Background != ui.Hex("#F3F5F7") || d.Panel != ui.Hex("#171717") {
 		t.Fatalf("backgrounds: %+v %+v", d.Background, l.Background)
 	}
 	// App.axaml writes #EE111111: alpha first.
 	if d.PreviewBg.A != 0xEE || d.PreviewBg.R != 0x11 || d.ToastBg.A != 0xCC || d.ToastBg.R != 0x33 {
 		t.Fatalf("translucent colours: %+v %+v", d.PreviewBg, d.ToastBg)
 	}
-	if l.ToastBg.A != 0xCC || l.ToastBg.R != 0x11 || l.Text != ui.Hex("#1A1A1A") {
+	if l.ToastBg.A != 0xCC || l.ToastBg.R != 0x11 || l.Text != ui.Hex("#202A36") {
 		t.Fatalf("light: %+v", l)
 	}
 }
@@ -231,7 +231,7 @@ func (r *rig) texts() []string {
 
 func TestViewLayoutFollowsTheOldWindow(t *testing.T) {
 	r := newRig(t, "first", "second")
-	for _, s := range []string{"About", "常用剪贴", "first", "second", "设置", "清除", "v1.0.11"} {
+	for _, s := range []string{"关于", "常用剪贴", "first", "second", "设置", "清除", "v1.0.11"} {
 		if !r.tt.HasText(s) {
 			t.Fatalf("missing %q in %q", s, r.tt.Texts())
 		}
@@ -477,11 +477,11 @@ func TestViewFollowsHistoryChanges(t *testing.T) {
 
 func TestViewButtons(t *testing.T) {
 	r := newRig(t, "one")
-	if err := r.tt.Click("About"); err != nil {
+	if err := r.tt.Click("关于"); err != nil {
 		t.Fatal(err)
 	}
 	if r.ho.about != 1 {
-		t.Fatal("About")
+		t.Fatal("关于")
 	}
 	if err := r.tt.Click("设置"); err != nil {
 		t.Fatal(err)

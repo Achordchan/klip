@@ -123,7 +123,7 @@ func TestTabsAndDefaults(t *testing.T) {
 		t.Fatalf("shelf: %q", r.tt.Texts())
 	}
 	r.click("云同步")
-	for _, s := range []string{"未登录", "登录", "注册", "忘记密码", "登录后即可启用云同步，剪贴板历史将自动同步到云端。"} {
+	for _, s := range []string{"未登录", "登录", "注册", "忘记密码", "登录后可管理云同步服务。"} {
 		if !r.has(s) {
 			t.Fatalf("cloud page lacks %q: %q", s, r.tt.Texts())
 		}
@@ -151,78 +151,66 @@ func TestUpdateCheckButton(t *testing.T) {
 	}
 }
 
-func TestCheckboxesWriteSettingsAndToast(t *testing.T) {
+func TestSettingsRemainDraftUntilSave(t *testing.T) {
 	r := newRig(t, "")
 	r.click("内容")
 	r.click("捕获文本")
-	if r.set.Get().CaptureText {
-		t.Fatal("not turned off")
+	if !r.set.Get().CaptureText || !r.m.Dirty() {
+		t.Fatal("checkbox was saved before confirmation")
 	}
-	if !r.has("设置已生效") {
-		t.Fatalf("no toast: %q", r.tt.Texts())
-	}
-	r.click("捕获文本")
-	if !r.set.Get().CaptureText {
-		t.Fatal("not turned on")
+	r.click("保存")
+	if r.set.Get().CaptureText || r.m.Dirty() {
+		t.Fatal("save did not commit draft")
 	}
 	r.click("通用")
 	r.click("开机启动")
-	if !r.auto.on || !r.set.Get().StartWithWindows {
-		t.Fatalf("autostart: system %v settings %v", r.auto.on, r.set.Get().StartWithWindows)
+	if r.auto.on {
+		t.Fatal("OS autostart changed before save")
+	}
+	r.click("保存")
+	if !r.auto.on {
+		t.Fatal("autostart not applied")
 	}
 }
-
-func TestNumbersAreKeptInRangeAndToastAfterAPause(t *testing.T) {
+func TestInvalidDraftDoesNotSave(t *testing.T) {
+	r := newRig(t, "")
+	r.m.v.MaxItems = "0"
+	if r.m.Save() {
+		t.Fatal("invalid value saved")
+	}
+	if r.set.Get().MaxItems != 200 || !r.m.Dirty() {
+		t.Fatal("invalid draft modified settings")
+	}
+}
+func TestCloseBlocksAndAllowsDiscard(t *testing.T) {
 	r := newRig(t, "")
 	r.click("内容")
-	// The single-file limit is put right as it is typed.
-	r.typeInto("单文件上限 MB", "9") // appended to 20: 209 -> over 300? no, 209 <= 300
-	if got := r.set.Get().CaptureFileMaxMegabytes; got != 209 {
-		t.Fatalf("file limit %d", got)
+	r.click("捕获文本")
+	r.click("关闭")
+	if r.host.closed != 0 || !r.m.confirmClose {
+		t.Fatal("dirty window closed without confirmation")
 	}
-	r.typeInto("最大容量 MB", "0") // 3000: raises
-	if got := r.set.Get().MaxMegabytes; got != 3000 {
-		t.Fatalf("history size %d", got)
+	r.click("继续编辑")
+	if r.m.confirmClose || !r.m.Dirty() {
+		t.Fatal("draft lost")
 	}
-	if r.has("设置已生效") {
-		t.Fatal("a typed number toasts only after a pause")
-	}
-	r.tt.Advance(800 * 1e6)
-	if !r.has("设置已生效") {
-		t.Fatalf("no toast after the pause: %q", r.tt.Texts())
-	}
-	// Shrinking the history size brings the file limit down with it.
-	r.click("最大容量 MB")
-	r.tt.Key(ui.Cmd, ui.KeyA)
-	r.tt.Type("100")
-	if st := r.set.Get(); st.MaxMegabytes != 100 || st.CaptureFileMaxMegabytes != 100 {
-		t.Fatalf("history %d file %d", st.MaxMegabytes, st.CaptureFileMaxMegabytes)
-	}
+	r.m.RequestClose()
 	r.tt.Frame()
-	if r.m.v.CaptureFileMaxMegabytes != "100" {
-		t.Fatalf("the box of the file limit did not follow: %q", r.m.v.CaptureFileMaxMegabytes)
-	}
-	// A bad count is ignored.
-	r.click("最大条目数")
-	r.tt.Key(ui.Cmd, ui.KeyA)
-	r.tt.Type("0")
-	if r.set.Get().MaxItems != 200 {
-		t.Fatalf("max items %d", r.set.Get().MaxItems)
+	r.click("放弃修改")
+	if r.host.closed != 1 || !r.set.Get().CaptureText || r.m.Dirty() {
+		t.Fatal("discard changed settings")
 	}
 }
-
-func TestOpenAgainReadsSettingsAndRepairs(t *testing.T) {
+func TestOpenReadsSettingsWithoutWriting(t *testing.T) {
 	r := newRig(t, "")
 	_ = r.set.Update(func(s *model.Settings) { s.CaptureFileExtensions = "" })
 	r.auto.on = true
 	r.m.Open()
-	r.tt.Frame()
-	r.click("内容")
-	if r.m.v.CaptureFileExtensions != prefs.DefaultCaptureFileExtensions {
-		t.Fatalf("blank list not replaced: %q", r.m.v.CaptureFileExtensions)
+	if r.m.v.CaptureFileExtensions != "" || !r.m.v.StartWithWindows {
+		t.Fatal("view not refreshed")
 	}
-	if !r.set.Get().StartWithWindows {
-		t.Fatal("autostart state of the system not taken")
+	if r.set.Get().StartWithWindows {
+		t.Fatal("opening wrote settings")
 	}
 }
 
@@ -230,7 +218,7 @@ func TestStorageAndSyncButtons(t *testing.T) {
 	r := newRig(t, "")
 	r.click("内容")
 	r.click("打开")
-	// the sync buttons are for a signed-in user
+	// Sync actions require a confirmed subscription.
 	_ = r.set.Update(func(s *model.Settings) {
 		s.AuthRefreshToken = model.Ptr("r")
 		s.AuthUserEmail = model.Ptr("me@example.com")
@@ -238,6 +226,8 @@ func TestStorageAndSyncButtons(t *testing.T) {
 	r.m.Open()
 	r.tt.Frame()
 	r.click("云同步")
+	r.m.sub = account.Subscription{Subscribed: true, Status: "已订阅"}
+	r.tt.Frame()
 	r.click("立即同步")
 	if r.host.storage != 1 || r.host.sync != 1 {
 		t.Fatalf("%+v", r.host)
@@ -434,5 +424,169 @@ func TestPasswordDialogKeepsTheKeys(t *testing.T) {
 	r.tt.Frame()
 	if r.has("找回密码") || !r.has("忘记密码") {
 		t.Fatalf("Escape did not close the dialog: %q", r.tt.Texts())
+	}
+}
+
+func TestFileExtensionsStayDraftWithoutSuccessToasts(t *testing.T) {
+	r := newRig(t, "")
+	r.click("内容")
+	r.tt.Scroll(300, 400, 0, 180)
+	r.tt.Frame()
+	r.click("文件后缀列表")
+	r.tt.Key(ui.Cmd, ui.KeyA)
+	for _, text := range []string{".", "j", "s", "o", "n"} {
+		r.tt.Type(text)
+		r.tt.Advance(time.Second)
+		if r.has("设置已生效") {
+			t.Fatal("autosave interrupted typing")
+		}
+	}
+	if !strings.Contains(r.m.v.CaptureFileExtensions, "json") {
+		t.Fatal("draft lost")
+	}
+	r.click("保存")
+	if r.set.Get().CaptureFileExtensions != ".json" {
+		t.Fatal("explicit save failed")
+	}
+}
+
+func (h *fakeHost) ChangeStorage()          {}
+func (h *fakeHost) StorageLocation() string { return "test storage" }
+
+func TestSaveAndCloseCommitsDraft(t *testing.T) {
+	r := newRig(t, "")
+	r.click("内容")
+	r.click("捕获文本")
+	r.m.RequestClose()
+	r.tt.Frame()
+	r.click("保存并关闭")
+	if r.host.closed != 1 || r.set.Get().CaptureText || r.m.Dirty() {
+		t.Fatal("save-and-close failed")
+	}
+}
+func TestFailedSaveAndCloseKeepsWindowOpen(t *testing.T) {
+	r := newRig(t, "")
+	r.m.v.MaxItems = "invalid"
+	r.m.RequestClose()
+	r.tt.Frame()
+	r.click("保存并关闭")
+	if r.host.closed != 0 || !r.m.Dirty() {
+		t.Fatal("invalid draft closed window")
+	}
+}
+
+func TestUnsavedDialogPreservesBackgroundAndBlocksEditing(t *testing.T) {
+	r := newRig(t, "")
+	r.click("内容")
+	r.click("捕获文本")
+	original := r.m.v.CaptureText
+	r.m.RequestClose()
+	r.tt.Frame()
+	for _, text := range []string{"历史", "捕获文本", "文件后缀", "设置尚未保存"} {
+		if !r.has(text) {
+			t.Fatalf("background or dialog missing %q: %v", text, r.tt.Texts())
+		}
+	}
+	// The modal must shield background input while keeping it in the render tree.
+	r.click("捕获文本")
+	if r.m.v.CaptureText != original {
+		t.Fatal("modal allowed background editing")
+	}
+	r.tt.Key(0, ui.KeyEscape)
+	r.tt.Frame()
+	if r.m.confirmClose || !r.m.Dirty() || r.host.closed != 0 {
+		t.Fatal("Escape lost draft or closed window")
+	}
+	if !r.has("文件后缀") {
+		t.Fatal("background did not remain after dismiss")
+	}
+}
+
+func TestCloudDetailsFollowSubscriptionState(t *testing.T) {
+	r := newRig(t, "")
+	_ = r.set.Update(func(s *model.Settings) {
+		s.AuthRefreshToken = model.Ptr("r")
+		s.AuthUserEmail = model.Ptr("me@example.com")
+	})
+	r.m.Open()
+	r.settle()
+	r.click("云同步")
+	r.m.SyncStatus = func() string { return "同步失败" }
+	for _, state := range []account.Subscription{account.None("未订阅"), account.Loading(), account.None("查询失败")} {
+		r.m.sub = state
+		r.tt.Frame()
+		for _, hidden := range []string{"立即同步", "同步失败", "套餐", "存储占用", "保留天数", "超限状态"} {
+			if r.has(hidden) {
+				t.Fatalf("%s should hide %s", state.Status, hidden)
+			}
+		}
+		for _, visible := range []string{"订阅状态", "刷新", "兑换卡密", "退出登录"} {
+			if !r.has(visible) {
+				t.Fatalf("missing %s", visible)
+			}
+		}
+	}
+	r.m.sub = account.Subscription{Subscribed: true, Status: "已订阅", Tier: "Mini", Storage: "1 MB / 1 GB", Retention: "30 天", Limit: "正常"}
+	r.tt.Frame()
+	for _, label := range []string{"立即同步", "套餐", "存储占用", "保留天数", "超限状态"} {
+		if !r.has(label) {
+			t.Fatalf("subscribed view missing %s", label)
+		}
+	}
+	r.m.sub = account.None("未订阅")
+	r.tt.Frame()
+	if r.has("套餐") {
+		t.Fatal("expired details remained")
+	}
+}
+
+func TestProfessionalSettingsFooterFits(t *testing.T) {
+	r := newRig(t, "")
+	r.click("内容")
+	r.click("捕获文本")
+	for _, label := range []string{"保存", "关闭"} {
+		rect, ok := r.tt.Find(label)
+		if !ok || rect.X < 0 || rect.Y < 0 || rect.X+rect.W > Width || rect.Y+rect.H > Height {
+			t.Fatalf("footer %s clipped: %+v", label, rect)
+		}
+	}
+	r.m.RequestClose()
+	r.tt.Frame()
+	for _, label := range []string{"继续编辑", "放弃修改", "保存并关闭"} {
+		rect, ok := r.tt.Find(label)
+		if !ok || rect.X+rect.W > Width || rect.Y+rect.H > Height {
+			t.Fatalf("dialog %s clipped: %+v", label, rect)
+		}
+	}
+}
+
+func TestQuitWaitsForUnsavedEdits(t *testing.T) {
+	r := newRig(t, "")
+	quits := 0
+	if r.m.RequestQuit(func() { quits++ }) {
+		t.Fatal("a clean window held the quit")
+	}
+	r.click("内容")
+	r.click("捕获文本")
+	if !r.m.RequestQuit(func() { quits++ }) || quits != 0 {
+		t.Fatal("unsaved edits did not hold the quit")
+	}
+	r.tt.Frame()
+	r.click("继续编辑")
+	if quits != 0 || !r.m.Dirty() || r.m.quitAfter != nil {
+		t.Fatal("continue editing did not call the quit off")
+	}
+	r.m.RequestQuit(func() { quits++ })
+	r.tt.Frame()
+	r.click("保存并退出")
+	if quits != 1 || r.set.Get().CaptureText || r.host.closed != 0 {
+		t.Fatalf("save and quit: quits %d, saved %v", quits, !r.set.Get().CaptureText)
+	}
+	r.click("捕获文本")
+	r.m.RequestQuit(func() { quits++ })
+	r.tt.Frame()
+	r.click("放弃修改")
+	if quits != 2 || r.set.Get().CaptureText || r.m.Dirty() {
+		t.Fatal("discard and quit")
 	}
 }
