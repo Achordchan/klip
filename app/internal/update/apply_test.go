@@ -1116,4 +1116,67 @@ func TestFailedLaunchIsUndoneEvenWhenTheCommittedJournalIsStuck(t *testing.T) {
 	if len(r.launched) != 1 {
 		t.Fatalf("the old program was not started again: %v", r.launched)
 	}
+	if _, err := os.Stat(rollbackPath(r.install)); !os.IsNotExist(err) {
+		t.Fatal("the rollback marker stayed after a whole undo")
+	}
+}
+
+func TestRollbackMarkerIsHonouredOverACommittedJournal(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	h := r.hooks().fill()
+	var rollback []rollbackItem
+	if err := applyFiles(r.plan, h, logger{r.plan.LogPath, h.Now}, &rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCommitted(r.install, rollback); err != nil {
+		t.Fatal(err)
+	}
+	// The undo was begun, recorded by the marker, and cut short.
+	if err := saveRollback(r.install, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if needed, err := recoveryNeeded(r.install); !needed || err != nil {
+		t.Fatalf("startup passes over a rollback marker: %v %v", needed, err)
+	}
+	if err := RecoverInterruptedUpdate(r.install); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "OLD EXE" {
+		t.Fatalf("the undo was not finished: %q", got)
+	}
+	for _, p := range []string{rollbackPath(r.install), recoveryPath(r.install)} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s stayed", filepath.Base(p))
+		}
+	}
+	if needed, _ := recoveryNeeded(r.install); needed {
+		t.Fatal("recovery is asked for again")
+	}
+}
+
+func TestNoUndoWithoutARecordOfIt(t *testing.T) {
+	r := newRig(t, newPkg, nil)
+	committed := false
+	prevWrite, prevRemove, prevRollback := writeJournal, removeJournal, writeRollback
+	defer func() { writeJournal, removeJournal, writeRollback = prevWrite, prevRemove, prevRollback }()
+	writeJournal = func(root string, b []byte) error {
+		if committed {
+			return errors.New("journal held")
+		}
+		committed = strings.Contains(string(b), `"committed":true`)
+		return prevWrite(root, b)
+	}
+	removeJournal = func(string) error { return errors.New("journal held") }
+	writeRollback = func(string, []rollbackItem) error { return errors.New("folder held") }
+	h := r.hooks()
+	h.Launch = func(string) error { return errors.New("the new program will not start") }
+	if err := RunPlan(r.plan, h); err == nil {
+		t.Fatal("a program that cannot start is a failed update")
+	}
+	if got := read(t, filepath.Join(r.install, "maccy.exe")); got != "NEW EXE" {
+		t.Fatalf("files were undone with no record of it: %q", got)
+	}
+	if len(r.alerts) != 1 || !strings.Contains(r.alerts[0], "没有回滚") {
+		t.Fatalf("alerts %v", r.alerts)
+	}
 }

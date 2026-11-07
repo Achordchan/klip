@@ -334,6 +334,7 @@ func RunPlan(p Plan, h Hooks) error {
 		}
 		if first == nil {
 			_ = os.Remove(recoveryPath(p.InstallDir))
+			_ = os.Remove(rollbackPath(p.InstallDir))
 		}
 		return first
 	}
@@ -371,6 +372,16 @@ func RunPlan(p Plan, h Hooks) error {
 			// does not start.
 			if jerr := saveRecovery(p.InstallDir, rollback); jerr != nil {
 				lg.say("cannot write the journal again: " + jerr.Error())
+				// A marker of its own, which startup honours over the journal.
+				// Without either nothing is undone: an undo cut short with no
+				// record of it would leave old and new files mixed, which no
+				// start would repair; the new version is at least whole.
+				if merr := writeRollback(p.InstallDir, rollback); merr != nil {
+					lg.say("cannot record the rollback: " + merr.Error())
+					h.Alert("Klip 更新失败", "新版本无法启动："+lerr.Error()+"\n\n也无法记录恢复信息（"+merr.Error()+"），为免新旧文件混杂，没有回滚。请重新下载安装包安装。日志："+p.LogPath)
+					report(err, false)
+					return err
+				}
 			}
 			if uerr := undo(); uerr != nil {
 				h.Alert("Klip 更新失败", "新版本无法启动："+lerr.Error()+"\n\n旧版本没能完全恢复（"+uerr.Error()+"），Klip 可能无法使用，请重新下载安装包安装。日志："+p.LogPath)

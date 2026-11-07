@@ -65,7 +65,27 @@ func saveCommitted(root string, items []rollbackItem) error {
 	return writeJournal(root, b)
 }
 
-func saveJournal(root string, b []byte) error {
+func saveJournal(root string, b []byte) error { return saveDurable(root, recoveryPath(root), b) }
+
+// rollbackPath is the rollback marker: the undo of an update that the
+// helper began while the journal could not be made to say so (a committed
+// journal that a scanner holds). Startup honours it before the journal, so
+// an undo cut short is finished, whatever the journal says.
+func rollbackPath(root string) string { return filepath.Join(root, ".klip-update-rollback.json") }
+
+// saveRollback writes the rollback marker, durably.
+func saveRollback(root string, items []rollbackItem) error {
+	b, err := json.Marshal(recoveryEntries(items))
+	if err != nil {
+		return err
+	}
+	return saveDurable(root, rollbackPath(root), b)
+}
+
+// writeRollback is saveRollback; tests make it fail.
+var writeRollback = saveRollback
+
+func saveDurable(root, path string, b []byte) error {
 	f, err := os.CreateTemp(root, ".recovery-*")
 	if err != nil {
 		return err
@@ -82,11 +102,31 @@ func saveJournal(root string, b []byte) error {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	return durable.Rename(f.Name(), recoveryPath(root))
+	return durable.Rename(f.Name(), path)
 }
 
 // RecoverInterruptedUpdate restores a recorded transaction before normal startup.
 func RecoverInterruptedUpdate(root string) error {
+	// A rollback marker first: an undo was begun, and is finished now, even
+	// over a journal that says the update was committed.
+	if b, err := os.ReadFile(rollbackPath(root)); err == nil {
+		var entries []recoveryEntry
+		if err := json.Unmarshal(b, &entries); err != nil {
+			return err
+		}
+		if err := restoreEntries(root, entries); err != nil {
+			return err
+		}
+		_ = durable.Remove(recoveryPath(root)) // the old version is back, whatever it says
+		// The marker must go, or every start would recover again; one that
+		// stays is a failed recovery (the helper then does not start Klip).
+		if err := durable.Remove(rollbackPath(root)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	b, err := os.ReadFile(recoveryPath(root))
 	if os.IsNotExist(err) {
 		return nil
@@ -111,6 +151,14 @@ func RecoverInterruptedUpdate(root string) error {
 	} else if err = json.Unmarshal(b, &entries); err != nil {
 		return err
 	}
+	if err := restoreEntries(root, entries); err != nil {
+		return err
+	}
+	return os.Remove(recoveryPath(root))
+}
+
+// restoreEntries puts back what the entries of a journal changed, last first.
+func restoreEntries(root string, entries []recoveryEntry) error {
 	restored := map[string]bool{}
 	for _, e := range entries {
 		if e.Moved {
@@ -162,7 +210,28 @@ func RecoverInterruptedUpdate(root string) error {
 			}
 		}
 	}
-	return os.Remove(recoveryPath(root))
+	return nil
+}
+
+// recoveryNeeded says whether startup must recover first: a rollback marker,
+// or a journal that is not committed. A committed journal alone is removed if
+// it can be, and needs nothing.
+func recoveryNeeded(root string) (bool, error) {
+	if _, err := os.Stat(rollbackPath(root)); err == nil {
+		return true, nil
+	} else if !os.IsNotExist(err) {
+		return true, err
+	}
+	if _, err := os.Stat(recoveryPath(root)); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return true, err
+	}
+	if journalCommitted(root) {
+		_ = durable.Remove(recoveryPath(root))
+		return false, nil
+	}
+	return true, nil
 }
 
 // journalCommitted says that the journal in root is that of an update that
@@ -180,14 +249,9 @@ func journalCommitted(root string) bool {
 // A committed journal needs no recovery: it is removed if it can be, and the
 // program starts either way (were it kept, every start would recover again).
 func StartRecovery(root string) (bool, error) {
-	if _, err := os.Stat(recoveryPath(root)); os.IsNotExist(err) {
-		return false, nil
-	} else if err != nil {
-		return true, err
-	}
-	if journalCommitted(root) {
-		_ = durable.Remove(recoveryPath(root))
-		return false, nil
+	needed, err := recoveryNeeded(root)
+	if !needed || err != nil {
+		return needed, err
 	}
 	exe, err := os.Executable()
 	if err != nil {
