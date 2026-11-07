@@ -3,6 +3,7 @@ package paths
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -71,12 +72,14 @@ func Current() (Layout, error) {
 		return Layout{}, err
 	}
 	b, err := os.ReadFile(p)
+	fromLegacy := false
 	if os.IsNotExist(err) {
 		legacy, lerr := legacySelectionPath()
 		if lerr != nil {
 			return Layout{}, lerr
 		}
 		b, err = os.ReadFile(legacy)
+		fromLegacy = err == nil
 	}
 	if os.IsNotExist(err) {
 		return def, nil
@@ -98,7 +101,15 @@ func Current() (Layout, error) {
 	if !st.IsDir() {
 		return Layout{}, errors.New("storage location is not a directory")
 	}
-	return Layout{Root: filepath.Clean(v.Root)}, nil
+	root := filepath.Clean(v.Root)
+	if fromLegacy {
+		// The old place is inside the folder that is now the backup: write the
+		// choice where deleting that folder leaves it, before relying on it.
+		if err := SaveSelection(p, root); err != nil {
+			return Layout{}, fmt.Errorf("cannot keep the storage location outside the old data folder: %w", err)
+		}
+	}
+	return Layout{Root: root}, nil
 }
 func SaveSelection(path, root string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {

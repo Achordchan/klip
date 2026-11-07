@@ -19,17 +19,25 @@ func (c *Controller) Save(base, draft View) error {
 		}
 		return n, nil
 	}
-	items, err := number("最大条目数", draft.MaxItems)
-	if err != nil {
-		return err
+	// Only a number this window changed is read: one it did not touch stays
+	// as stored, even outside what the window accepts (a very large maximum
+	// set elsewhere), as apply leaves it.
+	var items, mb, fileMB int
+	var err error
+	if draft.MaxItems != base.MaxItems {
+		if items, err = number("最大条目数", draft.MaxItems); err != nil {
+			return err
+		}
 	}
-	mb, err := number("最大容量", draft.MaxMegabytes)
-	if err != nil {
-		return err
+	if draft.MaxMegabytes != base.MaxMegabytes {
+		if mb, err = number("最大容量", draft.MaxMegabytes); err != nil {
+			return err
+		}
 	}
-	fileMB, err := number("单文件上限", draft.CaptureFileMaxMegabytes)
-	if err != nil {
-		return err
+	if draft.CaptureFileMaxMegabytes != base.CaptureFileMaxMegabytes {
+		if fileMB, err = number("单文件上限", draft.CaptureFileMaxMegabytes); err != nil {
+			return err
+		}
 	}
 	apply := func(s *model.Settings) {
 		if draft.StartWithWindows != base.StartWithWindows {

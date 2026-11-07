@@ -71,4 +71,13 @@ func TestLegacySelectionIsStillRead(t *testing.T) {
 	if got.Root != filepath.Clean(moved) {
 		t.Fatalf("data folder %s, want %s", got.Root, moved)
 	}
+	// It was written to the new place: deleting the old data folder, with
+	// the old file in it, keeps it.
+	def, _ := Default()
+	if err := os.RemoveAll(def.Root); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Current(); err != nil || got.Root != filepath.Clean(moved) {
+		t.Fatalf("after deleting the old folder: %v, %v", got, err)
+	}
 }

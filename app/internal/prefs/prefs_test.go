@@ -313,3 +313,24 @@ func (r *raceAuto) SetEnabled(on bool) error {
 	}
 	return r.fakeAuto.SetEnabled(on)
 }
+
+func TestSaveLeavesUntouchedNumbersAlone(t *testing.T) {
+	c, m, _, _ := newCtl(t)
+	_ = m.Update(func(s *model.Settings) { s.MaxItems = 2147483647 }) // "no limit", set elsewhere
+	base := c.CurrentView()
+	draft := base
+	draft.CaptureText = !base.CaptureText
+	if err := c.Save(base, draft); err != nil {
+		t.Fatalf("an unrelated edit failed on an untouched number: %v", err)
+	}
+	if got := m.Get(); got.MaxItems != 2147483647 || got.CaptureText == base.CaptureText {
+		t.Fatalf("settings %+v", got)
+	}
+	// A number the window changes is still checked.
+	base = c.CurrentView()
+	draft = base
+	draft.MaxItems = "0"
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("an invalid edited number was saved")
+	}
+}
