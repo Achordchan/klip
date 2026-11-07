@@ -1165,3 +1165,54 @@ func TestHighBitDepthImageStaysPNG(t *testing.T) {
 		t.Fatalf("hash %s", model.Str(it.ContentHash))
 	}
 }
+
+func TestPictureTooLongForWebPStaysPNG(t *testing.T) {
+	r := newRig(t)
+	img := image.NewNRGBA(image.Rect(0, 0, 2, imagecodec.WebPMaxDimension+1))
+	for i := range img.Pix {
+		img.Pix[i] = uint8(i)
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	r.clip.formats, r.clip.image = []string{"image/png"}, b.Bytes()
+	r.capture()
+	if r.h.Len() != 1 {
+		t.Fatal("a long screenshot was not captured")
+	}
+	if p := model.Str(r.h.Items()[0].ImageFilePath); filepath.Ext(p) != ".png" {
+		t.Fatalf("stored as %s", p)
+	}
+}
+
+func TestClipboardPNGCopiesDoNotAccumulate(t *testing.T) {
+	r := newRig(t)
+	var items []model.Item
+	for i := 0; i < 3; i++ {
+		img := image.NewNRGBA(image.Rect(0, 0, 3, 3))
+		img.Pix[0] = uint8(i + 1)
+		var b bytes.Buffer
+		if err := png.Encode(&b, img); err != nil {
+			t.Fatal(err)
+		}
+		r.clip.formats, r.clip.image = []string{"image/png"}, b.Bytes()
+		r.now = r.now.Add(time.Minute)
+		r.capture()
+		items = append(items, r.h.Items()[0])
+	}
+	// A side file left by a write that stopped goes too.
+	write(t, filepath.Join(r.s.ClipboardDir, ".klip-png-stale"), []byte("x"))
+	for _, it := range items {
+		if err := r.s.Apply(it); err != nil {
+			t.Fatal(err)
+		}
+		ents, err := os.ReadDir(r.s.ClipboardDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ents) != 1 || filepath.Join(r.s.ClipboardDir, ents[0].Name()) != r.clip.wroteWith {
+			t.Fatalf("clipboard copies: %v, current %s", ents, r.clip.wroteWith)
+		}
+	}
+}

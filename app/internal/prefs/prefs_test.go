@@ -225,3 +225,35 @@ func TestAutostartReconcilesPortableSetting(t *testing.T) {
 		t.Fatalf("OS entry not enabled: %+v", e)
 	}
 }
+
+func TestFailedSaveRollsBackOnlyItsOwnFields(t *testing.T) {
+	c, m, _, path := newCtl(t)
+	base := c.CurrentView()
+	// The file cannot be written: a directory stands where it goes.
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Somebody else (a sync) changes another setting while the save is under
+	// way, after its update and before its rollback.
+	once := false
+	m.OnChange(func(st model.Settings) {
+		if once {
+			return
+		}
+		once = true
+		_ = m.Update(func(s *model.Settings) { s.MaxItems = 777 })
+	})
+	draft := base
+	draft.CaptureText = !base.CaptureText
+	draft.StoreImagesAsWebP = !base.StoreImagesAsWebP
+	if err := c.Save(base, draft); err == nil {
+		t.Fatal("a save that cannot be written succeeded")
+	}
+	got := m.Get()
+	if got.CaptureText != base.CaptureText || got.StoreImagesAsWebP() != base.StoreImagesAsWebP {
+		t.Fatalf("own fields not rolled back: %+v", got)
+	}
+	if got.MaxItems != 777 {
+		t.Fatalf("rollback undid a concurrent change: MaxItems %d", got.MaxItems)
+	}
+}

@@ -598,8 +598,9 @@ func (s *Service) fileListBytes(id string, files []string) int64 {
 // full or the folder cannot be written, as against data that is no picture.
 var errStorage = errors.New("capture: cannot store the picture")
 
-// saveImage stores lossless WebP by default, or PNG when disabled or when the
-// picture has more than 8 bits per channel (WebP would lose them).
+// saveImage stores lossless WebP by default, or PNG when disabled, when the
+// picture has more than 8 bits per channel (WebP would lose them) or when it
+// is wider or taller than WebP allows.
 //
 // A picture has two possible fingerprints: the hash of its PNG bytes (what
 // C# and earlier versions store, and what a PNG kept as it came gives back
@@ -634,7 +635,7 @@ func (s *Service) saveImage(data []byte) (path, hash string, size int64, err err
 	legacy := hashOf("img", data)
 	deep := imagecodec.HighDepth(img)
 	s.setMu.RLock()
-	webp := s.storeWebP && !deep
+	webp := s.storeWebP && !deep && imagecodec.FitsWebP(img.Bounds())
 	s.setMu.RUnlock()
 	hash = legacy
 	if !deep {
@@ -692,9 +693,13 @@ func (s *Service) knownImageHash(fallback string, candidates ...string) string {
 	return fallback
 }
 
-// clipboardPNG writes the PNG of a picture kept in another format next to the
-// other such copies, so that a paste as a file gets a PNG as before. It
-// returns "" when it cannot: the picture then goes without a file.
+// clipboardPNG writes the PNG of a picture kept in another format, so that a
+// paste as a file gets a PNG as before. It returns "" when it cannot: the
+// picture then goes without a file.
+//
+// Only the copy just written is kept: the clipboard holds one picture, and
+// the copies of the ones before it are needed by nobody, so the folder never
+// holds more than one.
 func (s *Service) clipboardPNG(stored string, data []byte) string {
 	dir := s.ClipboardDir
 	if dir == "" {
@@ -706,6 +711,7 @@ func (s *Service) clipboardPNG(stored string, data []byte) string {
 	base := filepath.Base(stored)
 	path := filepath.Join(dir, strings.TrimSuffix(base, filepath.Ext(base))+".png")
 	if got, err := os.ReadFile(path); err == nil && bytes.Equal(got, data) {
+		s.pruneClipboardPNGs(dir, path)
 		return path
 	}
 	f, err := os.CreateTemp(dir, ".klip-png-*")
@@ -721,7 +727,26 @@ func (s *Service) clipboardPNG(stored string, data []byte) string {
 		os.Remove(tmp)
 		return ""
 	}
+	s.pruneClipboardPNGs(dir, path)
 	return path
+}
+
+// pruneClipboardPNGs removes from dir the copies other than keep, and side
+// files left by a write that stopped.
+func (s *Service) pruneClipboardPNGs(dir, keep string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		p := filepath.Join(dir, e.Name())
+		if e.IsDir() || samePath(p, keep) {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(e.Name()), ".png") || strings.HasPrefix(e.Name(), ".klip-png-") {
+			os.Remove(p)
+		}
+	}
 }
 
 // hashOf is "<prefix>:<SHA-256 in upper case hex>", what C# stores in

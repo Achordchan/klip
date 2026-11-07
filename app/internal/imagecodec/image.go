@@ -145,3 +145,12 @@ func Normalize(im image.Image) *image.NRGBA {
 func CanonicalPNG(im image.Image) ([]byte, error) {
 	return Encode(Normalize(im), "png")
 }
+
+// WebPMaxDimension is the largest width or height a WebP image can have.
+const WebPMaxDimension = 16384
+
+// FitsWebP says whether a picture of these bounds can be stored as WebP (a
+// long scrolling screenshot may be taller).
+func FitsWebP(b image.Rectangle) bool {
+	return b.Dx() > 0 && b.Dy() > 0 && b.Dx() <= WebPMaxDimension && b.Dy() <= WebPMaxDimension
+}

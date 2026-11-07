@@ -31,14 +31,19 @@ func (c *Controller) Save(base, draft View) error {
 	if fileMB > mb {
 		return fmt.Errorf("单文件上限不能超过最大容量")
 	}
-	old := c.Settings.Get()
 	oldAuto := c.Autostart.IsEnabled()
+	// before and after are taken inside the update, under the settings lock:
+	// a rollback then puts back only what this save changed, and leaves a
+	// change made by somebody else since (a sync, the account) alone.
+	var before, after model.Settings
 	if draft.StartWithWindows != base.StartWithWindows {
 		if err = c.Autostart.SetEnabled(draft.StartWithWindows); err != nil {
 			return err
 		}
 	}
 	err = c.Settings.Update(func(s *model.Settings) {
+		before = *s
+		defer func() { after = *s }()
 		if draft.StartWithWindows != base.StartWithWindows {
 			s.StartWithWindows = draft.StartWithWindows
 		}
@@ -83,11 +88,12 @@ func (c *Controller) Save(base, draft View) error {
 		}
 	})
 	if err != nil {
-		installed := c.Settings.Get()
 		_ = c.Settings.Update(func(s *model.Settings) {
-			s.RestorePortable(installed, old)
-			if draft.StoreImagesAsWebP != base.StoreImagesAsWebP {
-				s.SetStoreImagesAsWebP(old.StoreImagesAsWebP())
+			// A field this save did not change has the same value in before
+			// and after: RestorePortable leaves it as it is now.
+			s.RestorePortable(after, before)
+			if draft.StoreImagesAsWebP != base.StoreImagesAsWebP && s.StoreImagesAsWebP() == after.StoreImagesAsWebP() {
+				s.SetStoreImagesAsWebP(before.StoreImagesAsWebP())
 			}
 		})
 		if draft.StartWithWindows != base.StartWithWindows {
