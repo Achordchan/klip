@@ -11,6 +11,8 @@ import (
 // button, by pressing the chip again, or when the main window goes.
 type Manager struct {
 	Version string
+	// Parent keeps the About window above the panel without a global z-order workaround.
+	Parent *mygo.Window
 	// Quitting says the program is quitting: the window then lets itself be
 	// closed instead of hiding, or Quit would wait for it for ever.
 	Quitting func() bool
@@ -40,6 +42,7 @@ func (mg *Manager) Toggle(anchorX, anchorY int) {
 		if mg.win == nil {
 			mg.win = mygo.NewWindow(mygo.WindowOptions{
 				Title:         "关于 Klip",
+				Parent:        mg.Parent,
 				Panel:         true,
 				Frameless:     true,
 				Transparent:   true,
@@ -65,6 +68,13 @@ func (mg *Manager) Toggle(anchorX, anchorY int) {
 		mg.win.ShowInactive()
 		mg.model.LoadAvatar()
 	})
+}
+
+// Visible reports whether About is open, independently of keyboard focus.
+func (mg *Manager) Visible() bool {
+	mg.mu.Lock()
+	defer mg.mu.Unlock()
+	return mg.win != nil && mg.win.IsVisible()
 }
 
 func (mg *Manager) workArea(x, y int) [4]int {

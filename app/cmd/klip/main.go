@@ -180,7 +180,8 @@ func (p *program) ready() {
 		e.PreventDefault()
 		p.hide()
 	})
-	p.win.OnBlur(p.hide)
+	p.win.OnBlur(p.onWindowBlur)
+	p.about.Parent = p.win
 
 	registered := ""
 	for _, s := range shortcuts {
@@ -230,6 +231,7 @@ func (p *program) ready() {
 	mygo.App.OnQuit(p.stopShelf)
 	mygo.App.OnQuit(p.app.Stop)
 	p.app.Start()
+	p.showCentered()
 }
 
 // startShelf makes the shelf follow the settings. It is a Windows feature: it
@@ -411,11 +413,13 @@ func (p *program) showPrefs() {
 			p.redraw()
 		}
 		p.prefsWin = mygo.NewWindow(mygo.WindowOptions{
-			Title:         "设置",
-			Width:         prefswin.Width,
-			Height:        prefswin.Height,
-			DisableResize: true,
-			Content:       ui.View(p.prefs.View),
+			Title:          "设置",
+			UseContentSize: true,
+			Parent:         p.win,
+			Width:          prefswin.Width,
+			Height:         prefswin.Height,
+			DisableResize:  true,
+			Content:        ui.View(p.prefs.View),
 		})
 		p.prefsWin.OnClose(func(e *mygo.CloseEvent) {
 			if p.quitting.Load() {
@@ -425,8 +429,9 @@ func (p *program) showPrefs() {
 			p.prefs.RequestClose()
 		})
 	}
-	p.hide()
-	p.prefs.Open()
+	if !p.prefsWin.IsVisible() {
+		p.prefs.Open()
+	}
 	p.prefsWin.Show()
 	p.prefsWin.Focus()
 }
@@ -526,7 +531,7 @@ func (h prefsHost) OpenStorage()           { _ = mygo.Shell.OpenPath(h.p.layout.
 func (h prefsHost) CheckUpdates() func()   { return h.p.checkUpdates }
 func (h prefsHost) SyncNow()               { h.p.app.SyncNow() }
 func (h prefsHost) AccountChanged(in bool) { h.p.app.AccountChanged(in) }
-func (h prefsHost) Close()                 { h.p.prefsWin.Hide() }
+func (h prefsHost) Close()                 { h.p.closePreferences() }
 
 // updHost is what the update windows ask of the program.
 type updHost struct{ p *program }
