@@ -423,13 +423,39 @@ func TestDownloadChecks(t *testing.T) {
 	s.fail.Store(0)
 	gone := info
 	gone.PackageURL = s.URL + "/nope.zip"
-	if _, err := c.DownloadPackage(context.Background(), gone, root, nil); err == nil || s.hits.Load() != 1 {
+	// In a folder of its own: the package already downloaded above, whole,
+	// would be taken as it is (download keeps a verified file).
+	if _, err := c.DownloadPackage(context.Background(), gone, t.TempDir(), nil); err == nil || s.hits.Load() != 1 {
 		t.Errorf("404: %v after %d hits", err, s.hits.Load())
 	}
 	other := info
 	other.PackageRuntime = "linux-x64"
 	if _, err := c.DownloadPackage(context.Background(), other, root, nil); err == nil || err.Error() != "manifest package is not supported by this client" {
 		t.Errorf("other runtime: %v", err)
+	}
+}
+
+func TestVerifiedDownloadIsKept(t *testing.T) {
+	s := newServer(t)
+	z := zipOf(t, "1.0.11", "win-x64", map[string]string{"maccy.exe": "EXE"}, nil)
+	s.files["/p.zip"] = z
+	c := fastClient(s, "1.0.10")
+	root := t.TempDir()
+	info := pkgInfo("1.0.11", z, s.URL)
+	if _, err := c.DownloadPackage(context.Background(), info, root, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.hits.Store(0)
+	if _, err := c.DownloadPackage(context.Background(), info, root, nil); err != nil || s.hits.Load() != 0 {
+		t.Fatalf("a whole package was downloaded again: %v, %d hits", err, s.hits.Load())
+	}
+	// One that is not whole any more is downloaded again.
+	zp := filepath.Join(root, "packages", "maccy-1.0.11-win-x64.zip")
+	if err := os.WriteFile(zp, []byte("cut short"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DownloadPackage(context.Background(), info, root, nil); err != nil || s.hits.Load() != 1 {
+		t.Fatalf("a damaged package was kept: %v, %d hits", err, s.hits.Load())
 	}
 }
 

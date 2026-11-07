@@ -62,6 +62,8 @@ type Coordinator struct {
 	Supported bool
 	// StartHelper starts the helper (the package's own by default).
 	StartHelper func(helperExe, planPath string) error
+	// StopHelper, with StartHelper, stops the helper it started (tests).
+	StopHelper func()
 	// Now is time.Now unless a test sets it.
 	Now func() time.Time
 
@@ -72,6 +74,20 @@ type Coordinator struct {
 	state    State
 	busy     bool
 	applying bool
+	// prepared is the package of the newer version, downloaded and unpacked
+	// in the background (Prepare) and waiting to be installed; preparing says
+	// that Prepare is at work. Neither is part of State: nobody asked, and
+	// the windows must not show it.
+	prepared  *Prepared
+	preparing bool
+	// afterDownload, for tests, runs in Prepare between the download and the
+	// publication of what it made.
+	afterDownload func()
+	// failCommit, for tests, makes the commit file fail to be written.
+	failCommit func() error
+	// helperStop stops and reaps the helper last started, which waits for
+	// this process to exit (nil when none was). Under mu.
+	helperStop func() error
 }
 
 // NewCoordinator returns a Coordinator for the running program.
@@ -280,9 +296,14 @@ func (c *Coordinator) Apply(ctx context.Context) {
 		notice = "安装目录需要管理员权限，将改用完整安装包更新。"
 	}
 	if info.HasSupportedPackage(c.Client.runtime()) && canWrite {
-		prep, err := c.Client.DownloadPackage(ctx, *info, c.Root, progress)
+		// The package made ready in the background, if it is this version's:
+		// no need to download it again.
+		prep, err := c.takePrepared(info.Version), error(nil)
+		if prep == nil {
+			prep, err = c.Client.DownloadPackage(ctx, *info, c.Root, progress)
+		}
 		if err == nil {
-			err = c.startPackage(prep)
+			err = c.startPackage(prep, "")
 			if err == nil {
 				c.done()
 				return
@@ -406,7 +427,16 @@ func (c *Coordinator) helperCopy(version string) (string, error) {
 
 func (c *Coordinator) spawn(helper, plan string) error {
 	if c.StartHelper != nil {
-		return c.StartHelper(helper, plan)
+		if err := c.StartHelper(helper, plan); err != nil {
+			return err
+		}
+		c.setHelperStop(func() error {
+			if c.StopHelper != nil {
+				c.StopHelper()
+			}
+			return nil
+		})
+		return nil
 	}
 	p, err := ReadPlan(plan)
 	if err != nil {
@@ -425,7 +455,17 @@ func (c *Coordinator) spawn(helper, plan string) error {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err = os.Stat(p.ReadyFile); err == nil {
-			go cmd.Wait()
+			reaped := make(chan struct{})
+			go func() { _ = cmd.Wait(); close(reaped) }()
+			c.setHelperStop(func() error {
+				// It still waits for this process, which is alive: it has
+				// touched nothing, and may go.
+				if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					return err
+				}
+				<-reaped
+				return nil
+			})
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -437,7 +477,28 @@ func (c *Coordinator) spawn(helper, plan string) error {
 	return errors.New("update helper readiness timed out")
 }
 
-func (c *Coordinator) startPackage(p *Prepared) error {
+func (c *Coordinator) setHelperStop(f func() error) {
+	c.mu.Lock()
+	c.helperStop = f
+	c.mu.Unlock()
+}
+
+// stopHelper stops the helper last started, if any.
+func (c *Coordinator) stopHelper() error {
+	c.mu.Lock()
+	f := c.helperStop
+	c.helperStop = nil
+	c.mu.Unlock()
+	if f == nil {
+		return nil
+	}
+	return f()
+}
+
+// startPackage starts the helper on p. A quiet install passes commitFile, the
+// file the helper must find before it touches anything (Plan.CommitFile); it
+// is a new name for each attempt, never one a file can already be at.
+func (c *Coordinator) startPackage(p *Prepared, commitFile string) error {
 	for _, f := range p.Manifest.Files {
 		target, err := insideRoot(filepath.Dir(c.Exe), f.Path)
 		if err != nil {
@@ -461,6 +522,8 @@ func (c *Coordinator) startPackage(p *Prepared) error {
 		LogPath:           filepath.Join(c.Root, "last_light_update.log"),
 		Version:           p.Version,
 		ResultPath:        c.ResultPath(),
+		Quiet:             commitFile != "",
+		CommitFile:        commitFile,
 	}
 	return c.launchPlan(plan, p.Version)
 }
@@ -494,12 +557,20 @@ func (c *Coordinator) CleanOld() {
 	// helper and the staged files are for the update that is about to run.
 	c.mu.Lock()
 	applying := c.applying
+	if !applying {
+		// The staging goes, and with it what Prepare unpacked there (it may
+		// have run first, both start with the program): forgotten, so that
+		// it is unpacked again from the kept zip, not handed to a helper that
+		// would find it gone.
+		c.prepared = nil
+	}
 	c.mu.Unlock()
 	if applying {
 		return
 	}
 	_ = os.RemoveAll(filepath.Join(c.Root, "helper"))
 	_ = os.RemoveAll(filepath.Join(c.Root, "staging"))
+	removeCommits(c.Root)
 	c.removeOldDownloads(filepath.Join(c.Root, "packages"))
 	c.removeOldDownloads(c.Root)
 	keepNewestBackup(filepath.Join(c.Root, "backups"))

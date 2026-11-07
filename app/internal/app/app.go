@@ -428,6 +428,12 @@ func (a *App) Start() {
 				return
 			case <-t.C:
 				a.Updates.Refresh(ctx)
+				// A newer version that can be installed without the user is
+				// made ready now, quietly; the program installs it when the
+				// user is away (cmd/klip, autoInstall).
+				if err := a.Updates.Prepare(ctx); err != nil && ctx.Err() == nil {
+					a.cfg.Logf("update prepare: %v", err)
+				}
 				t.Reset(every)
 			}
 		}
@@ -839,6 +845,21 @@ func (a *App) AccountChanged(signedIn bool) {
 }
 
 // SyncStatus is the text for the window's footer: how the last sync went.
+// Syncing says whether a sync is running, of either kind: an update that
+// quits the program waits until it is not.
+func (a *App) Syncing() bool { return a.syncing.Load() > 0 }
+
+// ReserveQuit keeps any sync from starting, without waiting, when none runs
+// (syncer.Auto.Reserve): the quiet update takes it right before it quits the
+// program. ok is false when a sync, or the work that holds the runner (an
+// upload after a deletion), is under way.
+func (a *App) ReserveQuit() (release func(), ok bool) {
+	if a.Syncing() {
+		return nil, false
+	}
+	return a.Auto.Reserve()
+}
+
 func (a *App) SyncStatus() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
