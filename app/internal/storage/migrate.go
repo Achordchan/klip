@@ -46,6 +46,32 @@ func Validate(source, target string) (string, error) {
 	return dst, nil
 }
 
+// relUnder gives the place of p below root, when p is below it. The spelling
+// decides first; then, as for sameOrWithin, the identity of each folder above
+// p: a path saved with another capitalization, or through another name of the
+// folder (/var and /private/var on macOS), names the same files and is moved
+// with them.
+func relUnder(root string, rootInfo os.FileInfo, p string) (string, bool) {
+	if p == "" || !filepath.IsAbs(p) {
+		return "", false
+	}
+	if inside(root, p) {
+		rel, err := filepath.Rel(root, p)
+		return rel, err == nil
+	}
+	for q := filepath.Dir(p); ; {
+		if info, err := os.Stat(q); err == nil && os.SameFile(info, rootInfo) {
+			rel, err := filepath.Rel(q, p)
+			return rel, err == nil
+		}
+		up := filepath.Dir(q)
+		if up == q {
+			return "", false
+		}
+		q = up
+	}
+}
+
 // sameOrWithin says whether path is root or below it by what the file system
 // says, not by the spelling: on a volume that ignores case (macOS, Windows),
 // /data/Klip and /data/klip/new are one inside the other while their names
@@ -167,9 +193,12 @@ func Migrate(source, target, selection string, progress func(int, int)) error {
 		if err = json.Unmarshal(b, &items); err != nil {
 			return fmt.Errorf("历史记录无法解析：%w", err)
 		}
+		srcInfo, err := os.Stat(src)
+		if err != nil {
+			return err
+		}
 		remap := func(p string) string {
-			if p != "" && inside(src, p) {
-				rel, _ := filepath.Rel(src, p)
+			if rel, ok := relUnder(src, srcInfo, p); ok {
 				return filepath.Join(dst, rel)
 			}
 			return p

@@ -3,8 +3,10 @@ package storage
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -168,5 +170,64 @@ func TestRejectsTargetInsideSourceSpelledInAnotherCase(t *testing.T) {
 	}
 	if _, err := Validate(dst, src); err == nil {
 		t.Fatal("a source inside the target, spelled in another case, was accepted")
+	}
+}
+
+func TestHistoryPathsSpelledInAnotherCaseAreMoved(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "Klip")
+	if err := os.MkdirAll(filepath.Join(src, "images"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	a, errA := os.Stat(src)
+	b, errB := os.Stat(filepath.Join(base, "klip"))
+	if errA != nil || errB != nil || !os.SameFile(a, b) {
+		t.Skip("this volume tells case apart")
+	}
+	os.WriteFile(filepath.Join(src, "images", "a.png"), []byte("image"), 0600)
+	saved := filepath.Join(base, "KLIP", "images", "a.png") // as an older run saved it
+	items, _ := json.Marshal([]map[string]any{{"ImageFilePath": saved, "FilePaths": []string{saved}}})
+	os.WriteFile(filepath.Join(src, "history.json"), items, 0600)
+	dst := t.TempDir()
+	if err := Migrate(src, dst, filepath.Join(t.TempDir(), "location.json"), nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dst, "history.json"))
+	var decoded []map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	canonical, _ := filepath.EvalSymlinks(dst)
+	want := filepath.Join(canonical, "images", "a.png")
+	if decoded[0]["ImageFilePath"] != want || decoded[0]["FilePaths"].([]any)[0] != want {
+		t.Fatalf("paths not moved: %v", decoded[0])
+	}
+}
+
+func TestMigrationClearsInheritedACL(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS ACLs")
+	}
+	dst := t.TempDir()
+	if out, err := exec.Command("/bin/chmod", "+a", "everyone allow read,list,file_inherit,directory_inherit", dst).CombinedOutput(); err != nil {
+		t.Skipf("cannot set an ACL here: %v %s", err, out)
+	}
+	if has, _ := hasACL(dst); !has {
+		t.Fatal("the test ACL is not seen")
+	}
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "history.json"), []byte("[]"), 0600)
+	os.WriteFile(filepath.Join(src, "settings.json"), []byte(`{"AuthRefreshToken":"secret"}`), 0600)
+	if err := Migrate(src, dst, filepath.Join(t.TempDir(), "location.json"), nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{dst, filepath.Join(dst, "settings.json")} {
+		out, err := exec.Command("/bin/ls", "-lde", p).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(out), "everyone") {
+			t.Fatalf("%s still lets everyone in:\n%s", p, out)
+		}
 	}
 }
