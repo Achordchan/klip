@@ -4,7 +4,7 @@ import type { Env } from "./env";
 import { SUPPORTED_TIERS, getTierPolicy, normalizeTierName } from "./env";
 import { type Claims, signJwt, verifyJwt } from "./crypto";
 import * as db from "./db";
-import { blobKey, manifestKey, MAX_DECLARED_REFS, UserStore } from "./user_store";
+import { blobKey, manifestKey, MAX_CHECK_HASHES, MAX_DECLARED_REFS, UserStore } from "./user_store";
 import { isEmailConfigured } from "./smtp";
 import {
   ACCESS_TOKEN_HOURS,
@@ -348,6 +348,7 @@ const syncBlobCheck: Handler = async (req, env) => {
   // refsToken 由客户端在上传快照时带上，服务端据此核对存储代数、回收不再被引用的 blob。
   // 列表太长（收成一份放不下）时只标记为“超长”，快照按“引用未知”记账。
   if (!hashes.length) return json({ missing: [] });
+  if (hashes.length > MAX_CHECK_HASHES) return json({ code: "blob_check_too_large", error: "too many hashes in one check" }, 413);
   const stub = userStub(env, user.id);
   const missing: string[] = [];
   const collect = hashes.length <= MAX_DECLARED_REFS;

@@ -67,6 +67,11 @@ const DEFAULT_BLOB_GC_GRACE_MS = DAY_MS;
 const DEFAULT_BLOB_GC_DELAY_MS = 10 * 60_000;
 /** 快照记录删掉之后，它独占的 blob 再保留这么久：给正在下载那份快照的设备留时间取完 blob。 */
 const DEFAULT_BLOB_GC_DROP_HOLD_MS = DAY_MS;
+/** 一个账号同时保留的声明最多这么多条、这么多字节（声明自己的哈希列表，不含快照也在用的）。 */
+const MAX_REF_CLAIMS = 200;
+const MAX_REF_CLAIM_BYTES = 8 * 1024 * 1024;
+/** 一次查缺失最多这么多个哈希（8 MiB 的声明上限能装下）。Worker 据此拒绝更长的列表。 */
+export const MAX_CHECK_HASHES = 250_000;
 /**
  * 一份声明最多这么多个哈希（ref_sets 一行最多 2MB）。超过就不收成一份，只标记为“超长”：token 照给，
  * 上传快照时照样核对存储代数，但这份快照按“引用未知”记账（分批记下的列表照样保护这些 blob 到声明用掉或过期）。
@@ -526,10 +531,50 @@ export class UserStore extends DurableObject<Env> {
   /** 删掉过期的声明（连同还没收齐的分批列表），以及不再被任何快照或声明用到的哈希列表。在事务里调用。 */
   private pruneRefClaims(now: number): void {
     this.sql.exec("DELETE FROM ref_claims WHERE created_ms <= ?", now - REF_CLAIM_TTL_MS);
+    this.dropOrphanRefs();
+  }
+
+  private dropOrphanRefs(): void {
     this.sql.exec("DELETE FROM ref_claim_chunks WHERE NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.token = ref_claim_chunks.token)");
     this.sql.exec(
       "DELETE FROM ref_sets WHERE NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.refs = ref_sets.id) AND NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.set_id = ref_sets.id)",
     );
+  }
+
+  /**
+   * 给声明占的空间设上限（条数、字节数）：声明不计入档位容量，不设限的话反复查一堆不存在的哈希就能
+   * 无限写入元数据。超出时从最旧的声明开始作废，keep（正在记的这一条）不动。在事务里调用。
+   * 作废的声明不再保护它的 blob；还在用它的新客户端上传快照时会收到 blob_refs_expired，重查一遍。
+   */
+  private boundRefClaims(keep: string): void {
+    const rows = this.sql
+      .exec<{ token: string; set_id: string | null; chunk_bytes: number; set_bytes: number }>(
+        `SELECT c.token AS token, c.set_id AS set_id,
+           COALESCE((SELECT SUM(length(k.hashes)) FROM ref_claim_chunks k WHERE k.token = c.token), 0) AS chunk_bytes,
+           CASE WHEN c.set_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.refs = c.set_id)
+             THEN COALESCE((SELECT length(r.hashes) FROM ref_sets r WHERE r.id = c.set_id), 0) ELSE 0 END AS set_bytes
+         FROM ref_claims c ORDER BY (c.token = ?) DESC, c.created_ms DESC`,
+        keep,
+      )
+      .toArray();
+    let count = 0;
+    let bytes = 0;
+    const counted = new Set<string>();
+    const evict: string[] = [];
+    for (const r of rows) {
+      const size = r.chunk_bytes + (r.set_id && !counted.has(r.set_id) ? r.set_bytes : 0);
+      if (r.token !== keep && (count + 1 > MAX_REF_CLAIMS || bytes + size > MAX_REF_CLAIM_BYTES)) {
+        evict.push(r.token);
+        continue;
+      }
+      count++;
+      bytes += size;
+      if (r.set_id) counted.add(r.set_id);
+    }
+    if (evict.length === 0) return;
+    for (const t of evict) this.sql.exec("DELETE FROM ref_claims WHERE token=?", t);
+    this.dropOrphanRefs();
+    console.warn("ref claims over limit, evicted the oldest", { evicted: evict.length });
   }
 
   /**
@@ -880,6 +925,7 @@ export class UserStore extends DurableObject<Env> {
         }
         const seq = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ref_claim_chunks WHERE token=?", t).one().n;
         this.sql.exec("INSERT INTO ref_claim_chunks (token, seq, hashes) VALUES (?,?,?)", t, seq, encodeRefs(hashes).buffer as ArrayBuffer);
+        this.boundRefClaims(t);
         return t;
       });
     }
@@ -1043,6 +1089,13 @@ export class UserStore extends DurableObject<Env> {
    * 在 snapshotRefs 里同步调用。
    */
   private legacyUploadAllowed(caller: string, issuedMs: number): boolean {
+    // 旧客户端查缺失和上传快照用同一个令牌（遇到 401 刷新令牌后会重新查一遍），所以它的检查不早于令牌签发；
+    // 那次检查的声明保护它查到的 blob 24 小时。令牌签发不到 24 小时，回收就碰不到那些 blob。
+    // 访问令牌只有两小时有效，下面这条正常走不到，留着把这个前提写明：超过了就不再担保。
+    if (this.storageGeneration() > 0 && Date.now() - issuedMs >= REF_CLAIM_TTL_MS) {
+      this.sql.exec("INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms) VALUES (?,?,?)", caller, this.storageGeneration(), Date.now());
+      return false;
+    }
     // 用代数而不是时间排先后：清空和紧接着的一次检查可能落在同一毫秒。
     const resetGeneration = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_generation'").toArray()[0]?.v ?? 0);
     if (resetGeneration === 0) return true;

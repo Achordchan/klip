@@ -421,3 +421,27 @@ func TestAnUnrecordedOlderTokenIsRefusedOnceAfterAReset(t *testing.T) {
 	a.access = fresh // issued since the record began, and never checked
 	a.snapshot("")
 }
+
+// Declarations do not count against the tier, so their number and size are
+// bounded: past the limit the oldest ones go, and an oversized check is
+// refused.
+func TestDeclarationsAreBounded(t *testing.T) {
+	a := newGCAccount(t, "bounded@example.com")
+	x := a.blob(1000)
+	first := a.check(x)
+	for i := 0; i < 200; i++ {
+		a.check(x)
+	}
+	if err := a.trySnapshot(first); !syncclientIs(err, 409, "blob_refs_expired") {
+		t.Errorf("the oldest of 201 declarations is gone: %v", err)
+	}
+	a.snapshot(a.check(x))
+
+	hashes := make([]string, 250_001)
+	for i := range hashes {
+		hashes[i] = sha([]byte{byte(i), byte(i >> 8), byte(i >> 16), 'b'})
+	}
+	if _, err := a.c.CheckBlobs(a.ctx, a.access, hashes); !syncclient.IsStatus(err, 413) {
+		t.Errorf("a check of 250001 hashes: %v", err)
+	}
+}
