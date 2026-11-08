@@ -302,7 +302,8 @@ export class UserStore extends DurableObject<Env> {
         set_id TEXT,
         created_ms INTEGER NOT NULL,
         generation INTEGER NOT NULL,
-        oversized INTEGER NOT NULL DEFAULT 0
+        oversized INTEGER NOT NULL DEFAULT 0,
+        caller TEXT NOT NULL DEFAULT ''
       );
       CREATE TABLE IF NOT EXISTS ref_claim_chunks (
         token TEXT NOT NULL,
@@ -790,8 +791,8 @@ export class UserStore extends DurableObject<Env> {
           this.sql.exec("DELETE FROM ref_sets WHERE NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.set_id = ref_sets.id)");
           this.sql.exec("DELETE FROM meta WHERE k='gc_due_ms'");
           this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes','0')");
-          // 清空之后还没有设备查过缺失：这段时间里不接受不带声明的上传（见 legacyUploadAllowed）。
-          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_unchecked_ms',?)", String(Date.now()));
+          // 清空前查过缺失、清空后才上传的旧客户端据此拒绝（见 legacyUploadAllowed）。
+          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('last_reset_ms',?)", String(Date.now()));
           this.markUsageDirty();
           return n;
         });
@@ -816,7 +817,7 @@ export class UserStore extends DurableObject<Env> {
    */
   async checkBlobs(
     hashes: string[],
-    declare: { token: string | null; final: boolean; collect: boolean },
+    declare: { token: string | null; final: boolean; collect: boolean; caller: string },
   ): Promise<{ missing: string[]; refsToken: string | null }> {
     // 从这里到查完缺失没有 await：记这批声明和查缺失是同一刻，回收（也是同步执行的）只能在这之前或之后。
     const now = Date.now();
@@ -826,8 +827,13 @@ export class UserStore extends DurableObject<Env> {
       token = this.ctx.storage.transactionSync(() => {
         if (declare.token === null) {
           this.pruneRefClaims(now);
-          this.sql.exec("DELETE FROM meta WHERE k='reset_unchecked_ms'"); // 清空之后有设备查过了
-          this.sql.exec("INSERT INTO ref_claims (token, set_id, created_ms, generation) VALUES (?,NULL,?,?)", t, now, this.storageGeneration());
+          this.sql.exec(
+            "INSERT INTO ref_claims (token, set_id, created_ms, generation, caller) VALUES (?,NULL,?,?,?)",
+            t,
+            now,
+            this.storageGeneration(),
+            declare.caller,
+          );
         } else if (this.sql.exec("SELECT 1 FROM ref_claims WHERE token=? AND set_id IS NULL AND created_ms > ?", t, now - REF_CLAIM_TTL_MS).toArray().length === 0) {
           return null;
         }
@@ -989,13 +995,21 @@ export class UserStore extends DurableObject<Env> {
   /**
    * 不带声明的上传（还没用上引用声明的 Go 客户端；已发布的 C# 客户端连的是旧服务器，到不了这里）能不能接受。
    * - 回收不影响它：它查缺失时同样会记下声明，声明有效期内不会回收它查到的 blob。
-   * - 清空会：它可能是在清空前查的缺失（结论是“都在”），清空后才上传。所以清空后 24 小时内、
-   *   并且清空之后还没有任何设备查过缺失时拒绝；它被拒后下次同步会重新查，那时就能通过。
-   *   剩下的漏洞：同一账号里，它在清空前查过、另一台设备在清空后查过，它这时上传会被放行。
+   * - 清空会：它可能是在清空前查的缺失（结论是“都在”），清空后才上传。按调用方（访问令牌）对上：
+   *   这台设备最近一次查缺失在最近一次清空之前，就拒绝，并删掉它清空前的那些声明。它的同步就此失败，
+   *   下次同步会重新导出、有 blob 就重新查，那时就能通过；只有文字的历史从来不查，也就不会被拦。
+   *   旧客户端刷新令牌后会重新查一遍缺失，所以令牌变了不会让清空前的检查混过去。
+   * 在 snapshotRefs 里同步调用。
    */
-  private legacyUploadAllowed(): boolean {
-    const reset = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_unchecked_ms'").toArray()[0];
-    return !reset || Date.now() - Number(reset.v) >= REF_CLAIM_TTL_MS;
+  private legacyUploadAllowed(caller: string): boolean {
+    const resetMs = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='last_reset_ms'").toArray()[0]?.v ?? 0);
+    if (resetMs === 0) return true;
+    const latest = this.sql
+      .exec<{ t: number | null }>("SELECT MAX(created_ms) AS t FROM ref_claims WHERE caller=? AND created_ms > ?", caller, Date.now() - REF_CLAIM_TTL_MS)
+      .one().t;
+    if (latest === null || latest > resetMs) return true;
+    this.sql.exec("DELETE FROM ref_claims WHERE caller=? AND created_ms <= ?", caller, resetMs);
+    return false;
   }
 
   /**
@@ -1004,10 +1018,10 @@ export class UserStore extends DurableObject<Env> {
    * （storage_generation_stale，见 storageGeneration）、或者声明里有服务端还没有的 blob（blob_refs_missing），
    * 都返回 409，客户端重新查缺失、补传 blob 之后再传。
    */
-  private snapshotRefs(header: string | null): { refs: string | null; token: string | null } | Response {
+  private snapshotRefs(header: string | null, caller: string): { refs: string | null; token: string | null } | Response {
     const stale = () =>
       json({ code: "storage_generation_stale", error: "blobs were deleted after the blob check; check again", storageGeneration: this.storageGeneration() }, 409);
-    if (header === null) return this.legacyUploadAllowed() ? { refs: null, token: null } : stale();
+    if (header === null) return this.legacyUploadAllowed(caller) ? { refs: null, token: null } : stale();
     const value = header.trim();
     // 没有 blob 的快照不引用任何 blob，不会因为 blob 被删而坏掉，不看代数。
     if (value === "none") return { refs: NO_REFS, token: null };
@@ -1043,7 +1057,7 @@ export class UserStore extends DurableObject<Env> {
     await this.withCommit(() => this.reconcilePending(userId));
     // 这份快照引用了哪些 blob（见 checkBlobs）。从这里到登记待发布快照之间没有 await：
     // 核对过的 blob 不会在登记之前被回收；登记之后，这份快照的引用就保护着它们。
-    const refs = this.snapshotRefs(request.headers.get("x-klip-blob-refs"));
+    const refs = this.snapshotRefs(request.headers.get("x-klip-blob-refs"), request.headers.get("x-klip-caller") ?? "");
     if (refs instanceof Response) {
       await drainBody(request);
       return refs;

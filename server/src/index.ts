@@ -95,6 +95,8 @@ async function accessTokenFor(env: Env, userId: string, email: string) {
     nbf: iat,
     iat,
     exp: Math.floor(accessExpires / 1000),
+    // 每个令牌各不相同（同一秒签发的也是），调用方标识（callerId）靠它区分设备。
+    jti: base64UrlEncode(randomBytes(12)),
   };
   return { accessToken: await signJwt(claims, env.AUTH_SIGNING_KEY), accessTokenExpiresAt: new Date(accessExpires).toISOString() };
 }
@@ -108,6 +110,14 @@ async function issueTokens(env: Env, userId: string, email: string) {
   await db.insertRefreshToken(env, await sha256Hex(refreshToken.token), userId, refreshToken.expiresAt);
   const access = await accessTokenFor(env, userId, email);
   return { accessToken: access.accessToken, refreshToken: refreshToken.token, accessTokenExpiresAt: access.accessTokenExpiresAt, email, userId };
+}
+
+/**
+ * 调用方标识：访问令牌的哈希（每台设备登录、刷新各拿各的令牌）。用来把一台旧客户端的“查缺失”和
+ * 它随后的快照上传对上（见 UserStore.legacyUploadAllowed）。
+ */
+async function callerId(request: Request): Promise<string> {
+  return (await sha256Hex(bearer(request) ?? "")).slice(0, 32);
 }
 
 /** 订阅有效且分配了档位才能同步。 */
@@ -306,7 +316,7 @@ function forwardUpload(req: Request, env: Env, userId: string, path: string, ext
 
 const syncSnapshotPut: Handler = async (req, env) => {
   const { user, tier } = await requireSync(req, env);
-  return forwardUpload(req, env, user.id, "/snapshot", { "x-klip-tier": JSON.stringify(tier) });
+  return forwardUpload(req, env, user.id, "/snapshot", { "x-klip-tier": JSON.stringify(tier), "x-klip-caller": await callerId(req) });
 };
 
 const syncBlobCheck: Handler = async (req, env) => {
@@ -322,10 +332,11 @@ const syncBlobCheck: Handler = async (req, env) => {
   const stub = userStub(env, user.id);
   const missing: string[] = [];
   const collect = hashes.length <= MAX_DECLARED_REFS;
+  const caller = await callerId(req);
   let refsToken: string | null = null;
   for (let i = 0; i < hashes.length; i += BLOB_CHECK_BATCH) {
     const batch = hashes.slice(i, i + BLOB_CHECK_BATCH);
-    const r = await stub.checkBlobs(batch, { token: refsToken, final: i + BLOB_CHECK_BATCH >= hashes.length, collect });
+    const r = await stub.checkBlobs(batch, { token: refsToken, final: i + BLOB_CHECK_BATCH >= hashes.length, collect, caller });
     // 声明中途没了（不该发生）：前面几批的结论没人担保，整次作废，让客户端重来。
     if (r.refsToken === null) return json({ code: "blob_check_interrupted", error: "blob check was interrupted; check again" }, 409);
     missing.push(...r.missing);

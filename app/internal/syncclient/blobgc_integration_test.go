@@ -210,10 +210,10 @@ func TestResetStorage(t *testing.T) {
 	refs := a.check(x) // x is missing now, and uploaded again
 	a.snapshot("")     // once a device has checked since the reset, an older client is let through
 	a.snapshot(refs)
-	a.snapshot(syncclient.NoBlobRefs) // a snapshot without blobs is always fine
 	if !a.has(x) || a.usage() == 0 {
 		t.Error("the account did not fill up again")
 	}
+	a.snapshot(syncclient.NoBlobRefs) // a snapshot without blobs is always fine
 }
 
 // Device B has checked its blobs (and found x on the server) and is about to
@@ -329,4 +329,36 @@ func TestAnOversizedCheckStillKeepsItsBlobs(t *testing.T) {
 	// The token is accepted; the snapshot counts as one of unknown references
 	// (what that means is TestASnapshotOfUnknownReferencesKeepsEveryBlob).
 	a.snapshot(res.RefsToken)
+}
+
+// After a reset, an older client that checked its blobs before it is
+// refused until it checks again, even when another device has checked since;
+// one with only text, which never checks, is not held up.
+func TestOlderClientsAfterAReset(t *testing.T) {
+	a := newGCAccount(t, "older@example.com")
+	x := a.blob(5000)
+	a.snapshot(a.check(x))
+	if _, err := a.c.CheckBlobs(a.ctx, a.access, []string{x}); err != nil { // A checks: x is there
+		t.Fatal(err)
+	}
+	a.srv.Admin("/admin/user/reset-storage", map[string]any{"emailOrUserId": "older@example.com"})
+
+	// Another device checks after the reset: that says nothing about A.
+	other := a.srv.Login(a.ctx, "older@example.com", "password1").AccessToken
+	if other == a.access {
+		t.Fatal("two logins share a token")
+	}
+	if _, err := a.c.CheckBlobs(a.ctx, other, []string{x}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") {
+		t.Fatalf("A's upload relies on a check from before the reset: %v", err)
+	}
+	// A's next sync: with only text it does not check, and is let through.
+	a.snapshot("")
+
+	// The other device has only text, and never checked before the reset.
+	b := &gcAccount{t: t, srv: a.srv, ctx: a.ctx, c: a.c, access: a.srv.Login(a.ctx, "older@example.com", "password1").AccessToken, dir: a.dir, blobs: a.blobs}
+	a.srv.Admin("/admin/user/reset-storage", map[string]any{"emailOrUserId": "older@example.com"})
+	b.snapshot("")
 }
