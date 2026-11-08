@@ -448,7 +448,7 @@ export class UserStore extends DurableObject<Env> {
    * 存储代数：每次清空云端数据、每次回收已记账的 blob 都加一（和删除在同一个事务里）。
    * 查缺失时的声明记下当时的代数；上传快照时代数已经变了，说明查完之后有 blob 被删过，
    * 那次“已经有了”的结论可能不再成立，拒绝上传（409 storage_generation_stale），客户端重查、补传再传。
-   * 不带声明的上传（旧客户端）在代数为 0（从没清空、回收过）时照常接受，否则拒绝。
+   * 不带声明的上传（旧客户端）不看代数，见 legacyUploadAllowed。
    */
   private storageGeneration(): number {
     return Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='storage_generation'").toArray()[0]?.v ?? 0);
@@ -764,7 +764,8 @@ export class UserStore extends DurableObject<Env> {
    *
    * 为什么需要它：旧客户端上传的快照不声明引用了哪些 blob，只要还保留着这样的快照，blob 就不会被自动回收，
    * 删了历史也不会释放空间，占满档位后就同步不了。这里是给管理员的补救办法。
-   * 和正在同步的设备之间：清空前查过缺失的设备，上传快照时代数已经变了，会被拒绝并重查（见 storageGeneration）；
+   * 和正在同步的设备之间：清空前查过缺失的设备，上传快照时代数已经变了，会被拒绝并重查（见 storageGeneration；
+   * 不带声明的旧客户端见 legacyUploadAllowed）；
    * 正在上传的 blob 不在账目里，不受影响，它们的提交照常记账。
    * 拿着快照锁和提交锁执行，期间没有快照在上传或发布。
    */
@@ -789,6 +790,8 @@ export class UserStore extends DurableObject<Env> {
           this.sql.exec("DELETE FROM ref_sets WHERE NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.set_id = ref_sets.id)");
           this.sql.exec("DELETE FROM meta WHERE k='gc_due_ms'");
           this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes','0')");
+          // 清空之后还没有设备查过缺失：这段时间里不接受不带声明的上传（见 legacyUploadAllowed）。
+          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_unchecked_ms',?)", String(Date.now()));
           this.markUsageDirty();
           return n;
         });
@@ -823,6 +826,7 @@ export class UserStore extends DurableObject<Env> {
       token = this.ctx.storage.transactionSync(() => {
         if (declare.token === null) {
           this.pruneRefClaims(now);
+          this.sql.exec("DELETE FROM meta WHERE k='reset_unchecked_ms'"); // 清空之后有设备查过了
           this.sql.exec("INSERT INTO ref_claims (token, set_id, created_ms, generation) VALUES (?,NULL,?,?)", t, now, this.storageGeneration());
         } else if (this.sql.exec("SELECT 1 FROM ref_claims WHERE token=? AND set_id IS NULL AND created_ms > ?", t, now - REF_CLAIM_TTL_MS).toArray().length === 0) {
           return null;
@@ -983,6 +987,18 @@ export class UserStore extends DurableObject<Env> {
   }
 
   /**
+   * 不带声明的上传（还没用上引用声明的 Go 客户端；已发布的 C# 客户端连的是旧服务器，到不了这里）能不能接受。
+   * - 回收不影响它：它查缺失时同样会记下声明，声明有效期内不会回收它查到的 blob。
+   * - 清空会：它可能是在清空前查的缺失（结论是“都在”），清空后才上传。所以清空后 24 小时内、
+   *   并且清空之后还没有任何设备查过缺失时拒绝；它被拒后下次同步会重新查，那时就能通过。
+   *   剩下的漏洞：同一账号里，它在清空前查过、另一台设备在清空后查过，它这时上传会被放行。
+   */
+  private legacyUploadAllowed(): boolean {
+    const reset = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_unchecked_ms'").toArray()[0];
+    return !reset || Date.now() - Number(reset.v) >= REF_CLAIM_TTL_MS;
+  }
+
+  /**
    * 读上传快照的 x-klip-blob-refs 头：没有这个头 = 引用未知（旧客户端）；"none" = 没有 blob；
    * 否则是查缺失时拿到的声明 token。声明不存在或过期了（blob_refs_expired）、查完之后有 blob 被删过
    * （storage_generation_stale，见 storageGeneration）、或者声明里有服务端还没有的 blob（blob_refs_missing），
@@ -991,10 +1007,7 @@ export class UserStore extends DurableObject<Env> {
   private snapshotRefs(header: string | null): { refs: string | null; token: string | null } | Response {
     const stale = () =>
       json({ code: "storage_generation_stale", error: "blobs were deleted after the blob check; check again", storageGeneration: this.storageGeneration() }, 409);
-    if (header === null) {
-      // 旧客户端：没法知道它查缺失之后有没有 blob 被删。从没删过就照旧接受，删过就拒绝。
-      return this.storageGeneration() === 0 ? { refs: null, token: null } : stale();
-    }
+    if (header === null) return this.legacyUploadAllowed() ? { refs: null, token: null } : stale();
     const value = header.trim();
     // 没有 blob 的快照不引用任何 blob，不会因为 blob 被删而坏掉，不看代数。
     if (value === "none") return { refs: NO_REFS, token: null };

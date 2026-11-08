@@ -162,12 +162,9 @@ func TestASnapshotOfUnknownReferencesKeepsEveryBlob(t *testing.T) {
 	a.snapshot(syncclient.NoBlobRefs) // the snapshot without references expires
 	a.expectGone(x)
 
-	// A blob has been collected: an upload that says nothing of the check it
-	// relies on can no longer be trusted, and is refused.
-	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") || !syncclient.IsBlobRefsRejected(err) {
-		t.Errorf("an older client's upload after a collection: %v", err)
-	}
-	a.snapshot(syncclient.NoBlobRefs) // a snapshot without blobs is always fine
+	// A collection does not stop an older client: its check declared what it
+	// found, which a collection keeps.
+	a.snapshot("")
 }
 
 // A check made before blobs were collected cannot vouch for what it found:
@@ -207,10 +204,13 @@ func TestResetStorage(t *testing.T) {
 	if err := a.trySnapshot(old); !syncclientIs(err, 409, "storage_generation_stale") {
 		t.Errorf("a check from before the reset: %v", err)
 	}
-	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") {
-		t.Errorf("an older client after the reset: %v", err)
+	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") || !syncclient.IsBlobRefsRejected(err) {
+		t.Errorf("an older client with no check since the reset: %v", err)
 	}
-	a.snapshot(a.check(x)) // x is missing now, and uploaded again
+	refs := a.check(x) // x is missing now, and uploaded again
+	a.snapshot("")     // once a device has checked since the reset, an older client is let through
+	a.snapshot(refs)
+	a.snapshot(syncclient.NoBlobRefs) // a snapshot without blobs is always fine
 	if !a.has(x) || a.usage() == 0 {
 		t.Error("the account did not fill up again")
 	}
