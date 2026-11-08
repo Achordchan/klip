@@ -20,7 +20,7 @@ From [Releases](https://github.com/Achordchan/klip/releases/latest):
 | Folder | Contents |
 |---|---|
 | `app/` | The client (Go + [MyGo](https://github.com/egoist/mygo)) |
-| `nas-agent-py/` | The sync server (FastAPI) |
+| `server/` | The sync server (Cloudflare Workers + D1 + R2 + Durable Objects), see [`server/README.md`](server/README.md) |
 | `installer/klip.iss` | Inno Setup script |
 | `tools/release_go.py` | Build and packaging: `Klip.exe`, installer, update package, update manifest |
 | `tools/e2e_update.py` | End-to-end test on Windows: installing over the old version, and an unattended update to the next one |

@@ -29,7 +29,7 @@ Klip 是一个剪贴板管理工具：记下你复制过的文字、图片和文
 | 目录 | 内容 |
 |---|---|
 | `app/` | 客户端（Go + [MyGo](https://github.com/egoist/mygo)），说明见 [`app/README.md`](app/README.md) |
-| `nas-agent-py/` | 同步后端（FastAPI），部署见 [`docs/deploy/baota-python-nas-agent.md`](docs/deploy/baota-python-nas-agent.md) |
+| `server/` | 同步后端（Cloudflare Workers + D1 + R2 + Durable Objects），部署见 [`server/README.md`](server/README.md) |
 | `installer/klip.iss` | Inno Setup 安装包脚本 |
 | `tools/release_go.py` | 构建与打包：`Klip.exe`、安装包、更新包、更新清单 |
 | `tools/package_mac.sh` | macOS 的 `Klip.app` 与 zip（Apple 芯片 / Intel） |
@@ -68,16 +68,14 @@ python3 tools/release_go.py build --version 1.0.11 --publish-dir /path/to/out
 
 ## 同步后端
 
-`nas-agent-py` 提供账号、订阅、快照与 Blob 同步、SSE 事件和后台管理。本地启动：
+`server/` 是跑在 Cloudflare 免费版上的 Worker，提供账号、订阅与卡密、快照与 Blob 同步、推送和后台管理（`/admin`）。部署、本地运行和免费额度说明见 [`server/README.md`](server/README.md)。
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\pip install -r .\nas-agent-py\requirements.txt
-Copy-Item .\nas-agent-py\.env.example .\nas-agent-py\.env
-.\.venv\Scripts\python -m uvicorn main:app --app-dir .\nas-agent-py --host 127.0.0.1 --port 17655
+客户端的集成测试可以对着本地启动的真实后端跑：先在 `server/` 里 `npm install`，然后
+
+```bash
+cd app
+KLIP_TEST_SERVER=1 go test ./...
 ```
-
-环境变量见 `nas-agent-py/.env.example`；打包上传用 `python tools/package_nas_agent_py.py`。
 
 ## 许可
 

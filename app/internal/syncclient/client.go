@@ -1,4 +1,4 @@
-// Package syncclient talks to the sync server (nas-agent-py): accounts,
+// Package syncclient talks to the sync server (server/): accounts,
 // subscription, the snapshot and its blobs, and the event stream that tells
 // a device that another one has uploaded. It does what NasAgentClient,
 // AuthService and SyncEventStreamService do in the C# client, with the same
