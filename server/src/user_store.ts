@@ -13,7 +13,7 @@ import { getTierPolicy } from "./env";
 import { hashPassword, verifyPassword } from "./crypto";
 import { createPasswordCode, deletePasswordCode, generatePasswordCode, passwordCodeCooldown, setStorageBytes } from "./db";
 import { buildPasswordCodeMessage, sendMail } from "./smtp";
-import { DAY_MS, PASSWORD_CODE_RESEND_COOLDOWN_SECONDS, errorJson, hex, json, nowIso, safeSegment, sseEvent } from "./util";
+import { ACCESS_TOKEN_HOURS, DAY_MS, PASSWORD_CODE_RESEND_COOLDOWN_SECONDS, errorJson, hex, json, nowIso, safeSegment, sseEvent } from "./util";
 
 const PART_SIZE = 8 * 1024 * 1024; // R2 分片上传：除最后一片外每片一样大
 // R2 对同一个 key 每秒最多写一次。manifest 写入之间至少隔这么久，失败后按它的倍数退避。
@@ -70,6 +70,11 @@ const DEFAULT_BLOB_GC_DELAY_MS = 10 * 60_000;
  * 上传快照时照样核对存储代数，但这份快照按“引用未知”记账（分批记下的列表照样保护这些 blob 到声明用掉或过期）。
  */
 export const MAX_DECLARED_REFS = 60_000;
+/**
+ * caller_checks 保留多久：比访问令牌的有效期长一点。令牌过期后，这个调用方的上传过不了鉴权；
+ * 旧客户端刷新令牌后会重新查缺失，那是一个新的调用方。
+ */
+const CALLER_CHECK_KEEP_MS = (ACCESS_TOKEN_HOURS + 1) * 3_600_000;
 /** 快照“引用已知、没有 blob”时 snapshots.refs 的值。 */
 const NO_REFS = "";
 
@@ -302,8 +307,12 @@ export class UserStore extends DurableObject<Env> {
         set_id TEXT,
         created_ms INTEGER NOT NULL,
         generation INTEGER NOT NULL,
-        oversized INTEGER NOT NULL DEFAULT 0,
-        caller TEXT NOT NULL DEFAULT ''
+        oversized INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS caller_checks (
+        caller TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL,
+        checked_ms INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS ref_claim_chunks (
         token TEXT NOT NULL,
@@ -827,13 +836,11 @@ export class UserStore extends DurableObject<Env> {
       token = this.ctx.storage.transactionSync(() => {
         if (declare.token === null) {
           this.pruneRefClaims(now);
-          this.sql.exec(
-            "INSERT INTO ref_claims (token, set_id, created_ms, generation, caller) VALUES (?,NULL,?,?,?)",
-            t,
-            now,
-            this.storageGeneration(),
-            declare.caller,
-          );
+          this.sql.exec("INSERT INTO ref_claims (token, set_id, created_ms, generation) VALUES (?,NULL,?,?)", t, now, this.storageGeneration());
+          // 记下这台设备最近一次查缺失时的代数（见 legacyUploadAllowed）。令牌过期之后它就传不上来了，
+          // 刷新令牌后旧客户端会重新查一遍、换一个调用方标识，所以更早的记录可以删掉。
+          this.sql.exec("DELETE FROM caller_checks WHERE checked_ms < ?", now - CALLER_CHECK_KEEP_MS);
+          this.sql.exec("INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms) VALUES (?,?,?)", declare.caller, this.storageGeneration(), now);
         } else if (this.sql.exec("SELECT 1 FROM ref_claims WHERE token=? AND set_id IS NULL AND created_ms > ?", t, now - REF_CLAIM_TTL_MS).toArray().length === 0) {
           return null;
         }
@@ -996,7 +1003,7 @@ export class UserStore extends DurableObject<Env> {
    * 不带声明的上传（还没用上引用声明的 Go 客户端；已发布的 C# 客户端连的是旧服务器，到不了这里）能不能接受。
    * - 回收不影响它：它查缺失时同样会记下声明，声明有效期内不会回收它查到的 blob。
    * - 清空会：它可能是在清空前查的缺失（结论是“都在”），清空后才上传。按调用方（访问令牌）对上：
-   *   这台设备最近一次查缺失在最近一次清空之前，就拒绝，并删掉它清空前的那些声明。它的同步就此失败，
+   *   这台设备最近一次查缺失（caller_checks）在最近一次清空之前，就拒绝，并删掉这条记录。它的同步就此失败，
    *   下次同步会重新导出、有 blob 就重新查，那时就能通过；只有文字的历史从来不查，也就不会被拦。
    *   旧客户端刷新令牌后会重新查一遍缺失，所以令牌变了不会让清空前的检查混过去。
    * 在 snapshotRefs 里同步调用。
@@ -1005,11 +1012,10 @@ export class UserStore extends DurableObject<Env> {
     // 用代数而不是时间排先后：清空和紧接着的一次检查可能落在同一毫秒。
     const resetGeneration = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_generation'").toArray()[0]?.v ?? 0);
     if (resetGeneration === 0) return true;
-    const latest = this.sql
-      .exec<{ g: number | null }>("SELECT MAX(generation) AS g FROM ref_claims WHERE caller=? AND created_ms > ?", caller, Date.now() - REF_CLAIM_TTL_MS)
-      .one().g;
-    if (latest === null || latest >= resetGeneration) return true;
-    this.sql.exec("DELETE FROM ref_claims WHERE caller=? AND generation < ?", caller, resetGeneration);
+    // caller_checks 不随声明过期：只要这个令牌还能用，它清空前的那次检查就还记着。
+    const last = this.sql.exec<{ generation: number }>("SELECT generation FROM caller_checks WHERE caller=?", caller).toArray()[0];
+    if (!last || last.generation >= resetGeneration) return true;
+    this.sql.exec("DELETE FROM caller_checks WHERE caller=?", caller);
     return false;
   }
 
