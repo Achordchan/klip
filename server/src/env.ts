@@ -25,6 +25,7 @@ export interface Env {
   // blob 回收的时间（秒），不设就用默认值（见 user_store.ts）。BACKUP_RETENTION_SECONDS 只给测试用。
   BLOB_GC_GRACE_SECONDS?: string;
   BLOB_GC_DELAY_SECONDS?: string;
+  BLOB_GC_DROP_HOLD_SECONDS?: string;
   BACKUP_RETENTION_SECONDS?: string;
 }
 

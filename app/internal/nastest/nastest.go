@@ -35,6 +35,10 @@ import (
 // AdminKey is the ADMIN_KEY the test server runs with.
 const AdminKey = "test-admin-key"
 
+// SigningKey is the AUTH_SIGNING_KEY the test server runs with: a test can
+// sign its own tokens (HS256).
+const SigningKey = "test-signing-key-that-is-long-enough-for-hs256"
+
 // Server is a running sync server.
 type Server struct {
 	URL      string
@@ -57,13 +61,21 @@ type Option func(*options)
 
 type options struct {
 	fastBlobGC bool
+	vars       []string
 }
 
-// FastBlobGC runs the server with no grace period and no delay for deleting
-// the blobs no snapshot refers to, and with backups that expire at once (the
-// next upload removes them), so that a test sees blobs collected. It needs a
+// FastBlobGC runs the server with no grace period, no delay and no hold for
+// deleting the blobs no snapshot refers to, and with backups that expire at
+// once (the next upload removes them), so that a test sees blobs collected. It needs a
 // local server: against KLIP_TEST_SERVER_URL the test is skipped.
 func FastBlobGC() Option { return func(o *options) { o.fastBlobGC = true } }
+
+// Var sets one of the server's variables (wrangler.jsonc "vars", see
+// server/src/env.ts), after the ones FastBlobGC sets. It needs a local
+// server.
+func Var(name, value string) Option {
+	return func(o *options) { o.vars = append(o.vars, name+":"+value) }
+}
 
 // Start runs the server for the test and stops it when the test ends.
 func Start(t *testing.T, opts ...Option) *Server {
@@ -73,8 +85,8 @@ func Start(t *testing.T, opts ...Option) *Server {
 		f(&o)
 	}
 	if url := os.Getenv("KLIP_TEST_SERVER_URL"); url != "" {
-		if o.fastBlobGC {
-			t.Skip("FastBlobGC needs a local server")
+		if o.fastBlobGC || len(o.vars) > 0 {
+			t.Skip("FastBlobGC and Var need a local server")
 		}
 		key := os.Getenv("KLIP_TEST_ADMIN_KEY")
 		if key == "" {
@@ -115,11 +127,15 @@ func Start(t *testing.T, opts ...Option) *Server {
 		"--ip", "127.0.0.1", "--port", fmt.Sprint(port), "--inspector-port", fmt.Sprint(freePort(t)),
 		"--persist-to", state, "--show-interactive-dev-session=false", "--log-level", "warn",
 		"--var", "ADMIN_KEY:" + AdminKey,
-		"--var", "AUTH_SIGNING_KEY:test-signing-key-that-is-long-enough-for-hs256",
+		"--var", "AUTH_SIGNING_KEY:" + SigningKey,
 		"--var", "SMTP_HOST:", // email is not configured: password codes give 503
 	}
 	if o.fastBlobGC {
-		args = append(args, "--var", "BLOB_GC_GRACE_SECONDS:0", "--var", "BLOB_GC_DELAY_SECONDS:0", "--var", "BACKUP_RETENTION_SECONDS:0")
+		args = append(args, "--var", "BLOB_GC_GRACE_SECONDS:0", "--var", "BLOB_GC_DELAY_SECONDS:0",
+			"--var", "BLOB_GC_DROP_HOLD_SECONDS:0", "--var", "BACKUP_RETENTION_SECONDS:0")
+	}
+	for _, v := range o.vars {
+		args = append(args, "--var", v)
 	}
 	cmd := exec.Command(node, args...)
 	cmd.Dir, cmd.Env = dir, env

@@ -3,9 +3,14 @@ package syncclient_test
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,8 +34,8 @@ type gcAccount struct {
 	blobs  map[string]string // sha -> file
 }
 
-func newGCAccount(t *testing.T, email string) *gcAccount {
-	srv := nastest.Start(t, nastest.FastBlobGC())
+func newGCAccount(t *testing.T, email string, opts ...nastest.Option) *gcAccount {
+	srv := nastest.Start(t, append([]nastest.Option{nastest.FastBlobGC()}, opts...)...)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
 	tok := srv.Subscribe(ctx, email, "password1")
@@ -361,4 +366,58 @@ func TestOlderClientsAfterAReset(t *testing.T) {
 	b := &gcAccount{t: t, srv: a.srv, ctx: a.ctx, c: a.c, access: a.srv.Login(a.ctx, "older@example.com", "password1").AccessToken, dir: a.dir, blobs: a.blobs}
 	a.srv.Admin("/admin/user/reset-storage", map[string]any{"emailOrUserId": "older@example.com"})
 	b.snapshot("")
+}
+
+// A device may still be fetching the blobs of a snapshot that was just
+// replaced and whose backup went: the server keeps them a while longer.
+func TestTheBlobsOfADroppedSnapshotAreHeldForDownloads(t *testing.T) {
+	a := newGCAccount(t, "hold@example.com", nastest.Var("BLOB_GC_DROP_HOLD_SECONDS", "3600"))
+	x := a.blob(5000)
+	a.snapshot(a.check(x))
+	a.snapshot(syncclient.NoBlobRefs) // the snapshot with x expires
+	time.Sleep(time.Second)
+	if !a.has(x) {
+		t.Fatal("x went at once, while a device may still be downloading the snapshot that had it")
+	}
+}
+
+// olderToken signs a copy of token as issued an hour ago, before the
+// account's server started its record of checks, as a token of the previous
+// server version has neither iat_ms nor a record.
+func olderToken(t *testing.T, token string) string {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims map[string]any
+	json.Unmarshal(raw, &claims)
+	iat := time.Now().Add(-time.Hour).Unix()
+	claims["iat"], claims["nbf"] = iat, iat
+	delete(claims, "iat_ms")
+	payload, _ := json.Marshal(claims)
+	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	body := head + "." + base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte(nastest.SigningKey))
+	mac.Write([]byte(body))
+	return body + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// A token older than the server's record of checks may have checked before
+// the record began: after a reset its upload is refused once; a token issued
+// since, with no check on record, has never checked and is let through.
+func TestAnUnrecordedOlderTokenIsRefusedOnceAfterAReset(t *testing.T) {
+	a := newGCAccount(t, "untracked@example.com")
+	a.snapshot(syncclient.NoBlobRefs) // the account's record of checks starts
+	a.srv.Admin("/admin/user/reset-storage", map[string]any{"emailOrUserId": "untracked@example.com"})
+	fresh := a.access
+	a.access = olderToken(t, fresh)
+	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") {
+		t.Fatalf("a token from before the record, after a reset: %v", err)
+	}
+	a.snapshot("") // its next sync goes through
+
+	a.access = fresh // issued since the record began, and never checked
+	a.snapshot("")
 }

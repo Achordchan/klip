@@ -17,6 +17,7 @@ import {
   REFRESH_TOKEN_DAYS,
   TOKEN_LEEWAY_SECONDS,
   asInt,
+  base64UrlDecode,
   base64UrlEncode,
   clamp,
   errorJson,
@@ -97,6 +98,8 @@ async function accessTokenFor(env: Env, userId: string, email: string) {
     exp: Math.floor(accessExpires / 1000),
     // 每个令牌各不相同（同一秒签发的也是），调用方标识（callerId）靠它区分设备。
     jti: base64UrlEncode(randomBytes(12)),
+    // 精确到毫秒的签发时间（iat 只到秒），见 tokenIssuedMs。
+    iat_ms: now,
   };
   return { accessToken: await signJwt(claims, env.AUTH_SIGNING_KEY), accessTokenExpiresAt: new Date(accessExpires).toISOString() };
 }
@@ -118,6 +121,20 @@ async function issueTokens(env: Env, userId: string, email: string) {
  */
 async function callerId(request: Request): Promise<string> {
   return (await sha256Hex(bearer(request) ?? "")).slice(0, 32);
+}
+
+/**
+ * 访问令牌的签发时间（毫秒）。令牌已经在 requireSync 里验过签名，这里只读它的声明。
+ * 没有 iat_ms 的旧令牌按 iat（秒，向下取整）算，只会显得更早，判断偏保守。
+ */
+function tokenIssuedMs(request: Request): number {
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode((bearer(request) ?? "").split(".")[1] ?? "")));
+    if (typeof payload.iat_ms === "number") return payload.iat_ms;
+    return typeof payload.iat === "number" ? payload.iat * 1000 : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /** 订阅有效且分配了档位才能同步。 */
@@ -316,7 +333,9 @@ function forwardUpload(req: Request, env: Env, userId: string, path: string, ext
 
 const syncSnapshotPut: Handler = async (req, env) => {
   const { user, tier } = await requireSync(req, env);
-  return forwardUpload(req, env, user.id, "/snapshot", { "x-klip-tier": JSON.stringify(tier), "x-klip-caller": await callerId(req) });
+  return forwardUpload(req, env, user.id, "/snapshot", { "x-klip-tier": JSON.stringify(tier), "x-klip-caller": await callerId(req),
+    "x-klip-caller-issued-ms": String(tokenIssuedMs(req)),
+  });
 };
 
 const syncBlobCheck: Handler = async (req, env) => {

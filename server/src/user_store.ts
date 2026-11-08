@@ -65,6 +65,8 @@ const REF_CLAIM_TTL_MS = DAY_MS;
 const DEFAULT_BLOB_GC_GRACE_MS = DAY_MS;
 /** 引用变少之后过这么久才回收：把一段时间里的多次变化攒成一次（每次回收要扫一遍 blobs 表）。 */
 const DEFAULT_BLOB_GC_DELAY_MS = 10 * 60_000;
+/** 快照记录删掉之后，它独占的 blob 再保留这么久：给正在下载那份快照的设备留时间取完 blob。 */
+const DEFAULT_BLOB_GC_DROP_HOLD_MS = DAY_MS;
 /**
  * 一份声明最多这么多个哈希（ref_sets 一行最多 2MB）。超过就不收成一份，只标记为“超长”：token 照给，
  * 上传快照时照样核对存储代数，但这份快照按“引用未知”记账（分批记下的列表照样保护这些 blob 到声明用掉或过期）。
@@ -327,8 +329,14 @@ export class UserStore extends DurableObject<Env> {
     if (!cols.some((c) => c.name === "refs")) this.sql.exec("ALTER TABLE snapshots ADD COLUMN refs TEXT");
     // 加这一列之前记账的 blob 是 NULL：按 blob_epoch_ms（第一次跑到这里的时间）算它的上传时间，宽限期从那时算起。
     const blobCols = this.sql.exec<{ name: string }>("PRAGMA table_info(blobs)").toArray();
-    if (!blobCols.some((c) => c.name === "created_ms")) this.sql.exec("ALTER TABLE blobs ADD COLUMN created_ms INTEGER");
+    if (!blobCols.some((c) => c.name === "created_ms")) {
+      this.sql.exec("ALTER TABLE blobs ADD COLUMN created_ms INTEGER");
+      // 存量 blob 里可能有从来没被快照用到的（上传失败留下的）：宽限期过后安排一次回收，不然没有别的事会触发它。
+      if (this.sql.exec("SELECT 1 FROM blobs LIMIT 1").toArray().length > 0) this.markGcDue(Date.now() + this.gcGraceMs());
+    }
     this.sql.exec("INSERT OR IGNORE INTO meta (k,v) VALUES ('blob_epoch_ms',?)", String(Date.now()));
+    // 从这时起每台设备的查缺失都记在 caller_checks 里（见 legacyUploadAllowed）。
+    this.sql.exec("INSERT OR IGNORE INTO meta (k,v) VALUES ('caller_tracking_ms',?)", String(Date.now()));
     this.sql.exec("CREATE INDEX IF NOT EXISTS idx_snapshots_current ON snapshots (current)");
     const cleanupCols = this.sql.exec<{ name: string }>("PRAGMA table_info(cleanup)").toArray();
     if (!cleanupCols.some((c) => c.name === "blob_sha")) this.sql.exec("ALTER TABLE cleanup ADD COLUMN blob_sha TEXT");
@@ -342,6 +350,7 @@ export class UserStore extends DurableObject<Env> {
    * - 没写成功的 D1 用量：再写一次。
    */
   private async recoverPublication(): Promise<void> {
+    await this.scheduleGc(); // 迁移时安排的回收、或者上次没来得及安排的
     const pending = this.sql.exec<SnapshotRow>(`SELECT ${SNAPSHOT_COLS} FROM snapshots WHERE current=?`, PENDING).toArray();
     const hasCleanup = this.sql.exec("SELECT 1 FROM cleanup LIMIT 1").toArray().length > 0;
     const hasBlobIntents = this.sql.exec("SELECT 1 FROM blob_uploads LIMIT 1").toArray().length > 0;
@@ -443,7 +452,10 @@ export class UserStore extends DurableObject<Env> {
 
   // ---- blob 回收 ----
 
-  private envMs(name: "BLOB_GC_GRACE_SECONDS" | "BLOB_GC_DELAY_SECONDS" | "BACKUP_RETENTION_SECONDS", fallback: number): number {
+  private envMs(
+    name: "BLOB_GC_GRACE_SECONDS" | "BLOB_GC_DELAY_SECONDS" | "BLOB_GC_DROP_HOLD_SECONDS" | "BACKUP_RETENTION_SECONDS",
+    fallback: number,
+  ): number {
     const raw = this.env[name];
     if (raw === undefined || raw.trim() === "") return fallback;
     const n = Number(raw);
@@ -487,13 +499,28 @@ export class UserStore extends DurableObject<Env> {
    */
   private refsDropped(refs: string | null): void {
     if (refs === NO_REFS) return;
+    const now = Date.now();
+    // 刚删掉的快照可能还有设备在下载（先下快照，再一个个取 blob）：它的 blob 再留一阵（DROP_HOLD）。
+    const hold = this.envMs("BLOB_GC_DROP_HOLD_SECONDS", DEFAULT_BLOB_GC_DROP_HOLD_MS);
     if (refs === null) {
       if (this.sql.exec("SELECT 1 FROM snapshots WHERE refs IS NULL LIMIT 1").toArray().length > 0) return;
+      // 引用未知的快照不知道用了哪些 blob：整体推迟回收。
+      if (hold > 0) this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('gc_hold_until_ms',?)", String(now + hold));
     } else {
       // 还在声明里的不算：声明会过期，回收时会按声明的到期时间再安排。
       if (this.sql.exec("SELECT 1 FROM snapshots WHERE refs=? LIMIT 1", refs).toArray().length > 0) return;
+      // 记成一条“保留”声明（不发给任何客户端），到期时间是 now + hold。
+      if (hold > 0) {
+        this.sql.exec(
+          "INSERT INTO ref_claims (token, set_id, created_ms, generation) VALUES (?,?,?,?)",
+          "hold:" + hex(crypto.getRandomValues(new Uint8Array(16))),
+          refs,
+          now + Math.min(hold, REF_CLAIM_TTL_MS) - REF_CLAIM_TTL_MS,
+          this.storageGeneration(),
+        );
+      }
     }
-    this.markGcDue(Date.now() + this.envMs("BLOB_GC_DELAY_SECONDS", DEFAULT_BLOB_GC_DELAY_MS));
+    this.markGcDue(now + this.envMs("BLOB_GC_DELAY_SECONDS", DEFAULT_BLOB_GC_DELAY_MS));
   }
 
   /** 删掉过期的声明（连同还没收齐的分批列表），以及不再被任何快照或声明用到的哈希列表。在事务里调用。 */
@@ -520,7 +547,8 @@ export class UserStore extends DurableObject<Env> {
     const now = Date.now();
     const due = this.gcDue();
     if (due === null || due > now) return;
-    // 不满足前提就保持“到期”，之后每次提交再看（只是两次很便宜的查询）；能回收时一定会有快照记录被删，也会重新安排。
+    // 不满足前提就保持“到期”，之后每次提交再看（只是几次很便宜的查询）；能回收时一定会有快照记录被删，也会重新安排
+    // （整体推迟的，到时间由 scheduleGc 安排的 alarm 来做）。
     if (this.gcBlocked()) return;
 
     const kept = new Set<string>();
@@ -596,7 +624,13 @@ export class UserStore extends DurableObject<Env> {
   /** 回收的前提不满足：没有当前快照，或者还保留着“引用未知”的快照。这时到期了也不回收，等快照记录被删时再看。 */
   private gcBlocked(): boolean {
     if (this.sql.exec("SELECT 1 FROM snapshots WHERE current=? LIMIT 1", CURRENT).toArray().length === 0) return true;
+    if (this.gcHoldUntil() > Date.now()) return true;
     return this.sql.exec("SELECT 1 FROM snapshots WHERE refs IS NULL LIMIT 1").toArray().length > 0;
+  }
+
+  /** 删掉最后一份引用未知的快照之后，回收整体推迟到这个时间（见 refsDropped）。 */
+  private gcHoldUntil(): number {
+    return Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='gc_hold_until_ms'").toArray()[0]?.v ?? 0);
   }
 
   /**
@@ -606,7 +640,7 @@ export class UserStore extends DurableObject<Env> {
   private async scheduleGc(): Promise<void> {
     const due = this.gcDue();
     if (due === null) return;
-    const wait = due - Date.now();
+    const wait = Math.max(due, this.gcHoldUntil()) - Date.now();
     if (wait > 0) await this.scheduleMaintenance(wait);
     else if (!this.gcBlocked()) await this.scheduleMaintenance();
   }
@@ -1008,14 +1042,23 @@ export class UserStore extends DurableObject<Env> {
    *   旧客户端刷新令牌后会重新查一遍缺失，所以令牌变了不会让清空前的检查混过去。
    * 在 snapshotRefs 里同步调用。
    */
-  private legacyUploadAllowed(caller: string): boolean {
+  private legacyUploadAllowed(caller: string, issuedMs: number): boolean {
     // 用代数而不是时间排先后：清空和紧接着的一次检查可能落在同一毫秒。
     const resetGeneration = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_generation'").toArray()[0]?.v ?? 0);
     if (resetGeneration === 0) return true;
     // caller_checks 不随声明过期：只要这个令牌还能用，它清空前的那次检查就还记着。
     const last = this.sql.exec<{ generation: number }>("SELECT generation FROM caller_checks WHERE caller=?", caller).toArray()[0];
-    if (!last || last.generation >= resetGeneration) return true;
-    this.sql.exec("DELETE FROM caller_checks WHERE caller=?", caller);
+    if (last) {
+      if (last.generation >= resetGeneration) return true;
+    } else {
+      // 没有记录：令牌是开始记录之后签发的，就说明它从没查过缺失（只有文字），放行。
+      // 签发得更早的，可能在开始记录之前查过、没留下记录：保守拒绝一次。
+      const trackingSince = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='caller_tracking_ms'").one().v);
+      if (issuedMs >= trackingSince) return true;
+    }
+    // 拒绝这一次，并记下“已经拦过”：这台设备下次同步会重新导出，有 blob 就重新查（记录随之更新），
+    // 只有文字就不查，凭这条记录放行。
+    this.sql.exec("INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms) VALUES (?,?,?)", caller, this.storageGeneration(), Date.now());
     return false;
   }
 
@@ -1025,10 +1068,10 @@ export class UserStore extends DurableObject<Env> {
    * （storage_generation_stale，见 storageGeneration）、或者声明里有服务端还没有的 blob（blob_refs_missing），
    * 都返回 409，客户端重新查缺失、补传 blob 之后再传。
    */
-  private snapshotRefs(header: string | null, caller: string): { refs: string | null; token: string | null } | Response {
+  private snapshotRefs(header: string | null, caller: { id: string; issuedMs: number }): { refs: string | null; token: string | null } | Response {
     const stale = () =>
       json({ code: "storage_generation_stale", error: "blobs were deleted after the blob check; check again", storageGeneration: this.storageGeneration() }, 409);
-    if (header === null) return this.legacyUploadAllowed(caller) ? { refs: null, token: null } : stale();
+    if (header === null) return this.legacyUploadAllowed(caller.id, caller.issuedMs) ? { refs: null, token: null } : stale();
     const value = header.trim();
     // 没有 blob 的快照不引用任何 blob，不会因为 blob 被删而坏掉，不看代数。
     if (value === "none") return { refs: NO_REFS, token: null };
@@ -1064,7 +1107,10 @@ export class UserStore extends DurableObject<Env> {
     await this.withCommit(() => this.reconcilePending(userId));
     // 这份快照引用了哪些 blob（见 checkBlobs）。从这里到登记待发布快照之间没有 await：
     // 核对过的 blob 不会在登记之前被回收；登记之后，这份快照的引用就保护着它们。
-    const refs = this.snapshotRefs(request.headers.get("x-klip-blob-refs"), request.headers.get("x-klip-caller") ?? "");
+    const refs = this.snapshotRefs(request.headers.get("x-klip-blob-refs"), {
+      id: request.headers.get("x-klip-caller") ?? "",
+      issuedMs: Number(request.headers.get("x-klip-caller-issued-ms") ?? 0),
+    });
     if (refs instanceof Response) {
       await drainBody(request);
       return refs;
