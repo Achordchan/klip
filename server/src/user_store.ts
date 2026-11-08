@@ -52,11 +52,22 @@ async function streamToR2(
   key: string,
   body: ReadableStream<Uint8Array> | null,
   gzip: boolean,
-  // admit(已收到的字节数)：每收到一块问一次还能不能存；返回 false 就放弃写入，
-  // 但继续读完请求体，好报出完整大小。
-  opts: { admit?: (size: number) => boolean; expectedSha256?: string },
+  // admit(已收到的字节数)：每收到一块问一次还能不能存；返回 false 就放弃写入。
+  // 放弃之后，没给 readLimit 就立刻停止解压；给了就只再解压到超过 readLimit 为止
+  // （用来判断是不是单个文件就超出上限）。之后剩下的原始请求体只读不解压。
+  // 停下时返回的 size 是已解压的字节数。
+  opts: { admit?: (size: number) => boolean; readLimit?: number; expectedSha256?: string },
 ): Promise<StoreResult> {
-  let stream: ReadableStream<Uint8Array> = body ?? new ReadableStream({ start: (c) => c.close() });
+  // 放弃之后要把请求体读完（提前回响应、不读完的话，客户端还在发就会被重置连接，收不到错误码），
+  // 但不再解压：gate 把之后的原始数据直接丢掉，解压那一层什么也收不到。原始请求体最大
+  // 也就 Cloudflare 的上传上限，读掉它很便宜；解压才贵（高压缩比的 gzip 能膨胀到几十 GB）。
+  let draining = false;
+  const gate = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, ctl) {
+      if (!draining) ctl.enqueue(chunk);
+    },
+  });
+  let stream: ReadableStream<Uint8Array> = (body ?? new ReadableStream({ start: (c) => c.close() })).pipeThrough(gate);
   if (gzip) stream = stream.pipeThrough(new DecompressionStream("gzip"));
   const reader = stream.getReader();
   const digest = new crypto.DigestStream("SHA-256");
@@ -113,11 +124,21 @@ async function streamToR2(
       if (!data || data.byteLength === 0) continue;
       size += data.byteLength;
       await digestWriter.write(data);
-      if (!storing) continue;
-      if (opts.admit && !opts.admit(size)) {
-        await abort();
-        continue;
+      if (storing && opts.admit && !opts.admit(size)) await abort();
+      if (!storing && (opts.readLimit === undefined || size > opts.readLimit)) {
+        // 不再存了，也不必再解压：只把剩下的原始请求体读掉。
+        draining = true;
+        await digestWriter.abort().catch(() => {});
+        for (;;) {
+          try {
+            if ((await reader.read()).done) break;
+          } catch {
+            break; // gzip 被截断会在这里报错，正常
+          }
+        }
+        return { size, sha256: "", stored: false };
       }
+      if (!storing) continue;
       pending.push(data);
       pendingBytes += data.byteLength;
       while (pendingBytes >= PART_SIZE) {
@@ -603,7 +624,8 @@ export class UserStore extends DurableObject<Env> {
     const quota = this.quota(tier, false);
     let result: StoreResult;
     try {
-      result = await streamToR2(this.env.BUCKET, key, request.body, this.isGzip(request), { admit: quota.admit });
+      // 放不下就不再写；再读到超过档位上限为止，用来区分“单个快照就太大”（413）和“总量超额”（409）。
+      result = await streamToR2(this.env.BUCKET, key, request.body, this.isGzip(request), { admit: quota.admit, readLimit: tier.storageLimitBytes });
     } catch (e) {
       await discard();
       if (e instanceof GzipError) return errorJson(400, "invalid gzip payload");
