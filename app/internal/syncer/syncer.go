@@ -803,23 +803,29 @@ func (s *Syncer) upload(ctx context.Context, progress func(Progress), reason, ac
 		res, e = s.cfg.Client.UploadSnapshot(ctx, t, path, refs)
 		return e
 	}
-	if err := s.ensureAccount(token, account); err != nil {
-		return nil, fp, err
-	}
-	err = call(token)
-	if syncclient.IsBlobRefsRejected(err) && len(exp.Blobs) > 0 {
-		// The declaration of the blobs ran out (a long upload, or the
-		// account's cloud data was cleared) or a blob went missing: check
-		// them again and send the missing ones, then the snapshot once more.
-		s.timing("upload", "blob_refs_rejected", started, reason)
-		if token, refs, err = s.uploadMissingBlobsWithRefresh(ctx, token, exp, started, reason+";refs_rejected", account); err != nil {
-			return nil, fp, err
+	// callChecked uploads the snapshot, and once more if the server refused
+	// the blob check it relies on: the declaration ran out (a long upload),
+	// blobs were deleted since (a collection, or the account's cloud data was
+	// cleared), or a blob went missing. The blobs are checked again and the
+	// missing ones sent first.
+	callChecked := func(tag string) error {
+		if err := s.ensureAccount(token, account); err != nil {
+			return err
+		}
+		err := call(token)
+		if !syncclient.IsBlobRefsRejected(err) || len(exp.Blobs) == 0 {
+			return err
+		}
+		s.timing("upload", "blob_refs_rejected", started, reason+tag)
+		if token, refs, err = s.uploadMissingBlobsWithRefresh(ctx, token, exp, started, reason+tag+";refs_rejected", account); err != nil {
+			return err
 		}
 		if err := s.ensureAccount(token, account); err != nil {
-			return nil, fp, err
+			return err
 		}
-		err = call(token)
+		return call(token)
 	}
+	err = callChecked("")
 	if err != nil {
 		if isSubscriptionExpired(err) {
 			return nil, fp, ErrSubscriptionExpired
@@ -842,7 +848,7 @@ func (s *Syncer) upload(ctx context.Context, progress func(Progress), reason, ac
 				return nil, fp, err
 			}
 		}
-		if err = call(token); err != nil {
+		if err = callChecked(";after_refresh"); err != nil {
 			return nil, fp, err
 		}
 		s.timing("upload", "upload_snapshot_after_refresh", started, reason)
