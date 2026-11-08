@@ -99,7 +99,7 @@ func TestAccountCallsFallBackToOfficialServer(t *testing.T) {
 	if _, err := c.GetManifestJSON(bg, "t"); err != nil {
 		t.Errorf("no server: nothing to ask, as in C#: %v", err)
 	}
-	if _, err := c.UploadSnapshot(bg, "t", "x"); !errors.Is(err, ErrNoBaseURL) {
+	if _, err := c.UploadSnapshot(bg, "t", "x", ""); !errors.Is(err, ErrNoBaseURL) {
 		t.Errorf("%v", err)
 	}
 	if c.Health(bg) {
@@ -175,10 +175,12 @@ func TestStatusAndErrors(t *testing.T) {
 func TestGzipUploadAndDownload(t *testing.T) {
 	var gotBody []byte
 	var gotEncoding, gotType string
+	var gotRefs []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == "/sync/snapshot":
 			gotEncoding, gotType = r.Header.Get("Content-Encoding"), r.Header.Get("Content-Type")
+			gotRefs = r.Header.Values("X-Klip-Blob-Refs")
 			zr, err := gzip.NewReader(r.Body)
 			if err != nil {
 				t.Errorf("body is not gzip: %v", err)
@@ -197,7 +199,7 @@ func TestGzipUploadAndDownload(t *testing.T) {
 		case r.URL.Path == "/sync/blobs/missing":
 			w.WriteHeader(404)
 		case r.URL.Path == "/sync/blobs/check":
-			io.WriteString(w, `{"missing":["aa", 5, "", "bb"]}`)
+			io.WriteString(w, `{"missing":["aa", 5, "", "bb"],"refsToken":"tok-1"}`)
 		}
 	}))
 	defer srv.Close()
@@ -206,12 +208,20 @@ func TestGzipUploadAndDownload(t *testing.T) {
 
 	src := filepath.Join(dir, "s.sqlite")
 	os.WriteFile(src, []byte("hello world"), 0o644)
-	res, err := c.UploadSnapshot(bg, "t", src)
+	res, err := c.UploadSnapshot(bg, "t", src, "")
 	if err != nil || res.Version != "1780000000000" || res.SHA256 != "abc" || *res.Size != 11 {
 		t.Fatalf("upload: %+v %v", res, err)
 	}
 	if string(gotBody) != "hello world" || gotEncoding != "gzip" || gotType != "application/octet-stream" {
 		t.Errorf("server saw %q %q %q", gotBody, gotEncoding, gotType)
+	}
+	if len(gotRefs) != 0 {
+		t.Errorf("no refs given, none sent: %q", gotRefs)
+	}
+	for _, refs := range []string{NoBlobRefs, "tok-1"} {
+		if _, err := c.UploadSnapshot(bg, "t", src, refs); err != nil || strings.Join(gotRefs, ",") != refs {
+			t.Errorf("refs %q: server saw %q %v", refs, gotRefs, err)
+		}
 	}
 
 	dst := filepath.Join(dir, "sub", "down.sqlite")
@@ -242,10 +252,13 @@ func TestGzipUploadAndDownload(t *testing.T) {
 	if err != nil || strings.Join(missing, ",") != "aa,bb" {
 		t.Errorf("missing %v %v", missing, err)
 	}
+	if check, err := c.CheckBlobs(bg, "t", []string{"aa", "bb"}); err != nil || check.RefsToken != "tok-1" || len(check.Missing) != 2 {
+		t.Errorf("check %+v %v", check, err)
+	}
 	if m, err := c.CheckMissingBlobs(bg, "t", nil); err != nil || m != nil {
 		t.Errorf("no hashes, no call: %v %v", m, err)
 	}
-	if _, err := c.UploadSnapshot(bg, "t", filepath.Join(dir, "none")); err == nil {
+	if _, err := c.UploadSnapshot(bg, "t", filepath.Join(dir, "none"), ""); err == nil {
 		t.Error("a missing file")
 	}
 	if err := c.UploadBlob(bg, "t", " ", src); err == nil {

@@ -13,7 +13,7 @@ import { getTierPolicy } from "./env";
 import { hashPassword, verifyPassword } from "./crypto";
 import { createPasswordCode, deletePasswordCode, generatePasswordCode, passwordCodeCooldown, setStorageBytes } from "./db";
 import { buildPasswordCodeMessage, sendMail } from "./smtp";
-import { DAY_MS, PASSWORD_CODE_RESEND_COOLDOWN_SECONDS, errorJson, hex, json, nowIso, safeSegment, sseEvent } from "./util";
+import { ACCESS_TOKEN_HOURS, DAY_MS, PASSWORD_CODE_RESEND_COOLDOWN_SECONDS, errorJson, hex, json, nowIso, safeSegment, sseEvent } from "./util";
 
 const PART_SIZE = 8 * 1024 * 1024; // R2 分片上传：除最后一片外每片一样大
 // R2 对同一个 key 每秒最多写一次。manifest 写入之间至少隔这么久，失败后按它的倍数退避。
@@ -49,6 +49,68 @@ interface StoreResult {
 }
 
 const R2_DELETE_BATCH = 1000; // R2 一次 delete 最多 1000 个 key
+
+// ---- blob 回收 ----
+// 客户端查缺失 blob（POST /sync/blobs/check）时交来的哈希列表，就是它接下来要上传的快照引用的全部 blob。
+// 服务端把这份列表记成一条“引用声明”（ref_claims），把 token 返回给客户端；客户端上传快照时
+// 用请求头 x-klip-blob-refs 带上这个 token（快照里没有 blob 时带 "none"），服务端就知道这份快照引用了哪些 blob。
+// 不带这个头的快照（旧客户端）“引用未知”：只要还有这样的快照被保留着，就一个 blob 也不回收。
+//
+// 哈希列表按内容存一份（ref_sets：排好序的 32 字节哈希拼在一起，id 是它的 sha256），
+// 快照和声明只记 id：每次同步只写一两行，内容没变的快照共用同一份。免费版 DO 每天写入行数有限。
+
+/** 声明的有效期：查完缺失到上传完快照必须在这之内，过期了上传快照会被拒绝（409 blob_refs_expired），客户端重来一遍。 */
+const REF_CLAIM_TTL_MS = DAY_MS;
+/** 新上传的 blob 至少保留这么久才可能被回收：旧客户端先传 blob、后传快照，中间没有声明保护。 */
+const DEFAULT_BLOB_GC_GRACE_MS = DAY_MS;
+/** 引用变少之后过这么久才回收：把一段时间里的多次变化攒成一次（每次回收要扫一遍 blobs 表）。 */
+const DEFAULT_BLOB_GC_DELAY_MS = 10 * 60_000;
+/** 快照记录删掉之后，它独占的 blob 再保留这么久：给正在下载那份快照的设备留时间取完 blob。 */
+const DEFAULT_BLOB_GC_DROP_HOLD_MS = DAY_MS;
+/** 一个账号同时保留的声明最多这么多条、这么多字节（声明自己的哈希列表，不含快照也在用的）。 */
+const MAX_REF_CLAIMS = 200;
+const MAX_REF_CLAIM_BYTES = 8 * 1024 * 1024;
+/** 一次查缺失最多这么多个哈希（8 MiB 的声明上限能装下）。Worker 据此拒绝更长的列表。 */
+export const MAX_CHECK_HASHES = 250_000;
+/**
+ * 一份声明最多这么多个哈希（ref_sets 一行最多 2MB）。超过就不收成一份，只标记为“超长”：token 照给，
+ * 上传快照时照样核对存储代数，但这份快照按“引用未知”记账（分批记下的列表照样保护这些 blob 到声明用掉或过期）。
+ */
+export const MAX_DECLARED_REFS = 60_000;
+/**
+ * caller_checks 保留多久：比访问令牌的有效期长一点。令牌过期后，这个调用方的上传过不了鉴权；
+ * 旧客户端刷新令牌后会重新查缺失，那是一个新的调用方。
+ */
+const CALLER_CHECK_KEEP_MS = (ACCESS_TOKEN_HOURS + 1) * 3_600_000;
+/** 快照“引用已知、没有 blob”时 snapshots.refs 的值。 */
+const NO_REFS = "";
+
+function encodeRefs(hashes: string[]): Uint8Array {
+  const sorted = [...new Set(hashes)].sort();
+  const out = new Uint8Array(sorted.length * 32);
+  sorted.forEach((h, i) => {
+    for (let j = 0; j < 32; j++) out[i * 32 + j] = parseInt(h.slice(j * 2, j * 2 + 2), 16);
+  });
+  return out;
+}
+
+function decodeRefs(buf: ArrayBuffer, into: Set<string>): void {
+  const bytes = new Uint8Array(buf);
+  for (let off = 0; off + 32 <= bytes.length; off += 32) into.add(hex(bytes.subarray(off, off + 32)));
+}
+
+/** 把请求体读完（不解析），再回错误：提前回响应的话，还在发送的客户端会被重置连接、收不到错误码。 */
+async function drainBody(request: Request): Promise<void> {
+  const reader = request.body?.getReader();
+  if (!reader) return;
+  try {
+    while (!(await reader.read()).done) {
+      /* 丢掉 */
+    }
+  } catch {
+    /* 对方断开也无所谓 */
+  }
+}
 
 /**
  * 把（可能是 gzip 的）请求体解压后写进 R2，同时算 sha256 和大小。
@@ -185,7 +247,10 @@ type SnapshotRow = {
   size: number;
   current: number;
   r2_key: string | null;
+  refs: string | null; // 引用的 blob：ref_sets 的 id；NO_REFS = 没有 blob；null = 未知（旧客户端）
 };
+
+const SNAPSHOT_COLS = "version,created_ms,size,current,r2_key,refs";
 
 // snapshots.current：0 = 备份，1 = 当前，2 = 正在发布（R2 里的 manifest 还没指向它）。
 const BACKUP = 0;
@@ -240,9 +305,45 @@ export class UserStore extends DurableObject<Env> {
         sha256 TEXT NOT NULL,
         r2_key TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS ref_sets (
+        id TEXT PRIMARY KEY,
+        hashes BLOB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS ref_claims (
+        token TEXT PRIMARY KEY,
+        set_id TEXT,
+        created_ms INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        oversized INTEGER NOT NULL DEFAULT 0,
+        caller TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS caller_checks (
+        caller TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL,
+        checked_ms INTEGER NOT NULL,
+        invalidated INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS ref_claim_chunks (
+        token TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        hashes BLOB NOT NULL,
+        PRIMARY KEY (token, seq)
+      );
     `);
     const cols = this.sql.exec<{ name: string }>("PRAGMA table_info(snapshots)").toArray();
     if (!cols.some((c) => c.name === "r2_key")) this.sql.exec("ALTER TABLE snapshots ADD COLUMN r2_key TEXT");
+    // 加这一列之前的快照都是 NULL，即“引用未知”。
+    if (!cols.some((c) => c.name === "refs")) this.sql.exec("ALTER TABLE snapshots ADD COLUMN refs TEXT");
+    // 加这一列之前记账的 blob 是 NULL：按 blob_epoch_ms（第一次跑到这里的时间）算它的上传时间，宽限期从那时算起。
+    const blobCols = this.sql.exec<{ name: string }>("PRAGMA table_info(blobs)").toArray();
+    if (!blobCols.some((c) => c.name === "created_ms")) {
+      this.sql.exec("ALTER TABLE blobs ADD COLUMN created_ms INTEGER");
+      // 存量 blob 里可能有从来没被快照用到的（上传失败留下的）：宽限期过后安排一次回收，不然没有别的事会触发它。
+      if (this.sql.exec("SELECT 1 FROM blobs LIMIT 1").toArray().length > 0) this.markGcDue(Date.now() + this.gcGraceMs());
+    }
+    this.sql.exec("INSERT OR IGNORE INTO meta (k,v) VALUES ('blob_epoch_ms',?)", String(Date.now()));
+    // 从这时起每台设备的查缺失都记在 caller_checks 里（见 legacyUploadAllowed）。
+    this.sql.exec("INSERT OR IGNORE INTO meta (k,v) VALUES ('caller_tracking_ms',?)", String(Date.now()));
     this.sql.exec("CREATE INDEX IF NOT EXISTS idx_snapshots_current ON snapshots (current)");
     const cleanupCols = this.sql.exec<{ name: string }>("PRAGMA table_info(cleanup)").toArray();
     if (!cleanupCols.some((c) => c.name === "blob_sha")) this.sql.exec("ALTER TABLE cleanup ADD COLUMN blob_sha TEXT");
@@ -254,9 +355,20 @@ export class UserStore extends DurableObject<Env> {
    * - 发布到一半的快照：看 R2 里的 manifest 指向谁，指向它就补成当前快照，否则撤销。
    * - 上传到一半的 blob（有上传意图、没有记账）：R2 里的文件交给待清理表删掉。
    * - 没写成功的 D1 用量：再写一次。
+   * - 做到一半的清空（见 resetStorage）：先把它做完，再处理别的。
    */
   private async recoverPublication(): Promise<void> {
-    const pending = this.sql.exec<SnapshotRow>("SELECT version,created_ms,size,current,r2_key FROM snapshots WHERE current=?", PENDING).toArray();
+    await this.scheduleGc(); // 迁移时安排的回收、或者上次没来得及安排的
+    if (this.sql.exec("SELECT 1 FROM meta WHERE k='reset_pending'").toArray().length > 0) {
+      const resetUser = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='user'").toArray()[0]?.v;
+      try {
+        if (resetUser) await this.finishReset(resetUser);
+      } catch (e) {
+        // 留到下一次快照上传开始前（uploadSnapshot 先调用 finishReset）。
+        console.error("finish storage reset failed, will retry before the next upload", String(e));
+      }
+    }
+    const pending = this.sql.exec<SnapshotRow>(`SELECT ${SNAPSHOT_COLS} FROM snapshots WHERE current=?`, PENDING).toArray();
     const hasCleanup = this.sql.exec("SELECT 1 FROM cleanup LIMIT 1").toArray().length > 0;
     const hasBlobIntents = this.sql.exec("SELECT 1 FROM blob_uploads LIMIT 1").toArray().length > 0;
     const usageDirty = this.sql.exec("SELECT 1 FROM meta WHERE k='usage_dirty'").toArray().length > 0;
@@ -294,7 +406,7 @@ export class UserStore extends DurableObject<Env> {
    * 调用时不能有正在进行的快照上传（DO 启动时，或拿着 snapshotLock 时）。
    */
   private async reconcilePending(userId: string): Promise<void> {
-    const pending = this.sql.exec<SnapshotRow>("SELECT version,created_ms,size,current,r2_key FROM snapshots WHERE current=? ORDER BY created_ms ASC", PENDING).toArray();
+    const pending = this.sql.exec<SnapshotRow>(`SELECT ${SNAPSHOT_COLS} FROM snapshots WHERE current=? ORDER BY created_ms ASC`, PENDING).toArray();
     if (pending.length === 0) return;
     const head = await this.env.BUCKET.head(manifestKey(userId)); // 失败就抛出：不在不确定时删东西
     const published = head?.customMetadata?.snapshotKey;
@@ -308,7 +420,8 @@ export class UserStore extends DurableObject<Env> {
   private dropPending(version: string, r2Key: string | null): void {
     this.ctx.storage.transactionSync(() => {
       if (r2Key) this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key) VALUES (?)", r2Key);
-      this.sql.exec("DELETE FROM snapshots WHERE version=? AND current=?", version, PENDING);
+      const row = this.sql.exec<{ refs: string | null }>("DELETE FROM snapshots WHERE version=? AND current=? RETURNING refs", version, PENDING).toArray()[0];
+      if (row) this.refsDropped(row.refs);
     });
   }
 
@@ -352,6 +465,247 @@ export class UserStore extends DurableObject<Env> {
   /** 账目变了、D1 里的用量需要重写。和改账目放在同一个事务里调用，重启也不会丢。 */
   private markUsageDirty(): void {
     this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('usage_dirty','1')");
+  }
+
+  // ---- blob 回收 ----
+
+  private envMs(
+    name: "BLOB_GC_GRACE_SECONDS" | "BLOB_GC_DELAY_SECONDS" | "BLOB_GC_DROP_HOLD_SECONDS" | "BACKUP_RETENTION_SECONDS",
+    fallback: number,
+  ): number {
+    const raw = this.env[name];
+    if (raw === undefined || raw.trim() === "") return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n * 1000 : fallback;
+  }
+
+  private gcGraceMs(): number {
+    return this.envMs("BLOB_GC_GRACE_SECONDS", DEFAULT_BLOB_GC_GRACE_MS);
+  }
+
+  /**
+   * 存储代数：每次清空云端数据、每次回收已记账的 blob 都加一（和删除在同一个事务里）。
+   * 查缺失时的声明记下当时的代数；上传快照时代数已经变了，说明查完之后有 blob 被删过，
+   * 那次“已经有了”的结论可能不再成立，拒绝上传（409 storage_generation_stale），客户端重查、补传再传。
+   * 不带声明的上传（旧客户端）不看代数，见 legacyUploadAllowed。
+   */
+  private storageGeneration(): number {
+    return Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='storage_generation'").toArray()[0]?.v ?? 0);
+  }
+
+  /** 代数加一。在删除已记账的 blob（或清空）的同一个事务里、删除之前调用。 */
+  private bumpGeneration(): void {
+    this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('storage_generation',?)", String(this.storageGeneration() + 1));
+  }
+
+  /** 下一次该检查回收的时间（存在 meta 里，重启不丢）；null = 不需要。 */
+  private gcDue(): number | null {
+    const v = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='gc_due_ms'").toArray()[0]?.v;
+    return v === undefined ? null : Number(v);
+  }
+
+  /** 安排在 at 之前检查一次回收（已经安排了更早的就不动）。 */
+  private markGcDue(at: number): void {
+    const due = this.gcDue();
+    if (due === null || at < due) this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('gc_due_ms',?)", String(at));
+  }
+
+  /**
+   * 一条快照记录删掉之后调用（和删除在同一个事务里）：它引用的 blob 如果别的快照都不再引用，
+   * 就安排一次回收。删掉的是“引用未知”的快照、而且这是最后一份时，回收从此可以进行，也安排一次。
+   */
+  private refsDropped(refs: string | null): void {
+    if (refs === NO_REFS) return;
+    const now = Date.now();
+    // 刚删掉的快照可能还有设备在下载（先下快照，再一个个取 blob）：它的 blob 再留一阵（DROP_HOLD）。
+    const hold = this.envMs("BLOB_GC_DROP_HOLD_SECONDS", DEFAULT_BLOB_GC_DROP_HOLD_MS);
+    if (refs === null) {
+      if (this.sql.exec("SELECT 1 FROM snapshots WHERE refs IS NULL LIMIT 1").toArray().length > 0) return;
+      // 引用未知的快照不知道用了哪些 blob：整体推迟回收。
+      if (hold > 0) this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('gc_hold_until_ms',?)", String(now + hold));
+    } else {
+      // 还在声明里的不算：声明会过期，回收时会按声明的到期时间再安排。
+      if (this.sql.exec("SELECT 1 FROM snapshots WHERE refs=? LIMIT 1", refs).toArray().length > 0) return;
+      // 记成一条“保留”声明（不发给任何客户端），到期时间是 now + hold。
+      if (hold > 0) {
+        this.sql.exec(
+          "INSERT INTO ref_claims (token, set_id, created_ms, generation) VALUES (?,?,?,?)",
+          "hold:" + hex(crypto.getRandomValues(new Uint8Array(16))),
+          refs,
+          now + Math.min(hold, REF_CLAIM_TTL_MS) - REF_CLAIM_TTL_MS,
+          this.storageGeneration(),
+        );
+      }
+    }
+    this.markGcDue(now + this.envMs("BLOB_GC_DELAY_SECONDS", DEFAULT_BLOB_GC_DELAY_MS));
+  }
+
+  /** 删掉过期的声明（连同还没收齐的分批列表），以及不再被任何快照或声明用到的哈希列表。在事务里调用。 */
+  private pruneRefClaims(now: number): void {
+    this.sql.exec("DELETE FROM ref_claims WHERE created_ms <= ?", now - REF_CLAIM_TTL_MS);
+    this.dropOrphanRefs();
+  }
+
+  private dropOrphanRefs(): void {
+    this.sql.exec("DELETE FROM ref_claim_chunks WHERE NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.token = ref_claim_chunks.token)");
+    this.sql.exec(
+      "DELETE FROM ref_sets WHERE NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.refs = ref_sets.id) AND NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.set_id = ref_sets.id)",
+    );
+  }
+
+  /**
+   * 给声明占的空间设上限（条数、字节数）：声明不计入档位容量，不设限的话反复查一堆不存在的哈希就能
+   * 无限写入元数据。超出时从最旧的声明开始作废，keep（正在记的这一条）不动。在事务里调用。
+   * 作废的声明不再保护它的 blob；还在用它的新客户端上传快照时会收到 blob_refs_expired，重查一遍；
+   * 旧客户端（不带声明上传）的检查记录标成作废，它的上传会被拒一次（见 legacyUploadAllowed）。
+   * 为下载保留的声明（hold:）不算在内、也不作废：它们随快照记录的删除产生，数量跟着快照走。
+   */
+  private boundRefClaims(keep: string): void {
+    const rows = this.sql
+      .exec<{ token: string; set_id: string | null; chunk_bytes: number; set_bytes: number; caller: string; created_ms: number }>(
+        `SELECT c.token AS token, c.set_id AS set_id, c.caller AS caller, c.created_ms AS created_ms,
+           COALESCE((SELECT SUM(length(k.hashes)) FROM ref_claim_chunks k WHERE k.token = c.token), 0) AS chunk_bytes,
+           CASE WHEN c.set_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.refs = c.set_id)
+             THEN COALESCE((SELECT length(r.hashes) FROM ref_sets r WHERE r.id = c.set_id), 0) ELSE 0 END AS set_bytes
+         FROM ref_claims c WHERE c.token NOT LIKE 'hold:%' ORDER BY (c.token = ?) DESC, c.created_ms DESC`,
+        keep,
+      )
+      .toArray();
+    let count = 0;
+    let bytes = 0;
+    const counted = new Set<string>();
+    const evict: { token: string; caller: string; created_ms: number }[] = [];
+    for (const r of rows) {
+      const size = r.chunk_bytes + (r.set_id && !counted.has(r.set_id) ? r.set_bytes : 0);
+      if (r.token !== keep && (count + 1 > MAX_REF_CLAIMS || bytes + size > MAX_REF_CLAIM_BYTES)) {
+        evict.push(r);
+        continue;
+      }
+      count++;
+      bytes += size;
+      if (r.set_id) counted.add(r.set_id);
+    }
+    if (evict.length === 0) return;
+    for (const e of evict) {
+      this.sql.exec("DELETE FROM ref_claims WHERE token=?", e.token);
+      // 这是那台设备最近一次检查的话，它的检查不再有保护：记下作废。
+      if (e.caller) this.sql.exec("UPDATE caller_checks SET invalidated=1 WHERE caller=? AND checked_ms <= ?", e.caller, e.created_ms);
+    }
+    this.dropOrphanRefs();
+    console.warn("ref claims over limit, evicted the oldest", { evicted: evict.length });
+  }
+
+  /**
+   * 回收不再被引用的 blob：只是把它们从账目里去掉、记进待清理表（同一个事务里减掉 blob_bytes、标记用量要重写），
+   * R2 里的文件由随后的 drainCleanup 删。到了 gc_due_ms 才做；同步执行，中间没有 await。
+   * 只能在提交锁（withCommit）里或 DO 启动恢复时调用，和 drainCleanup 一样。
+   *
+   * 一个 blob 被回收需要同时满足：
+   * - 有当前快照，并且没有任何“引用未知”的快照（当前、备份、正在发布的都算）；否则整体不回收，等以后再看；
+   * - 不被任何保留的快照引用，也不被未过期的声明引用（正在同步的设备查完缺失、还没传完快照）；
+   * - 没有正在进行的上传；
+   * - 上传已经超过宽限期。
+   */
+  private collectGarbage(userId: string): void {
+    const now = Date.now();
+    const due = this.gcDue();
+    if (due === null || due > now) return;
+    // 不满足前提就保持“到期”，之后每次提交再看（只是几次很便宜的查询）；能回收时一定会有快照记录被删，也会重新安排
+    // （整体推迟的，到时间由 scheduleGc 安排的 alarm 来做）。
+    if (this.gcBlocked()) return;
+
+    const kept = new Set<string>();
+    const wanted = this.sql.exec<{ n: number }>("SELECT COUNT(DISTINCT refs) AS n FROM snapshots WHERE refs != ?", NO_REFS).one().n;
+    let found = 0;
+    for (const r of this.sql.exec<{ hashes: ArrayBuffer }>("SELECT hashes FROM ref_sets WHERE id IN (SELECT refs FROM snapshots)")) {
+      decodeRefs(r.hashes, kept);
+      found++;
+    }
+    if (found !== wanted) {
+      // 有快照的哈希列表找不到：不该发生。宁可不回收，一小时后再看（不让 alarm 空转）。
+      console.error("blob gc: a snapshot's ref set is missing, skipping", { wanted, found });
+      this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('gc_due_ms',?)", String(now + 3_600_000));
+      return;
+    }
+    const claimed = new Set<string>();
+    let claimExpiry = Infinity;
+    for (const r of this.sql.exec<{ hashes: ArrayBuffer; created_ms: number }>(
+      "SELECT s.hashes AS hashes, MIN(c.created_ms) AS created_ms FROM ref_claims c JOIN ref_sets s ON s.id = c.set_id WHERE c.created_ms > ? GROUP BY c.set_id",
+      now - REF_CLAIM_TTL_MS,
+    )) {
+      decodeRefs(r.hashes, claimed);
+      claimExpiry = Math.min(claimExpiry, r.created_ms + REF_CLAIM_TTL_MS);
+    }
+    // 还在分批记录中的声明（查缺失的请求还没结束）。
+    for (const r of this.sql.exec<{ hashes: ArrayBuffer; created_ms: number }>(
+      "SELECT k.hashes AS hashes, c.created_ms AS created_ms FROM ref_claim_chunks k JOIN ref_claims c ON c.token = k.token WHERE c.created_ms > ?",
+      now - REF_CLAIM_TTL_MS,
+    )) {
+      decodeRefs(r.hashes, claimed);
+      claimExpiry = Math.min(claimExpiry, r.created_ms + REF_CLAIM_TTL_MS);
+    }
+
+    const grace = this.gcGraceMs();
+    const epoch = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='blob_epoch_ms'").one().v);
+    let next = Infinity;
+    const doomed: { sha256: string; size: number }[] = [];
+    for (const b of this.sql.exec<{ sha256: string; size: number; created_ms: number }>(
+      "SELECT sha256, size, COALESCE(created_ms, ?) AS created_ms FROM blobs b WHERE NOT EXISTS (SELECT 1 FROM blob_uploads u WHERE u.sha256 = b.sha256)",
+      epoch,
+    )) {
+      if (kept.has(b.sha256)) continue;
+      if (claimed.has(b.sha256)) {
+        next = Math.min(next, claimExpiry);
+        continue;
+      }
+      if (b.created_ms > now - grace) {
+        next = Math.min(next, b.created_ms + grace);
+        continue;
+      }
+      doomed.push({ sha256: b.sha256, size: b.size });
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      this.pruneRefClaims(now);
+      if (doomed.length > 0) {
+        this.bumpGeneration(); // 先加代数：之前查过缺失、还没传快照的设备会被要求重查
+        let freed = 0;
+        for (const b of doomed) {
+          this.sql.exec("DELETE FROM blobs WHERE sha256=?", b.sha256);
+          this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) VALUES (?,?)", blobKey(userId, b.sha256), b.sha256);
+          freed += b.size;
+        }
+        this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes',?)", String(Math.max(0, this.blobBytes() - freed)));
+        this.markUsageDirty();
+      }
+      if (Number.isFinite(next)) this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('gc_due_ms',?)", String(next));
+      else this.sql.exec("DELETE FROM meta WHERE k='gc_due_ms'");
+    });
+    if (doomed.length > 0) console.log("blob gc", { removed: doomed.length, bytes: doomed.reduce((n, b) => n + b.size, 0) });
+  }
+
+  /** 回收的前提不满足：没有当前快照，或者还保留着“引用未知”的快照。这时到期了也不回收，等快照记录被删时再看。 */
+  private gcBlocked(): boolean {
+    if (this.sql.exec("SELECT 1 FROM snapshots WHERE current=? LIMIT 1", CURRENT).toArray().length === 0) return true;
+    if (this.gcHoldUntil() > Date.now()) return true;
+    return this.sql.exec("SELECT 1 FROM snapshots WHERE refs IS NULL LIMIT 1").toArray().length > 0;
+  }
+
+  /** 删掉最后一份引用未知的快照之后，回收整体推迟到这个时间（见 refsDropped）。 */
+  private gcHoldUntil(): number {
+    return Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='gc_hold_until_ms'").toArray()[0]?.v ?? 0);
+  }
+
+  /**
+   * 用 alarm 安排下一次回收（alarm 只有一个，跑完一次之后要重新安排）。在提交的最后调用：
+   * 提交过程中到期时间可能刚好过去（回收那一步时还没到），这时马上安排；前提不满足的不安排，免得 alarm 空转。
+   */
+  private async scheduleGc(): Promise<void> {
+    const due = this.gcDue();
+    if (due === null) return;
+    const wait = Math.max(due, this.gcHoldUntil()) - Date.now();
+    if (wait > 0) await this.scheduleMaintenance(wait);
+    else if (!this.gcBlocked()) await this.scheduleMaintenance();
   }
 
   /** 把一份待发布的快照变成当前快照，原来的当前快照变成备份。 */
@@ -411,8 +765,6 @@ export class UserStore extends DurableObject<Env> {
   }
 
   /**
-   * 注意：blob 记上账之后不会被自动删除：服务端看不懂快照内容，不知道哪些 blob 还被引用，
-   * 贸然删除会删掉别的设备还要用的附件。限制和打算见 server/README.md 的“blob 不会自动回收”。
    * blob 总字节数：存在 meta 里的计数，和记 blob 在同一个事务里更新。
    * 上传时每收到一块数据都要查一次，不能每次都对整张 blobs 表求和。
    */
@@ -464,14 +816,17 @@ export class UserStore extends DurableObject<Env> {
 
   /** 提交的收尾：清理备份（失败只记日志，下次提交会再清），再把用量写到 D1。只在 withCommit 里调用。 */
   private async settle(userId: string, tier: TierPolicy): Promise<{ pruned: { count: number; bytes: number }; storageBytes: number }> {
-    await this.drainCleanup();
     let pruned = { count: 0, bytes: 0 };
     try {
       pruned = await this.pruneBackups(userId, tier);
     } catch (e) {
       console.error("prune backups failed", String(e));
     }
+    // 备份删掉之后才不再被引用的 blob，这次就能回收（到了回收时间的话）。
+    this.collectGarbage(userId);
+    await this.drainCleanup();
     await this.flushUsage(userId);
+    await this.scheduleGc();
     return { pruned, storageBytes: this.usageBytes() };
   }
 
@@ -501,17 +856,145 @@ export class UserStore extends DurableObject<Env> {
     const userId = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='user'").toArray()[0]?.v;
     if (!userId) return;
     await this.withCommit(async () => {
+      this.collectGarbage(userId);
       await this.drainCleanup();
       await this.flushUsage(userId);
+      await this.scheduleGc();
     });
   }
 
-  async missingBlobs(hashes: string[]): Promise<string[]> {
+  /**
+   * 清空这个用户的云端数据（后台操作）：先删 manifest，再在一个事务里把账目里的全部文件（快照、blob）
+   * 记进待清理表、清空账目、存储代数加一，最后由 drainCleanup 删 R2 里的文件。删到一半失败或 DO 重启，
+   * 剩下的留在待清理表里，alarm 和启动恢复会接着删。然后推送一次更新：客户端看到 manifest 不存在，
+   * 会把本地的快照和 blob 重新上传，只留下现在还用得到的那部分。
+   *
+   * 为什么需要它：旧客户端上传的快照不声明引用了哪些 blob，只要还保留着这样的快照，blob 就不会被自动回收，
+   * 删了历史也不会释放空间，占满档位后就同步不了。这里是给管理员的补救办法。
+   * 和正在同步的设备之间：清空前查过缺失的设备，上传快照时代数已经变了，会被拒绝并重查（见 storageGeneration；
+   * 不带声明的旧客户端见 legacyUploadAllowed）；
+   * 正在上传的 blob 不在账目里，不受影响，它们的提交照常记账。
+   * 拿着快照锁和提交锁执行，期间没有快照在上传或发布。
+   * 删 manifest 之前先记下“清空进行中”（meta reset_pending）：删完 manifest、事务还没提交时 DO 重启，
+   * 启动恢复会接着把清空做完；恢复也失败的话，下一次快照上传开始前先做完它（见 finishReset）。
+   */
+  async resetStorage(userId: string): Promise<{ removedObjects: number }> {
+    const run = this.snapshotLock.then(() =>
+      this.withCommit(async () => {
+        this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_pending','1')");
+        return { removedObjects: await this.finishReset(userId, this.env.TEST_INTERRUPT_RESET === "1") };
+      }),
+    );
+    this.snapshotLock = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * 做完记下的清空（见 resetStorage），没有就什么都不做，返回 0。调用时不能有快照在上传或发布：
+   * 拿着快照锁和提交锁，或者在 DO 启动恢复里。失败就抛出，reset_pending 留着（manifest 可能已经删掉了），下次再做：管理员看到失败，清空也会在下次快照上传前或 DO 重启时做完。
+   */
+  private async finishReset(userId: string, interruptForTest = false): Promise<number> {
+    if (this.sql.exec("SELECT 1 FROM meta WHERE k='reset_pending'").toArray().length === 0) return 0;
+    // manifest 不进待清理表：清理晚于新快照发布的话，会删掉新的 manifest。失败就抛出，账目没动。
+    await this.env.BUCKET.delete(manifestKey(userId));
+    if (interruptForTest) throw new Error("storage reset interrupted (TEST_INTERRUPT_RESET)");
+    const queued = this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM meta WHERE k='reset_pending'");
+      this.bumpGeneration();
+      let n = 0;
+      for (const r of this.sql.exec<{ version: string; r2_key: string | null }>("SELECT version, r2_key FROM snapshots").toArray()) {
+        this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key) VALUES (?)", r.r2_key ?? snapshotKey(userId, r.version));
+        n++;
+      }
+      for (const b of this.sql.exec<{ sha256: string }>("SELECT sha256 FROM blobs").toArray()) {
+        this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) VALUES (?,?)", blobKey(userId, b.sha256), b.sha256);
+        n++;
+      }
+      this.sql.exec("DELETE FROM snapshots");
+      this.sql.exec("DELETE FROM blobs");
+      this.sql.exec("DELETE FROM ref_sets WHERE NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.set_id = ref_sets.id)");
+      this.sql.exec("DELETE FROM meta WHERE k='gc_due_ms'");
+      this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes','0')");
+      // 清空前查过缺失、清空后才上传的旧客户端据此拒绝（见 legacyUploadAllowed）。
+      this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_generation',?)", String(this.storageGeneration()));
+      this.markUsageDirty();
+      return n;
+    });
+    await this.drainCleanup();
+    await this.flushUsage(userId);
+    this.broadcast(sseEvent("sync-updated", { reset: true, updatedAt: nowIso() }));
+    return queued + 1;
+  }
+
+  /**
+   * 查哪些 blob 服务端还没有（hashes 已经规范化、去重），同时把这批哈希记进一条引用声明：
+   * Worker 按批调用（RPC 参数有大小限制），第一批 token 为 null，新开一条声明；之后各批带上返回的 token
+   * 追加进去；final 那一批把整份列表收成一个 ref_sets（按内容去重），collect 为 false（列表太长）时
+   * 只标记成“超长”，分批记下的列表照样保护这些 blob。
+   * 声明在有效期内保护列表里的 blob 不被回收：查完说“已经有了”的 blob，不会在客户端传快照之前被删掉。
+   * 返回的 refsToken 由客户端在上传快照时带上；旧客户端不认识它，声明到期自然作废。
+   * 带来的 token 已经不存在或已经收尾（不该发生）时 refsToken 为 null，Worker 让整次检查失败。
+   */
+  async checkBlobs(
+    hashes: string[],
+    declare: { token: string | null; final: boolean; collect: boolean; caller: string },
+  ): Promise<{ missing: string[]; refsToken: string | null }> {
+    // 从这里到查完缺失没有 await：记这批声明和查缺失是同一刻，回收（也是同步执行的）只能在这之前或之后。
+    const now = Date.now();
+    let token: string | null = null;
+    {
+      const t = declare.token ?? hex(crypto.getRandomValues(new Uint8Array(16)));
+      token = this.ctx.storage.transactionSync(() => {
+        if (declare.token === null) {
+          this.pruneRefClaims(now);
+          this.sql.exec(
+            "INSERT INTO ref_claims (token, set_id, created_ms, generation, caller) VALUES (?,NULL,?,?,?)",
+            t,
+            now,
+            this.storageGeneration(),
+            declare.caller,
+          );
+          // 记下这台设备最近一次查缺失时的代数（见 legacyUploadAllowed）。令牌过期之后它就传不上来了，
+          // 刷新令牌后旧客户端会重新查一遍、换一个调用方标识，所以更早的记录可以删掉。
+          this.sql.exec("DELETE FROM caller_checks WHERE checked_ms < ?", now - CALLER_CHECK_KEEP_MS);
+          this.sql.exec(
+            "INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms, invalidated) VALUES (?,?,?,0)",
+            declare.caller,
+            this.storageGeneration(),
+            now,
+          );
+        } else if (this.sql.exec("SELECT 1 FROM ref_claims WHERE token=? AND set_id IS NULL AND created_ms > ?", t, now - REF_CLAIM_TTL_MS).toArray().length === 0) {
+          return null;
+        }
+        const seq = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ref_claim_chunks WHERE token=?", t).one().n;
+        this.sql.exec("INSERT INTO ref_claim_chunks (token, seq, hashes) VALUES (?,?,?)", t, seq, encodeRefs(hashes).buffer as ArrayBuffer);
+        this.boundRefClaims(t);
+        return t;
+      });
+    }
     const missing: string[] = [];
     for (const h of hashes) {
       if (this.sql.exec("SELECT 1 FROM blobs WHERE sha256=?", h).toArray().length === 0) missing.push(h);
     }
-    return missing;
+    if (token && declare.final && !declare.collect) {
+      const t = token;
+      this.sql.exec("UPDATE ref_claims SET oversized=1 WHERE token=? AND set_id IS NULL", t);
+    } else if (token && declare.final) {
+      // 收齐了：合成一份排好序的列表。算哈希要 await，这期间分批记下的列表照样保护着这些 blob。
+      const all = new Set<string>();
+      for (const r of this.sql.exec<{ hashes: ArrayBuffer }>("SELECT hashes FROM ref_claim_chunks WHERE token=?", token)) decodeRefs(r.hashes, all);
+      const bytes = encodeRefs([...all]);
+      const setId = hex(await crypto.subtle.digest("SHA-256", bytes));
+      const t = token;
+      token = this.ctx.storage.transactionSync(() => {
+        if (this.sql.exec("SELECT 1 FROM ref_claims WHERE token=? AND set_id IS NULL", t).toArray().length === 0) return null; // 刚被清空
+        this.sql.exec("INSERT OR IGNORE INTO ref_sets (id, hashes) VALUES (?,?)", setId, bytes.buffer as ArrayBuffer);
+        this.sql.exec("UPDATE ref_claims SET set_id=? WHERE token=?", setId, t);
+        this.sql.exec("DELETE FROM ref_claim_chunks WHERE token=?", t);
+        return t;
+      });
+    }
+    return { missing, refsToken: token };
   }
 
   async storageBytes(): Promise<number> {
@@ -593,8 +1076,14 @@ export class UserStore extends DurableObject<Env> {
       await this.withCommit(async () => {
         this.ctx.storage.transactionSync(() => {
           const before = this.blobBytes();
-          const inserted = this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size) VALUES (?,?) RETURNING size", sha, result.size).toArray().length > 0;
-          if (inserted) this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes',?)", String(before + result.size));
+          const now = Date.now();
+          const inserted =
+            this.sql.exec("INSERT OR IGNORE INTO blobs (sha256,size,created_ms) VALUES (?,?,?) RETURNING size", sha, result.size, now).toArray().length > 0;
+          if (inserted) {
+            this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes',?)", String(before + result.size));
+            // 宽限期过后看一眼：上传了却没有快照用到它（快照没传成）的 blob 那时回收。
+            this.markGcDue(now + this.gcGraceMs());
+          }
           this.markUsageDirty();
           this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
           this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", key);
@@ -634,16 +1123,129 @@ export class UserStore extends DurableObject<Env> {
   }
 
   /**
+   * 不带声明的上传（还没用上引用声明的 Go 客户端；已发布的 C# 客户端连的是旧服务器，到不了这里）能不能接受。
+   * - 回收不影响它：它查缺失时同样会记下声明，声明有效期内不会回收它查到的 blob。
+   * - 清空会：它可能是在清空前查的缺失（结论是“都在”），清空后才上传。按调用方（访问令牌）对上：
+   *   这台设备最近一次查缺失（caller_checks）在最近一次清空之前，就拒绝，并删掉这条记录。它的同步就此失败，
+   *   下次同步会重新导出、有 blob 就重新查，那时就能通过；只有文字的历史从来不查，也就不会被拦。
+   *   旧客户端刷新令牌后会重新查一遍缺失，所以令牌变了不会让清空前的检查混过去。
+   * 在 snapshotRefs 里同步调用。
+   */
+  private legacyUploadAllowed(caller: string, issuedMs: number): boolean {
+    // 旧客户端查缺失和上传快照用同一个令牌（遇到 401 刷新令牌后会重新查一遍），所以它的检查不早于令牌签发；
+    // 那次检查的声明保护它查到的 blob 24 小时。令牌签发不到 24 小时，回收就碰不到那些 blob。
+    // 访问令牌只有两小时有效，下面这条正常走不到，留着把这个前提写明：超过了就不再担保。
+    if (this.storageGeneration() > 0 && Date.now() - issuedMs >= REF_CLAIM_TTL_MS) return this.refuseLegacy(caller);
+    // caller_checks 不随声明过期：只要这个令牌还能用，它最近那次检查就还记着。
+    const last = this.sql
+      .exec<{ generation: number; invalidated: number }>("SELECT generation, invalidated FROM caller_checks WHERE caller=?", caller)
+      .toArray()[0];
+    // 它最近那次检查的声明因为超出上限被作废了：那些 blob 不再受保护，不再担保（见 boundRefClaims）。
+    if (last?.invalidated) return this.refuseLegacy(caller);
+    // 用代数而不是时间排先后：清空和紧接着的一次检查可能落在同一毫秒。
+    const resetGeneration = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_generation'").toArray()[0]?.v ?? 0);
+    if (resetGeneration === 0) return true;
+    if (last) return last.generation >= resetGeneration || this.refuseLegacy(caller);
+    // 没有记录：令牌是开始记录之后签发的，就说明它从没查过缺失（只有文字），放行。
+    // 签发得更早的，可能在开始记录之前查过、没留下记录：保守拒绝一次。
+    const trackingSince = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='caller_tracking_ms'").one().v);
+    return issuedMs >= trackingSince || this.refuseLegacy(caller);
+  }
+
+  /**
+   * 拒绝一次不带声明的上传，并记下“已经拦过”（当前代数、未作废）：这台设备的这次同步就此失败，
+   * 下次同步会重新导出，有 blob 就重新查（记录随之更新），只有文字就不查，凭这条记录放行。
+   */
+  private refuseLegacy(caller: string): false {
+    this.sql.exec(
+      "INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms, invalidated) VALUES (?,?,?,0)",
+      caller,
+      this.storageGeneration(),
+      Date.now(),
+    );
+    return false;
+  }
+
+  /**
+   * 读上传快照的 x-klip-blob-refs 头：没有这个头 = 引用未知（旧客户端）；"none" = 没有 blob；
+   * 否则是查缺失时拿到的声明 token。声明不存在或过期了（blob_refs_expired）、查完之后有 blob 被删过
+   * （storage_generation_stale，见 storageGeneration）、或者声明里有服务端还没有的 blob（blob_refs_missing），
+   * 都返回 409，客户端重新查缺失、补传 blob 之后再传。
+   */
+  private snapshotRefs(
+    header: string | null,
+    caller: { id: string; issuedMs: number; unique: boolean },
+  ): { refs: string | null; token: string | null } | Response {
+    const stale = () =>
+      json({ code: "storage_generation_stale", error: "blobs were deleted after the blob check; check again", storageGeneration: this.storageGeneration() }, 409);
+    if (header === null) {
+      // 不带声明的上传靠调用方（令牌）把检查和上传对上；这一版之前签发的令牌可能几台设备共用一个，
+      // 对不上。让它先刷新令牌：旧客户端遇到 401 会刷新，并用新令牌重新查一遍缺失再上传。
+      if (!caller.unique) return errorJson(401, "access token predates blob reference tracking; refresh it");
+      return this.legacyUploadAllowed(caller.id, caller.issuedMs) ? { refs: null, token: null } : stale();
+    }
+    const value = header.trim();
+    // 没有 blob 的快照不引用任何 blob，不会因为 blob 被删而坏掉，不看代数。
+    if (value === "none") return { refs: NO_REFS, token: null };
+    const claim = this.sql
+      .exec<{ set_id: string | null; generation: number; oversized: number }>(
+        "SELECT set_id, generation, oversized FROM ref_claims WHERE token=? AND created_ms > ?",
+        value,
+        Date.now() - REF_CLAIM_TTL_MS,
+      )
+      .toArray()[0];
+    if (claim?.oversized) {
+      // 列表太长没收成一份：只核对代数，快照按“引用未知”记账。
+      return claim.generation === this.storageGeneration() ? { refs: null, token: value } : stale();
+    }
+    const set = claim?.set_id ? this.sql.exec<{ hashes: ArrayBuffer }>("SELECT hashes FROM ref_sets WHERE id=?", claim.set_id).toArray()[0] : undefined;
+    if (!claim || !claim.set_id || !set) return json({ code: "blob_refs_expired", error: "blob reference declaration not found or expired" }, 409);
+    if (claim.generation !== this.storageGeneration()) return stale();
+    const hashes = new Set<string>();
+    decodeRefs(set.hashes, hashes);
+    const missing: string[] = [];
+    for (const h of hashes) if (this.sql.exec("SELECT 1 FROM blobs WHERE sha256=?", h).toArray().length === 0) missing.push(h);
+    if (missing.length > 0) return json({ code: "blob_refs_missing", error: "snapshot refers to blobs the server does not have", missing: missing.slice(0, 100) }, 409);
+    return { refs: claim.set_id as string, token: value };
+  }
+
+  /**
    * 上传快照：先登记成“正在发布”，写进 R2，确定放得下，写 manifest，最后才切成当前快照。
    * 任何一步失败都撤销这份待发布的快照，当前快照、manifest、备份都不动；
    * 写 manifest 的结果不明时先回读核对，读不到就保留待发布状态，留给下次上传或 DO 重启时的 reconcilePending。
    */
   private async uploadSnapshot(request: Request, userId: string, tier: TierPolicy): Promise<Response> {
-    // 先处理上次留下的、结果不明的发布（拿着 snapshotLock，没有别的快照在上传）。
-    await this.withCommit(() => this.reconcilePending(userId));
+    // 先做完没做完的清空，再处理上次留下的、结果不明的发布（拿着 snapshotLock，没有别的快照在上传）。
+    // 清空做不完就让这次上传失败：不能在 manifest 已删、账目还在的状态下发布新快照。
+    await this.withCommit(async () => {
+      await this.finishReset(userId);
+      await this.reconcilePending(userId);
+    });
+    // 这份快照引用了哪些 blob（见 checkBlobs）。从这里到登记待发布快照之间没有 await：
+    // 核对过的 blob 不会在登记之前被回收；登记之后，这份快照的引用就保护着它们。
+    const refs = this.snapshotRefs(request.headers.get("x-klip-blob-refs"), {
+      id: request.headers.get("x-klip-caller") ?? "",
+      issuedMs: Number(request.headers.get("x-klip-caller-issued-ms") ?? 0),
+      unique: request.headers.get("x-klip-caller-unique") === "1",
+    });
+    if (refs instanceof Response) {
+      await drainBody(request);
+      return refs;
+    }
     const version = this.nextVersion();
     const key = snapshotKey(userId, version);
-    this.sql.exec("INSERT INTO snapshots (version,created_ms,size,sha256,current,r2_key) VALUES (?,?,0,'',?,?)", version, Number(version), PENDING, key);
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        "INSERT INTO snapshots (version,created_ms,size,sha256,current,r2_key,refs) VALUES (?,?,0,'',?,?,?)",
+        version,
+        Number(version),
+        PENDING,
+        key,
+        refs.refs,
+      );
+      // 声明用掉了：引用由这份快照接着保护。上传失败的话快照记录撤销，客户端下次同步会重新查一遍。
+      if (refs.token) this.sql.exec("DELETE FROM ref_claims WHERE token=?", refs.token);
+    });
     // 撤销只登记待清理（同步、和删记录同一事务），真正删 R2 留给提交锁里的 drainCleanup：
     // 所有清理都排在同一条队列上，同一个哈希不会有两次删除同时在进行。
     const discard = async () => {
@@ -739,8 +1341,9 @@ export class UserStore extends DurableObject<Env> {
 
   /** 先删超过保留天数的备份，还超额就从最旧的开始删。当前快照和正在发布的不动。只在 withCommit 里调用。 */
   private async pruneBackups(userId: string, tier: TierPolicy): Promise<{ count: number; bytes: number }> {
-    const backups = this.sql.exec<SnapshotRow>("SELECT version,created_ms,size,current,r2_key FROM snapshots WHERE current=? ORDER BY created_ms ASC", BACKUP).toArray();
-    const cutoff = Date.now() - Math.abs(tier.retentionDays) * DAY_MS;
+    const backups = this.sql.exec<SnapshotRow>(`SELECT ${SNAPSHOT_COLS} FROM snapshots WHERE current=? ORDER BY created_ms ASC`, BACKUP).toArray();
+    // BACKUP_RETENTION_SECONDS 只给测试用：让备份很快过期，好观察 blob 回收。
+    const cutoff = Date.now() - this.envMs("BACKUP_RETENTION_SECONDS", Math.abs(tier.retentionDays) * DAY_MS);
     const doomed: SnapshotRow[] = backups.filter((b) => b.created_ms < cutoff);
     let usage = this.usageBytes() - doomed.reduce((n, b) => n + b.size, 0);
     for (const b of backups) {
@@ -756,6 +1359,7 @@ export class UserStore extends DurableObject<Env> {
       await this.env.BUCKET.delete(batch.map((b) => b.r2_key ?? snapshotKey(userId, b.version)));
       this.ctx.storage.transactionSync(() => {
         for (const b of batch) this.sql.exec("DELETE FROM snapshots WHERE version=?", b.version);
+        for (const b of batch) this.refsDropped(b.refs);
         this.markUsageDirty();
       });
       for (const b of batch) {

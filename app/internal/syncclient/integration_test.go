@@ -164,7 +164,7 @@ func TestAgainstTheRealServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	up, err := c.UploadSnapshot(ctx, access, snapPath)
+	up, err := c.UploadSnapshot(ctx, access, snapPath, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestAgainstTheRealServer(t *testing.T) {
 	if !strings.Contains(conn.Data, "serverTime") {
 		t.Errorf("connected: %q", conn.Data)
 	}
-	up2, err := c.UploadSnapshot(ctx, access, snapPath)
+	up2, err := c.UploadSnapshot(ctx, access, snapPath, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestAgainstTheRealServer(t *testing.T) {
 		t.Fatal("the session did not renew the token after the server refused it")
 	}
 	time.Sleep(300 * time.Millisecond) // let the stream connect
-	if _, err := c.UploadSnapshot(ctx, model.Str(current().AuthAccessToken), snapPath); err != nil {
+	if _, err := c.UploadSnapshot(ctx, model.Str(current().AuthAccessToken), snapPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	select {

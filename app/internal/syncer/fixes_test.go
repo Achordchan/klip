@@ -3349,3 +3349,138 @@ func TestApplyingNeedsAWayToSaveTheHistory(t *testing.T) {
 		t.Fatal("the history was changed")
 	}
 }
+
+// The server refuses a snapshot upload whose blob check is no longer good
+// (blobs were deleted since): the blobs are checked again and the snapshot
+// uploaded once more, with the new declaration. Also when the first try
+// needed a token refresh.
+func TestUploadRetriesARefusedBlobCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		answers []int // to each snapshot upload, in turn
+		checks  int
+	}{
+		{"refused", []int{409, 200}, 2},
+		{"refused after a refresh", []int{401, 409, 200}, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var checks int
+			var sent []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case r.URL.Path == "/sync/blobs/check":
+					checks++
+					fmt.Fprintf(w, `{"missing":[],"refsToken":"tok-%d"}`, checks)
+				case r.Method == http.MethodPut && r.URL.Path == "/sync/snapshot":
+					io.Copy(io.Discard, r.Body)
+					sent = append(sent, r.Header.Get("X-Klip-Blob-Refs"))
+					switch tc.answers[len(sent)-1] {
+					case 409:
+						w.WriteHeader(409)
+						io.WriteString(w, `{"code":"storage_generation_stale","error":"check again"}`)
+					case 401:
+						w.WriteHeader(401)
+					default:
+						io.WriteString(w, `{"version":"1780000000000","sha256":"abc","size":1}`)
+					}
+				case r.URL.Path == "/auth/refresh":
+					io.WriteString(w, `{"accessToken":"`+testJWT("account-a")+`","refreshToken":"r2","accessTokenExpiresAt":"2030-01-01T00:00:00+00:00"}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			dir := t.TempDir()
+			img := filepath.Join(dir, "1780000000000_a.png")
+			os.WriteFile(img, []byte("\x89PNG-bytes"), 0o644)
+			item := model.Item{ID: "7c9e6679-7425-40de-944b-e07fc1f90ae7", Kind: model.KindImage, CapturedAt: model.Time{Time: time.Now()},
+				ApproxBytes: 10, ImageFilePath: &img, CopyCount: 1}
+			s := model.DefaultSettings()
+			s.AuthAccessToken = model.Ptr(testJWT("account-a"))
+			s.AuthRefreshToken = model.Ptr("r1")
+			s.AuthExpiresAtUnixMs = time.Now().Add(time.Hour).UnixMilli()
+			syn := unitSyncer(t, srv, &s, &unitHistory{items: []model.Item{item}})
+			if _, err := syn.Upload(context.Background(), nil, "test"); err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			want := make([]string, 0, len(tc.answers))
+			for i := range tc.answers {
+				want = append(want, fmt.Sprintf("tok-%d", min(i+1, tc.checks)))
+			}
+			if checks != tc.checks || strings.Join(sent, ",") != strings.Join(want, ",") {
+				t.Errorf("checks %d, uploads with %v; want %d, %v", checks, sent, tc.checks, want)
+			}
+		})
+	}
+}
+
+// A long blob check that the server interrupts half way (409
+// blob_check_interrupted) is asked again a few times, not given up at once.
+func TestUploadRetriesAnInterruptedBlobCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		interrupted int // checks answered with 409 before the others succeed
+		checks      int
+		ok          bool
+	}{
+		{"once", 1, 2, true},
+		{"every time", 100, blobCheckAttempts, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var checks int
+			var sent []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case r.URL.Path == "/sync/blobs/check":
+					checks++
+					if checks <= tc.interrupted {
+						w.WriteHeader(409)
+						io.WriteString(w, `{"code":"blob_check_interrupted","error":"check again"}`)
+						return
+					}
+					fmt.Fprintf(w, `{"missing":[],"refsToken":"tok-%d"}`, checks)
+				case r.Method == http.MethodPut && r.URL.Path == "/sync/snapshot":
+					io.Copy(io.Discard, r.Body)
+					sent = append(sent, r.Header.Get("X-Klip-Blob-Refs"))
+					io.WriteString(w, `{"version":"1780000000000","sha256":"abc","size":1}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			dir := t.TempDir()
+			img := filepath.Join(dir, "1780000000000_a.png")
+			os.WriteFile(img, []byte("\x89PNG-bytes"), 0o644)
+			item := model.Item{ID: "7c9e6679-7425-40de-944b-e07fc1f90ae7", Kind: model.KindImage, CapturedAt: model.Time{Time: time.Now()},
+				ApproxBytes: 10, ImageFilePath: &img, CopyCount: 1}
+			s := model.DefaultSettings()
+			s.AuthAccessToken = model.Ptr(testJWT("account-a"))
+			s.AuthRefreshToken = model.Ptr("r1")
+			s.AuthExpiresAtUnixMs = time.Now().Add(time.Hour).UnixMilli()
+			syn := unitSyncer(t, srv, &s, &unitHistory{items: []model.Item{item}})
+			_, err := syn.Upload(context.Background(), nil, "test")
+			mu.Lock()
+			defer mu.Unlock()
+			if checks != tc.checks {
+				t.Errorf("checks %d, want %d", checks, tc.checks)
+			}
+			if tc.ok {
+				if err != nil || strings.Join(sent, ",") != fmt.Sprintf("tok-%d", tc.checks) {
+					t.Errorf("upload: %v, sent %v", err, sent)
+				}
+			} else if !syncclient.IsBlobCheckInterrupted(err) || len(sent) != 0 {
+				t.Errorf("upload: %v, sent %v; want the interrupted check, and no snapshot", err, sent)
+			}
+		})
+	}
+}

@@ -4,7 +4,7 @@ import type { Env } from "./env";
 import { SUPPORTED_TIERS, getTierPolicy, normalizeTierName } from "./env";
 import { type Claims, signJwt, verifyJwt } from "./crypto";
 import * as db from "./db";
-import { blobKey, manifestKey, UserStore } from "./user_store";
+import { blobKey, manifestKey, MAX_CHECK_HASHES, MAX_DECLARED_REFS, UserStore } from "./user_store";
 import { isEmailConfigured } from "./smtp";
 import {
   ACCESS_TOKEN_HOURS,
@@ -17,6 +17,7 @@ import {
   REFRESH_TOKEN_DAYS,
   TOKEN_LEEWAY_SECONDS,
   asInt,
+  base64UrlDecode,
   base64UrlEncode,
   clamp,
   errorJson,
@@ -95,6 +96,10 @@ async function accessTokenFor(env: Env, userId: string, email: string) {
     nbf: iat,
     iat,
     exp: Math.floor(accessExpires / 1000),
+    // 每个令牌各不相同（同一秒签发的也是），调用方标识（callerId）靠它区分设备。
+    jti: base64UrlEncode(randomBytes(12)),
+    // 精确到毫秒的签发时间（iat 只到秒），见 tokenIssuedMs。
+    iat_ms: now,
   };
   return { accessToken: await signJwt(claims, env.AUTH_SIGNING_KEY), accessTokenExpiresAt: new Date(accessExpires).toISOString() };
 }
@@ -108,6 +113,29 @@ async function issueTokens(env: Env, userId: string, email: string) {
   await db.insertRefreshToken(env, await sha256Hex(refreshToken.token), userId, refreshToken.expiresAt);
   const access = await accessTokenFor(env, userId, email);
   return { accessToken: access.accessToken, refreshToken: refreshToken.token, accessTokenExpiresAt: access.accessTokenExpiresAt, email, userId };
+}
+
+/**
+ * 调用方标识：访问令牌的哈希（每台设备登录、刷新各拿各的令牌）。用来把一台旧客户端的“查缺失”和
+ * 它随后的快照上传对上（见 UserStore.legacyUploadAllowed）。
+ */
+async function callerId(request: Request): Promise<string> {
+  return (await sha256Hex(bearer(request) ?? "")).slice(0, 32);
+}
+
+/**
+ * 访问令牌的签发时间（毫秒），以及它是不是这一版签发的（有 jti 和 iat_ms，各不相同）。
+ * 更早签发的令牌，两台设备同一秒登录时可能一模一样，不能当作设备标识（见 UserStore.snapshotRefs）。
+ * 令牌已经在 requireSync 里验过签名，这里只读它的声明。
+ */
+function tokenIssue(request: Request): { issuedMs: number; unique: boolean } {
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode((bearer(request) ?? "").split(".")[1] ?? "")));
+    if (typeof payload.iat_ms === "number" && typeof payload.jti === "string") return { issuedMs: payload.iat_ms, unique: true };
+    return { issuedMs: typeof payload.iat === "number" ? payload.iat * 1000 : 0, unique: false };
+  } catch {
+    return { issuedMs: 0, unique: false };
+  }
 }
 
 /** 订阅有效且分配了档位才能同步。 */
@@ -298,12 +326,18 @@ function forwardUpload(req: Request, env: Env, userId: string, path: string, ext
   const headers = new Headers({ "x-klip-user": userId, ...extra });
   const encoding = req.headers.get("content-encoding");
   if (encoding) headers.set("content-encoding", encoding);
+  // 上传快照时声明它引用的 blob（见 UserStore.checkBlobs）。
+  const refs = req.headers.get("x-klip-blob-refs");
+  if (refs !== null) headers.set("x-klip-blob-refs", refs);
   return userStub(env, userId).fetch(new Request(`https://user-store${path}`, { method: "PUT", headers, body: req.body }));
 }
 
 const syncSnapshotPut: Handler = async (req, env) => {
   const { user, tier } = await requireSync(req, env);
-  return forwardUpload(req, env, user.id, "/snapshot", { "x-klip-tier": JSON.stringify(tier) });
+  return forwardUpload(req, env, user.id, "/snapshot", { "x-klip-tier": JSON.stringify(tier), "x-klip-caller": await callerId(req),
+    "x-klip-caller-issued-ms": String(tokenIssue(req).issuedMs),
+    "x-klip-caller-unique": tokenIssue(req).unique ? "1" : "0",
+  });
 };
 
 const syncBlobCheck: Handler = async (req, env) => {
@@ -312,10 +346,25 @@ const syncBlobCheck: Handler = async (req, env) => {
   if (!Array.isArray(p.hashes)) return errorJson(400, "missing hashes");
   const hashes = [...new Set(p.hashes.map(normalizeBlobSha256).filter((h): h is string => h !== null))];
   // DO 的 RPC 参数和返回值各限 1 MiB：分批问（每批 2000 个哈希，约 140 KB）。
+  // 这份列表同时是一条引用声明（见 UserStore.checkBlobs）：每批都记进同一条声明，最后一批时收成一份；
+  // refsToken 由客户端在上传快照时带上，服务端据此核对存储代数、回收不再被引用的 blob。
+  // 列表太长（收成一份放不下）时只标记为“超长”，快照按“引用未知”记账。
+  if (!hashes.length) return json({ missing: [] });
+  if (hashes.length > MAX_CHECK_HASHES) return json({ code: "blob_check_too_large", error: "too many hashes in one check" }, 413);
   const stub = userStub(env, user.id);
   const missing: string[] = [];
-  for (let i = 0; i < hashes.length; i += BLOB_CHECK_BATCH) missing.push(...(await stub.missingBlobs(hashes.slice(i, i + BLOB_CHECK_BATCH))));
-  return json({ missing });
+  const collect = hashes.length <= MAX_DECLARED_REFS;
+  const caller = await callerId(req);
+  let refsToken: string | null = null;
+  for (let i = 0; i < hashes.length; i += BLOB_CHECK_BATCH) {
+    const batch = hashes.slice(i, i + BLOB_CHECK_BATCH);
+    const r = await stub.checkBlobs(batch, { token: refsToken, final: i + BLOB_CHECK_BATCH >= hashes.length, collect, caller });
+    // 声明中途没了（不该发生）：前面几批的结论没人担保，整次作废，让客户端重来。
+    if (r.refsToken === null) return json({ code: "blob_check_interrupted", error: "blob check was interrupted; check again" }, 409);
+    missing.push(...r.missing);
+    refsToken = r.refsToken;
+  }
+  return json({ missing, refsToken });
 };
 
 const syncBlobPut: Handler = async (req, env, _ctx, [raw]) => {
@@ -480,6 +529,14 @@ const adminResetPassword: Handler = async (req, env) => {
   return json({ success: true, userId: user.id, email: user.email });
 };
 
+const adminResetStorage: Handler = async (req, env) => {
+  const t = await adminTarget(req, env);
+  if (t instanceof Response) return t;
+  const { user } = t;
+  const r = await userStub(env, user.id).resetStorage(user.id);
+  return json({ success: true, userId: user.id, email: user.email, removedObjects: r.removedObjects });
+};
+
 // ---- 路由表 ----
 
 const ROUTES: Array<[string, RegExp, Handler]> = [
@@ -510,6 +567,7 @@ const ROUTES: Array<[string, RegExp, Handler]> = [
   ["POST", /^\/admin\/user\/upgrade$/, adminUpgrade],
   ["POST", /^\/admin\/user\/tier$/, adminSetTier],
   ["POST", /^\/admin\/user\/reset-password$/, adminResetPassword],
+  ["POST", /^\/admin\/user\/reset-storage$/, adminResetStorage],
 ];
 
 export default {

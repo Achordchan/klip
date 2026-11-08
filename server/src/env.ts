@@ -21,6 +21,14 @@ export interface Env {
   SMTP_FROM_NAME: string;
   SMTP_SSL: string;
   SMTP_STARTTLS: string;
+
+  // blob 回收的时间（秒），不设就用默认值（见 user_store.ts）。BACKUP_RETENTION_SECONDS 只给测试用。
+  BLOB_GC_GRACE_SECONDS?: string;
+  BLOB_GC_DELAY_SECONDS?: string;
+  BLOB_GC_DROP_HOLD_SECONDS?: string;
+  BACKUP_RETENTION_SECONDS?: string;
+  // 只给测试用：设成 1 时后台清空删完 manifest 就中断（模拟 DO 在这时重启），由下一次快照上传接着做完。
+  TEST_INTERRUPT_RESET?: string;
 }
 
 export interface TierPolicy {

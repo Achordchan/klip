@@ -327,7 +327,7 @@ func TestUploadSnapshotRejectsAnEmptyReceipt(t *testing.T) {
 	if err := os.WriteFile(src, []byte("snapshot"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(srv.URL).UploadSnapshot(bg, "t", src); err == nil {
+	if _, err := New(srv.URL).UploadSnapshot(bg, "t", src, ""); err == nil {
 		t.Error("an empty upload receipt was accepted")
 	}
 }
