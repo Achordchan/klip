@@ -138,14 +138,22 @@ type BlobCheck struct {
 	RefsToken string
 }
 
-// IsBlobRefsRejected says the server refused a snapshot upload because its
-// blob references are no longer good: the declaration expired, or names a
-// blob the server lacks. Checking the blobs again, uploading the missing ones
-// and the snapshot with the new token fixes it.
+// IsBlobRefsRejected says the server refused a snapshot upload because the
+// blob check it relies on is no longer good: the declaration expired, names a
+// blob the server lacks, or blobs were deleted on the server since the check
+// (the account's cloud data was cleared, or unused blobs were collected).
+// Checking the blobs again, uploading the missing ones and the snapshot with
+// the new token fixes it.
 func IsBlobRefsRejected(err error) bool {
 	var ae *APIError
-	return errors.As(err, &ae) && ae.StatusCode == http.StatusConflict &&
-		(ae.Code == "blob_refs_expired" || ae.Code == "blob_refs_missing")
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict {
+		return false
+	}
+	switch ae.Code {
+	case "blob_refs_expired", "blob_refs_missing", "storage_generation_stale", "blob_check_interrupted":
+		return true
+	}
+	return false
 }
 
 // CheckMissingBlobs says which of the hashes the server does not have.

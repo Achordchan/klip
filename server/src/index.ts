@@ -316,25 +316,22 @@ const syncBlobCheck: Handler = async (req, env) => {
   const hashes = [...new Set(p.hashes.map(normalizeBlobSha256).filter((h): h is string => h !== null))];
   // DO 的 RPC 参数和返回值各限 1 MiB：分批问（每批 2000 个哈希，约 140 KB）。
   // 这份列表同时是一条引用声明（见 UserStore.checkBlobs）：每批都记进同一条声明，最后一批时收成一份；
-  // refsToken 由客户端在上传快照时带上，服务端据此回收不再被引用的 blob。
-  // 列表太长（收成一份放不下）时照样逐批记下、保护这些 blob 到声明过期，只是不收成一份、不给 token，
-  // 这份快照按“引用未知”上传。
+  // refsToken 由客户端在上传快照时带上，服务端据此核对存储代数、回收不再被引用的 blob。
+  // 列表太长（收成一份放不下）时只标记为“超长”，快照按“引用未知”记账。
   if (!hashes.length) return json({ missing: [] });
   const stub = userStub(env, user.id);
   const missing: string[] = [];
-  let giveToken = hashes.length <= MAX_DECLARED_REFS;
-  let token: string | null = null;
+  const collect = hashes.length <= MAX_DECLARED_REFS;
+  let refsToken: string | null = null;
   for (let i = 0; i < hashes.length; i += BLOB_CHECK_BATCH) {
     const batch = hashes.slice(i, i + BLOB_CHECK_BATCH);
-    const last = i + BLOB_CHECK_BATCH >= hashes.length;
-    const r = await stub.checkBlobs(batch, { token, final: giveToken && last });
+    const r = await stub.checkBlobs(batch, { token: refsToken, final: i + BLOB_CHECK_BATCH >= hashes.length, collect });
+    // 声明中途没了（不该发生）：前面几批的结论没人担保，整次作废，让客户端重来。
+    if (r.refsToken === null) return json({ code: "blob_check_interrupted", error: "blob check was interrupted; check again" }, 409);
     missing.push(...r.missing);
-    // 声明中途作废了（比如云端数据刚被清空）：剩下的批次另开一条声明继续保护，但这次不给 token。
-    if (r.refsToken === null) giveToken = false;
-    token = r.refsToken;
+    refsToken = r.refsToken;
   }
-  const refsToken = giveToken ? token : null;
-  return json(refsToken ? { missing, refsToken } : { missing });
+  return json({ missing, refsToken });
 };
 
 const syncBlobPut: Handler = async (req, env, _ctx, [raw]) => {

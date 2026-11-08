@@ -21,6 +21,7 @@ import (
 
 type gcAccount struct {
 	t      *testing.T
+	srv    *nastest.Server
 	ctx    context.Context
 	c      *syncclient.Client
 	access string
@@ -33,7 +34,7 @@ func newGCAccount(t *testing.T, email string) *gcAccount {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
 	tok := srv.Subscribe(ctx, email, "password1")
-	return &gcAccount{t: t, ctx: ctx, c: syncclient.New(srv.URL), access: tok.AccessToken, dir: t.TempDir(), blobs: map[string]string{}}
+	return &gcAccount{t: t, srv: srv, ctx: ctx, c: syncclient.New(srv.URL), access: tok.AccessToken, dir: t.TempDir(), blobs: map[string]string{}}
 }
 
 // blob makes a file of n random bytes and returns its hash.
@@ -160,6 +161,59 @@ func TestASnapshotOfUnknownReferencesKeepsEveryBlob(t *testing.T) {
 	}
 	a.snapshot(syncclient.NoBlobRefs) // the snapshot without references expires
 	a.expectGone(x)
+
+	// A blob has been collected: an upload that says nothing of the check it
+	// relies on can no longer be trusted, and is refused.
+	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") || !syncclient.IsBlobRefsRejected(err) {
+		t.Errorf("an older client's upload after a collection: %v", err)
+	}
+	a.snapshot(syncclient.NoBlobRefs) // a snapshot without blobs is always fine
+}
+
+// A check made before blobs were collected cannot vouch for what it found:
+// the upload is refused, and a new check works.
+func TestACheckFromBeforeACollectionIsRefused(t *testing.T) {
+	a := newGCAccount(t, "stale@example.com")
+	x, w := a.blob(5000), a.blob(5000)
+	a.snapshot(a.check(x, w))
+	old := a.check(x)
+	a.snapshot(a.check(x)) // the snapshot with w expires, and w is collected
+	a.expectGone(w, x)
+	if err := a.trySnapshot(old); !syncclientIs(err, 409, "storage_generation_stale") {
+		t.Fatalf("a check from before the collection: %v", err)
+	}
+	a.snapshot(a.check(x))
+}
+
+// The admin clears the account's cloud data: everything goes, a check made
+// before is refused, and the account fills up again from the devices.
+func TestResetStorage(t *testing.T) {
+	a := newGCAccount(t, "reset@example.com")
+	x := a.blob(30_000)
+	a.snapshot(a.check(x))
+	old := a.check(x)
+	if r := a.srv.Admin("/admin/user/reset-storage", map[string]any{"emailOrUserId": "reset@example.com"}); r["success"] != true {
+		t.Fatalf("reset: %v", r)
+	}
+	if _, err := a.c.GetManifestJSON(a.ctx, a.access); !syncclient.IsStatus(err, 404) {
+		t.Errorf("manifest after the reset: %v", err)
+	}
+	a.expectGone(x)
+	if u := a.usage(); u != 0 {
+		t.Errorf("usage after the reset: %d", u)
+	}
+	// The device checked before the reset: x was there. Its upload is refused,
+	// and so is one that says nothing.
+	if err := a.trySnapshot(old); !syncclientIs(err, 409, "storage_generation_stale") {
+		t.Errorf("a check from before the reset: %v", err)
+	}
+	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") {
+		t.Errorf("an older client after the reset: %v", err)
+	}
+	a.snapshot(a.check(x)) // x is missing now, and uploaded again
+	if !a.has(x) || a.usage() == 0 {
+		t.Error("the account did not fill up again")
+	}
 }
 
 // Device B has checked its blobs (and found x on the server) and is about to
@@ -250,9 +304,9 @@ func TestALongDeclarationCoversEveryBatch(t *testing.T) {
 	}
 }
 
-// A list too long for a declaration gets no token, and its snapshot counts
-// as one of unknown references; the blobs it found are still kept until it
-// is uploaded.
+// A list too long for a declaration still keeps the blobs it found, and its
+// token still guards against a stale check; the snapshot counts as one of
+// unknown references.
 func TestAnOversizedCheckStillKeepsItsBlobs(t *testing.T) {
 	a := newGCAccount(t, "oversized@example.com")
 	x := a.blob(5000)
@@ -264,7 +318,7 @@ func TestAnOversizedCheckStillKeepsItsBlobs(t *testing.T) {
 	}
 	hashes = append(hashes, x)
 	res, err := a.c.CheckBlobs(a.ctx, a.access, hashes)
-	if err != nil || res.RefsToken != "" || len(res.Missing) != 60_001 {
+	if err != nil || res.RefsToken == "" || len(res.Missing) != 60_001 {
 		t.Fatalf("check: %d missing, token %q, %v", len(res.Missing), res.RefsToken, err)
 	}
 	a.snapshot(syncclient.NoBlobRefs) // the snapshot with x expires
@@ -272,4 +326,7 @@ func TestAnOversizedCheckStillKeepsItsBlobs(t *testing.T) {
 	if !a.has(x) {
 		t.Fatal("x was collected after an oversized check found it")
 	}
+	// The token is accepted; the snapshot counts as one of unknown references
+	// (what that means is TestASnapshotOfUnknownReferencesKeepsEveryBlob).
+	a.snapshot(res.RefsToken)
 }
