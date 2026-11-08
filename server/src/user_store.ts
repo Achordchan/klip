@@ -16,6 +16,13 @@ import { buildPasswordCodeMessage, sendMail } from "./smtp";
 import { DAY_MS, PASSWORD_CODE_RESEND_COOLDOWN_SECONDS, errorJson, hex, json, nowIso, safeSegment, sseEvent } from "./util";
 
 const PART_SIZE = 8 * 1024 * 1024; // R2 分片上传：除最后一片外每片一样大
+// R2 对同一个 key 每秒最多写一次。manifest 写入之间至少隔这么久，失败后按它的倍数退避。
+const MANIFEST_WRITE_INTERVAL_MS = 1100;
+const MANIFEST_WRITE_ATTEMPTS = 4;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export function userPrefix(userId: string): string {
   return `users/${safeSegment(userId)}/`;
@@ -199,6 +206,8 @@ export class UserStore extends DurableObject<Env> {
   private blobDeletions = new Map<string, Promise<void>>();
   // 发验证码按用途排队。
   private codeLocks = new Map<string, Promise<unknown>>();
+  // 上次写 manifest 的时间：R2 同一个 key 每秒最多写一次，连续发布时先等够间隔。
+  private lastManifestWrite = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -661,25 +670,35 @@ export class UserStore extends DurableObject<Env> {
           snapshot: { type: "sqlite", fileName: "snapshot.sqlite", sha256: result.sha256, size: result.size },
         },
       };
-      try {
-        await this.env.BUCKET.put(manifestKey(userId), JSON.stringify(manifest), {
-          httpMetadata: { contentType: "application/json; charset=utf-8" },
-          customMetadata: { snapshotKey: key },
-        });
-      } catch (e) {
-        // 写入失败也可能其实已经写进去了（只是确认没回来）：回读 manifest 核对。
-        let published: string | undefined;
+      // R2 同一个 key 每秒最多写一次，超了会被限流：先等够间隔，失败了再退避重试几次。
+      // 内容和 snapshotKey 每次都一样，重复写是安全的。
+      for (let attempt = 0; ; attempt++) {
+        const wait = this.lastManifestWrite + MANIFEST_WRITE_INTERVAL_MS - Date.now();
+        if (wait > 0) await sleep(wait);
         try {
-          published = (await this.env.BUCKET.head(manifestKey(userId)))?.customMetadata?.snapshotKey;
-        } catch {
-          // 结果不明：保留这份待发布的快照，下次上传或 DO 重启时再按 manifest 判断。
-          throw e;
+          this.lastManifestWrite = Date.now();
+          await this.env.BUCKET.put(manifestKey(userId), JSON.stringify(manifest), {
+            httpMetadata: { contentType: "application/json; charset=utf-8" },
+            customMetadata: { snapshotKey: key },
+          });
+          break;
+        } catch (e) {
+          // 写入失败也可能其实已经写进去了（只是确认没回来）：回读 manifest 核对。
+          let published: string | undefined;
+          try {
+            published = (await this.env.BUCKET.head(manifestKey(userId)))?.customMetadata?.snapshotKey;
+          } catch {
+            // 结果不明：保留这份待发布的快照，下次上传或 DO 重启时再按 manifest 判断。
+            throw e;
+          }
+          // manifest 已经指向它：当作发布成功，继续。
+          if (published === key) break;
+          if (attempt + 1 >= MANIFEST_WRITE_ATTEMPTS) {
+            await discard();
+            throw e;
+          }
+          await sleep(MANIFEST_WRITE_INTERVAL_MS * 2 ** attempt);
         }
-        if (published !== key) {
-          await discard();
-          throw e;
-        }
-        // manifest 已经指向它：当作发布成功，继续。
       }
       this.promote(version);
       return this.settle(userId, tier);
