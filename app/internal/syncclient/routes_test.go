@@ -57,6 +57,27 @@ func TestRoutesExistInServer(t *testing.T) {
 	}
 }
 
+// The header and fields of the blob reference declaration (see CheckBlobs and
+// UploadSnapshot) are the server's.
+func TestServerBlobRefsProtocol(t *testing.T) {
+	var src strings.Builder
+	for _, f := range []string{"index.ts", "user_store.ts"} {
+		b, err := os.ReadFile("../../../server/src/" + f)
+		if err != nil {
+			t.Skipf("server source not available: %v", err)
+		}
+		src.Write(b)
+	}
+	for _, want := range []string{`"x-klip-blob-refs"`, `refsToken`, `=== "none"`, `"blob_refs_expired"`, `"blob_refs_missing"`} {
+		if !strings.Contains(src.String(), want) {
+			t.Errorf("the server no longer has %s", want)
+		}
+	}
+	if NoBlobRefs != "none" {
+		t.Errorf("NoBlobRefs is %q", NoBlobRefs)
+	}
+}
+
 // The sync server's event names and the one the client reacts to.
 func TestServerEventNames(t *testing.T) {
 	var src strings.Builder

@@ -4,7 +4,7 @@ import type { Env } from "./env";
 import { SUPPORTED_TIERS, getTierPolicy, normalizeTierName } from "./env";
 import { type Claims, signJwt, verifyJwt } from "./crypto";
 import * as db from "./db";
-import { blobKey, manifestKey, UserStore } from "./user_store";
+import { blobKey, manifestKey, MAX_DECLARED_REFS, UserStore } from "./user_store";
 import { isEmailConfigured } from "./smtp";
 import {
   ACCESS_TOKEN_HOURS,
@@ -298,6 +298,9 @@ function forwardUpload(req: Request, env: Env, userId: string, path: string, ext
   const headers = new Headers({ "x-klip-user": userId, ...extra });
   const encoding = req.headers.get("content-encoding");
   if (encoding) headers.set("content-encoding", encoding);
+  // 上传快照时声明它引用的 blob（见 UserStore.checkBlobs）。
+  const refs = req.headers.get("x-klip-blob-refs");
+  if (refs !== null) headers.set("x-klip-blob-refs", refs);
   return userStub(env, userId).fetch(new Request(`https://user-store${path}`, { method: "PUT", headers, body: req.body }));
 }
 
@@ -312,10 +315,22 @@ const syncBlobCheck: Handler = async (req, env) => {
   if (!Array.isArray(p.hashes)) return errorJson(400, "missing hashes");
   const hashes = [...new Set(p.hashes.map(normalizeBlobSha256).filter((h): h is string => h !== null))];
   // DO 的 RPC 参数和返回值各限 1 MiB：分批问（每批 2000 个哈希，约 140 KB）。
+  // 这份列表同时是一条引用声明（见 UserStore.checkBlobs）：每批都记进同一条声明，最后一批时收成一份；
+  // refsToken 由客户端在上传快照时带上，服务端据此回收不再被引用的 blob。
+  if (!hashes.length) return json({ missing: [] });
   const stub = userStub(env, user.id);
   const missing: string[] = [];
-  for (let i = 0; i < hashes.length; i += BLOB_CHECK_BATCH) missing.push(...(await stub.missingBlobs(hashes.slice(i, i + BLOB_CHECK_BATCH))));
-  return json({ missing });
+  let declare = hashes.length <= MAX_DECLARED_REFS;
+  let refsToken: string | null = null;
+  for (let i = 0; i < hashes.length; i += BLOB_CHECK_BATCH) {
+    const batch = hashes.slice(i, i + BLOB_CHECK_BATCH);
+    const r = await stub.checkBlobs(batch, declare ? { token: refsToken, final: i + BLOB_CHECK_BATCH >= hashes.length } : null);
+    missing.push(...r.missing);
+    // 声明中途作废了（比如云端数据刚被清空）：这次不给 token，客户端的快照按“引用未知”上传。
+    if (declare && r.refsToken === null) declare = false;
+    refsToken = declare ? r.refsToken : null;
+  }
+  return json(refsToken ? { missing, refsToken } : { missing });
 };
 
 const syncBlobPut: Handler = async (req, env, _ctx, [raw]) => {
@@ -480,6 +495,14 @@ const adminResetPassword: Handler = async (req, env) => {
   return json({ success: true, userId: user.id, email: user.email });
 };
 
+const adminResetStorage: Handler = async (req, env) => {
+  const t = await adminTarget(req, env);
+  if (t instanceof Response) return t;
+  const { user } = t;
+  const r = await userStub(env, user.id).resetStorage(user.id);
+  return json({ success: true, userId: user.id, email: user.email, removedObjects: r.removedObjects });
+};
+
 // ---- 路由表 ----
 
 const ROUTES: Array<[string, RegExp, Handler]> = [
@@ -510,6 +533,7 @@ const ROUTES: Array<[string, RegExp, Handler]> = [
   ["POST", /^\/admin\/user\/upgrade$/, adminUpgrade],
   ["POST", /^\/admin\/user\/tier$/, adminSetTier],
   ["POST", /^\/admin\/user\/reset-password$/, adminResetPassword],
+  ["POST", /^\/admin\/user\/reset-storage$/, adminResetStorage],
 ];
 
 export default {

@@ -781,9 +781,12 @@ func (s *Syncer) upload(ctx context.Context, progress func(Progress), reason, ac
 	if err := s.ensureAccount(token, account); err != nil {
 		return nil, fp, err
 	}
+	// refs tells the server which blobs the snapshot refers to, so that it
+	// can delete the ones nothing refers to any more.
+	refs := syncclient.NoBlobRefs
 	if len(exp.Blobs) > 0 {
 		report(progress, "upload_blobs", "上传二进制对象", 68)
-		if token, err = s.uploadMissingBlobsWithRefresh(ctx, token, exp, started, reason, account); err != nil {
+		if token, refs, err = s.uploadMissingBlobsWithRefresh(ctx, token, exp, started, reason, account); err != nil {
 			return nil, fp, err
 		}
 	}
@@ -797,13 +800,26 @@ func (s *Syncer) upload(ctx context.Context, progress func(Progress), reason, ac
 	report(progress, "upload_snapshot", "上传快照", 84)
 	call := func(t string) error {
 		var e error
-		res, e = s.cfg.Client.UploadSnapshot(ctx, t, path)
+		res, e = s.cfg.Client.UploadSnapshot(ctx, t, path, refs)
 		return e
 	}
 	if err := s.ensureAccount(token, account); err != nil {
 		return nil, fp, err
 	}
 	err = call(token)
+	if syncclient.IsBlobRefsRejected(err) && len(exp.Blobs) > 0 {
+		// The declaration of the blobs ran out (a long upload, or the
+		// account's cloud data was cleared) or a blob went missing: check
+		// them again and send the missing ones, then the snapshot once more.
+		s.timing("upload", "blob_refs_rejected", started, reason)
+		if token, refs, err = s.uploadMissingBlobsWithRefresh(ctx, token, exp, started, reason+";refs_rejected", account); err != nil {
+			return nil, fp, err
+		}
+		if err := s.ensureAccount(token, account); err != nil {
+			return nil, fp, err
+		}
+		err = call(token)
+	}
 	if err != nil {
 		if isSubscriptionExpired(err) {
 			return nil, fp, ErrSubscriptionExpired
@@ -822,7 +838,7 @@ func (s *Syncer) upload(ctx context.Context, progress func(Progress), reason, ac
 			return nil, fp, err
 		}
 		if len(exp.Blobs) > 0 {
-			if token, err = s.uploadMissingBlobsWithRefresh(ctx, token, exp, started, reason+";after_refresh", account); err != nil {
+			if token, refs, err = s.uploadMissingBlobsWithRefresh(ctx, token, exp, started, reason+";after_refresh", account); err != nil {
 				return nil, fp, err
 			}
 		}
@@ -836,28 +852,35 @@ func (s *Syncer) upload(ctx context.Context, progress func(Progress), reason, ac
 	return res, fp, nil
 }
 
-func (s *Syncer) uploadMissingBlobsWithRefresh(ctx context.Context, token string, exp snapshot.ExportResult, started time.Time, reason, account string) (string, error) {
+// uploadMissingBlobsWithRefresh returns the access token in use and the refs
+// for UploadSnapshot.
+func (s *Syncer) uploadMissingBlobsWithRefresh(ctx context.Context, token string, exp snapshot.ExportResult, started time.Time, reason, account string) (string, string, error) {
 	if err := s.ensureAccount(token, account); err != nil {
-		return token, err
+		return token, "", err
 	}
-	err := s.uploadMissingBlobs(ctx, token, exp, started, reason, account)
+	refs, err := s.uploadMissingBlobs(ctx, token, exp, started, reason, account)
 	if err == nil || !isAuthError(err) {
-		return token, err
+		return token, refs, err
 	}
 	ok, rerr := s.refreshBound(ctx, account)
 	if rerr != nil {
-		return token, rerr
+		return token, "", rerr
 	}
 	if !ok {
-		return token, err
+		return token, "", err
 	}
 	if token, err = s.tokenFor(account); err != nil {
-		return token, err
+		return token, "", err
 	}
-	return token, s.uploadMissingBlobs(ctx, token, exp, started, reason+";blob_refresh", account)
+	refs, err = s.uploadMissingBlobs(ctx, token, exp, started, reason+";blob_refresh", account)
+	return token, refs, err
 }
 
-func (s *Syncer) uploadMissingBlobs(ctx context.Context, token string, exp snapshot.ExportResult, started time.Time, reason, account string) error {
+// uploadMissingBlobs asks the server which of the snapshot's blobs it lacks
+// and sends those. The question names every blob of the snapshot, which
+// declares them: the answer's token, returned here, goes with the snapshot
+// upload. It is empty when the server does not take declarations.
+func (s *Syncer) uploadMissingBlobs(ctx context.Context, token string, exp snapshot.ExportResult, started time.Time, reason, account string) (string, error) {
 	seen := map[string]bool{}
 	var unique []snapshot.Blob
 	for _, b := range exp.Blobs {
@@ -868,37 +891,37 @@ func (s *Syncer) uploadMissingBlobs(ctx context.Context, token string, exp snaps
 		}
 	}
 	if len(unique) == 0 {
-		return nil
+		return syncclient.NoBlobRefs, nil
 	}
 	hashes := make([]string, len(unique))
 	for i, b := range unique {
 		hashes[i] = b.SHA256
 	}
-	missingList, err := s.cfg.Client.CheckMissingBlobs(ctx, token, hashes)
+	check, err := s.cfg.Client.CheckBlobs(ctx, token, hashes)
 	if err != nil {
-		return err
+		return "", err
 	}
 	missing := map[string]bool{}
-	for _, h := range missingList {
+	for _, h := range check.Missing {
 		missing[strings.ToLower(h)] = true
 	}
 	s.timing("upload", "check_missing_blobs", started, fmt.Sprintf("%s;total=%d;missing=%d", reason, len(unique), len(missing)))
 	for _, b := range unique {
 		if err := ctx.Err(); err != nil {
-			return err
+			return "", err
 		}
 		if !missing[strings.ToLower(b.SHA256)] {
 			continue
 		}
 		if err := s.ensureAccount(token, account); err != nil {
-			return err
+			return "", err
 		}
 		if err := s.cfg.Client.UploadBlob(ctx, token, b.SHA256, b.SourcePath); err != nil {
-			return err
+			return "", err
 		}
 	}
-	s.timing("upload", "upload_blobs", started, fmt.Sprintf("%s;uploaded=%d", reason, len(missing)))
-	return nil
+	s.timing("upload", "upload_blobs", started, fmt.Sprintf("%s;uploaded=%d;refs=%t", reason, len(missing), check.RefsToken != ""))
+	return check.RefsToken, nil
 }
 
 // ---- download

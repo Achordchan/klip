@@ -3,6 +3,8 @@ package syncer_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -142,7 +144,9 @@ func guid(n int) string {
 }
 
 func TestDevicesSyncThroughTheRealServer(t *testing.T) {
-	srv := nastest.Start(t)
+	// Blobs are collected at once: a blob a sync still needs and the server
+	// deleted would fail a download here.
+	srv := nastest.Start(t, nastest.FastBlobGC())
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	tok := srv.Subscribe(ctx, "owner@example.com", "password1")
@@ -312,6 +316,102 @@ func TestDevicesSyncThroughTheRealServer(t *testing.T) {
 		t.Errorf("A gets the merge: %+v, %d items", res.Decision, len(a.hist.Items()))
 	}
 }
+
+// A deleted image is synced away, and the server deletes its blob once no
+// snapshot it keeps refers to it; an image still in use is kept.
+func TestDeletedImageBlobIsCollected(t *testing.T) {
+	srv := nastest.Start(t, nastest.FastBlobGC())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	tok := srv.Subscribe(ctx, "gc@example.com", "password1")
+	cl := syncclient.New(srv.URL)
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+	a := newDevice(t, srv, "A", tok)
+	keepBytes := bytes.Repeat([]byte("\x89PNG-kept-"), 2000)
+	dropBytes := bytes.Repeat([]byte("\x89PNG-dropped-"), 5000)
+	keep, drop := sha256Hex(keepBytes), sha256Hex(dropBytes)
+	// imageItem names the file by the id's first eight characters: they differ.
+	a.hist.items = []model.Item{
+		a.imageItem("11111111-0000-0000-0000-000000000001", dropBytes, base.Add(2*time.Minute)),
+		a.imageItem("22222222-0000-0000-0000-000000000002", keepBytes, base.Add(1*time.Minute)),
+	}
+	if res := a.run(ctx); res.Decision.Direction != syncer.Upload {
+		t.Fatalf("first sync: %+v", res.Decision)
+	}
+	access := func() string { return model.Str(a.settings().AuthAccessToken) }
+	// Whether the server has a blob: asked with a download, since a check
+	// declares the hashes, which keeps them.
+	has := func(h string) bool {
+		t.Helper()
+		err := cl.DownloadBlob(ctx, access(), h, filepath.Join(t.TempDir(), "blob"))
+		if err != nil && !syncclient.IsStatus(err, 404) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	if !has(keep) || !has(drop) {
+		t.Fatal("both images are on the server")
+	}
+	usage := func() int64 {
+		t.Helper()
+		st, err := cl.SubscriptionStatus(ctx, access())
+		if err != nil || st.StorageBytes == nil {
+			t.Fatalf("status: %+v %v", st, err)
+		}
+		return *st.StorageBytes
+	}
+	before := usage()
+
+	// A deletes one image and syncs. The snapshot that had it becomes a
+	// backup, which expires at once on this server.
+	a.hist.items = a.hist.items[1:]
+	if res := a.run(ctx); res.Decision.Direction != syncer.Upload {
+		t.Fatalf("sync after the deletion: %+v", res.Decision)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for has(drop) {
+		if time.Now().After(deadline) {
+			t.Fatal("the deleted image's blob is still on the server")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !has(keep) {
+		t.Fatal("the image still in the history was dropped")
+	}
+	if after := usage(); after > before-int64(len(dropBytes))+4096 {
+		t.Errorf("usage %d -> %d: the deleted image (%d bytes) is still counted", before, after, len(dropBytes))
+	}
+
+	// Another sync, with the kept image still in the history: it stays.
+	a.hist.add(textItem(guid(3), "later", base.Add(3*time.Minute), "h-later"))
+	if res := a.run(ctx); res.Decision.Direction != syncer.Upload {
+		t.Fatalf("sync of the text: %+v", res.Decision)
+	}
+	if !has(keep) {
+		t.Fatal("the kept image went with a text-only sync")
+	}
+
+	// Another device gets the history with the kept image.
+	b := newDevice(t, srv, "B", srv.Login(ctx, "gc@example.com", "password1"))
+	if res := b.run(ctx); res.Decision.Direction != syncer.Download {
+		t.Fatalf("B: %+v", res.Decision)
+	}
+	var images int
+	for _, it := range b.hist.Items() {
+		if it.Kind == model.KindImage {
+			images++
+			if got, _ := os.ReadFile(model.Str(it.ImageFilePath)); !bytes.Equal(got, keepBytes) {
+				t.Error("B's image is not the kept one")
+			}
+		}
+	}
+	if images != 1 {
+		t.Errorf("B has %d images", images)
+	}
+}
+
+func sha256Hex(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
 func regexpMatch(pattern, s string) bool {
 	ok, _ := regexpMatchString(pattern, s)

@@ -64,9 +64,18 @@ func (c *Client) GetManifestJSON(ctx context.Context, accessToken string) (strin
 	return string(b), err
 }
 
+// NoBlobRefs is the refs of UploadSnapshot for a snapshot that refers to no
+// blob.
+const NoBlobRefs = "none"
+
 // UploadSnapshot sends the snapshot file, gzipped, and replaces the one of
 // the account. The other devices are told through the event stream.
-func (c *Client) UploadSnapshot(ctx context.Context, accessToken, snapshotPath string) (*UploadResult, error) {
+//
+// refs says which blobs the snapshot refers to, so that the server can delete
+// the ones no snapshot needs any more: the RefsToken of the CheckBlobs call
+// made with all of them, or NoBlobRefs when there are none. An empty refs
+// says nothing, and the server then keeps every blob.
+func (c *Client) UploadSnapshot(ctx context.Context, accessToken, snapshotPath, refs string) (*UploadResult, error) {
 	if err := c.needServer(accessToken, true); err != nil {
 		return nil, err
 	}
@@ -87,6 +96,9 @@ func (c *Client) UploadSnapshot(ctx context.Context, accessToken, snapshotPath s
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Content-Encoding", "gzip")
+	if refs = strings.TrimSpace(refs); refs != "" {
+		req.Header.Set("X-Klip-Blob-Refs", refs)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -116,41 +128,70 @@ func (c *Client) DownloadSnapshot(ctx context.Context, accessToken, targetPath s
 	return c.download(ctx, "/sync/snapshot", accessToken, targetPath, "download snapshot failed", true)
 }
 
+// BlobCheck is the answer of CheckBlobs.
+type BlobCheck struct {
+	// Missing are the hashes the server does not have.
+	Missing []string
+	// RefsToken stands for the list of hashes asked about, for UploadSnapshot
+	// to say that the snapshot refers to those blobs. It is empty when the
+	// server does not take part (an older server, or too long a list).
+	RefsToken string
+}
+
+// IsBlobRefsRejected says the server refused a snapshot upload because its
+// blob references are no longer good: the declaration expired, or names a
+// blob the server lacks. Checking the blobs again, uploading the missing ones
+// and the snapshot with the new token fixes it.
+func IsBlobRefsRejected(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.StatusCode == http.StatusConflict &&
+		(ae.Code == "blob_refs_expired" || ae.Code == "blob_refs_missing")
+}
+
 // CheckMissingBlobs says which of the hashes the server does not have.
 func (c *Client) CheckMissingBlobs(ctx context.Context, accessToken string, hashes []string) ([]string, error) {
+	res, err := c.CheckBlobs(ctx, accessToken, hashes)
+	return res.Missing, err
+}
+
+// CheckBlobs says which of the hashes the server does not have. Called with
+// every blob a snapshot refers to, it also declares them: the server keeps
+// them while the snapshot is uploaded with the RefsToken.
+func (c *Client) CheckBlobs(ctx context.Context, accessToken string, hashes []string) (BlobCheck, error) {
 	if err := c.needServer(accessToken, true); err != nil {
-		return nil, err
+		return BlobCheck{}, err
 	}
 	if len(hashes) == 0 {
-		return nil, nil
+		return BlobCheck{}, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, blobCheckTimout)
 	defer cancel()
 	payload, _ := json.Marshal(map[string]any{"hashes": hashes})
 	req, err := c.newRequest(ctx, http.MethodPost, "/sync/blobs/check", strings.TrimSpace(accessToken), strings.NewReader(string(payload)))
 	if err != nil {
-		return nil, err
+		return BlobCheck{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return BlobCheck{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, newAPIError(resp, "check missing blobs failed", false)
+		return BlobCheck{}, newAPIError(resp, "check missing blobs failed", false)
 	}
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return BlobCheck{}, err
 	}
-	raw, ok := decodeObject(b)["missing"]
+	obj := decodeObject(b)
+	raw, ok := obj["missing"]
 	if !ok {
-		return nil, errors.New("check missing blobs: response has no missing list")
+		return BlobCheck{}, errors.New("check missing blobs: response has no missing list")
 	}
 	var list []json.RawMessage
 	if err := json.Unmarshal(raw, &list); err != nil || list == nil {
-		return nil, errors.New("check missing blobs: malformed missing list")
+		return BlobCheck{}, errors.New("check missing blobs: malformed missing list")
 	}
 	var missing []string
 	for _, raw := range list {
@@ -159,7 +200,7 @@ func (c *Client) CheckMissingBlobs(ctx context.Context, accessToken string, hash
 			missing = append(missing, s)
 		}
 	}
-	return missing, nil
+	return BlobCheck{Missing: missing, RefsToken: strings.TrimSpace(scalarString(obj["refsToken"]))}, nil
 }
 
 // UploadBlob sends a file under its SHA-256, gzipped. The server checks the

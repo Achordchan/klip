@@ -52,10 +52,30 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+// Option changes how Start runs the server.
+type Option func(*options)
+
+type options struct {
+	fastBlobGC bool
+}
+
+// FastBlobGC runs the server with no grace period and no delay for deleting
+// the blobs no snapshot refers to, and with backups that expire at once (the
+// next upload removes them), so that a test sees blobs collected. It needs a
+// local server: against KLIP_TEST_SERVER_URL the test is skipped.
+func FastBlobGC() Option { return func(o *options) { o.fastBlobGC = true } }
+
 // Start runs the server for the test and stops it when the test ends.
-func Start(t *testing.T) *Server {
+func Start(t *testing.T, opts ...Option) *Server {
 	t.Helper()
+	var o options
+	for _, f := range opts {
+		f(&o)
+	}
 	if url := os.Getenv("KLIP_TEST_SERVER_URL"); url != "" {
+		if o.fastBlobGC {
+			t.Skip("FastBlobGC needs a local server")
+		}
 		key := os.Getenv("KLIP_TEST_ADMIN_KEY")
 		if key == "" {
 			t.Fatal("KLIP_TEST_SERVER_URL needs KLIP_TEST_ADMIN_KEY")
@@ -91,13 +111,17 @@ func Start(t *testing.T) *Server {
 	out.Reset()
 
 	port := freePort(t)
-	cmd := exec.Command(node, wrangler, "dev", "--local",
+	args := []string{wrangler, "dev", "--local",
 		"--ip", "127.0.0.1", "--port", fmt.Sprint(port), "--inspector-port", fmt.Sprint(freePort(t)),
 		"--persist-to", state, "--show-interactive-dev-session=false", "--log-level", "warn",
-		"--var", "ADMIN_KEY:"+AdminKey,
+		"--var", "ADMIN_KEY:" + AdminKey,
 		"--var", "AUTH_SIGNING_KEY:test-signing-key-that-is-long-enough-for-hs256",
 		"--var", "SMTP_HOST:", // email is not configured: password codes give 503
-	)
+	}
+	if o.fastBlobGC {
+		args = append(args, "--var", "BLOB_GC_GRACE_SECONDS:0", "--var", "BLOB_GC_DELAY_SECONDS:0", "--var", "BACKUP_RETENTION_SECONDS:0")
+	}
+	cmd := exec.Command(node, args...)
 	cmd.Dir, cmd.Env = dir, env
 	cmd.Stdout, cmd.Stderr = &out, &out
 	ownProcessGroup(cmd)
@@ -172,5 +196,15 @@ func (s *Server) Subscribe(ctx context.Context, email, password string) syncclie
 		s.t.Fatal(err)
 	}
 	s.Admin("/admin/user/upgrade", map[string]any{"emailOrUserId": email, "durationDays": 30, "tier": "Mini"})
+	return tok
+}
+
+// Login signs in to an account of the server and returns its tokens.
+func (s *Server) Login(ctx context.Context, email, password string) syncclient.TokenSet {
+	s.t.Helper()
+	tok, err := syncclient.New(s.URL).Login(ctx, email, password)
+	if err != nil {
+		s.t.Fatal(err)
+	}
 	return tok
 }
