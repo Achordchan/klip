@@ -1148,10 +1148,18 @@ export class UserStore extends DurableObject<Env> {
    * （storage_generation_stale，见 storageGeneration）、或者声明里有服务端还没有的 blob（blob_refs_missing），
    * 都返回 409，客户端重新查缺失、补传 blob 之后再传。
    */
-  private snapshotRefs(header: string | null, caller: { id: string; issuedMs: number }): { refs: string | null; token: string | null } | Response {
+  private snapshotRefs(
+    header: string | null,
+    caller: { id: string; issuedMs: number; unique: boolean },
+  ): { refs: string | null; token: string | null } | Response {
     const stale = () =>
       json({ code: "storage_generation_stale", error: "blobs were deleted after the blob check; check again", storageGeneration: this.storageGeneration() }, 409);
-    if (header === null) return this.legacyUploadAllowed(caller.id, caller.issuedMs) ? { refs: null, token: null } : stale();
+    if (header === null) {
+      // 不带声明的上传靠调用方（令牌）把检查和上传对上；这一版之前签发的令牌可能几台设备共用一个，
+      // 对不上。让它先刷新令牌：旧客户端遇到 401 会刷新，并用新令牌重新查一遍缺失再上传。
+      if (!caller.unique) return errorJson(401, "access token predates blob reference tracking; refresh it");
+      return this.legacyUploadAllowed(caller.id, caller.issuedMs) ? { refs: null, token: null } : stale();
+    }
     const value = header.trim();
     // 没有 blob 的快照不引用任何 blob，不会因为 blob 被删而坏掉，不看代数。
     if (value === "none") return { refs: NO_REFS, token: null };
@@ -1190,6 +1198,7 @@ export class UserStore extends DurableObject<Env> {
     const refs = this.snapshotRefs(request.headers.get("x-klip-blob-refs"), {
       id: request.headers.get("x-klip-caller") ?? "",
       issuedMs: Number(request.headers.get("x-klip-caller-issued-ms") ?? 0),
+      unique: request.headers.get("x-klip-caller-unique") === "1",
     });
     if (refs instanceof Response) {
       await drainBody(request);

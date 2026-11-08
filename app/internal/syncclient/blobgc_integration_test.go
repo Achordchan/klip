@@ -382,9 +382,26 @@ func TestTheBlobsOfADroppedSnapshotAreHeldForDownloads(t *testing.T) {
 }
 
 // olderToken signs a copy of token as issued an hour ago, before the
-// account's server started its record of checks, as a token of the previous
-// server version has neither iat_ms nor a record.
+// account's server started its record of checks.
 func olderToken(t *testing.T, token string) string {
+	t.Helper()
+	return resign(t, token, func(claims map[string]any) {
+		iat := time.Now().Add(-time.Hour)
+		claims["iat"], claims["nbf"], claims["iat_ms"] = iat.Unix(), iat.Unix(), iat.UnixMilli()
+	})
+}
+
+// preUpgradeToken signs a copy of token as the previous server version
+// issued it: without jti and iat_ms.
+func preUpgradeToken(t *testing.T, token string) string {
+	t.Helper()
+	return resign(t, token, func(claims map[string]any) {
+		delete(claims, "jti")
+		delete(claims, "iat_ms")
+	})
+}
+
+func resign(t *testing.T, token string, change func(map[string]any)) string {
 	t.Helper()
 	parts := strings.Split(token, ".")
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -393,9 +410,7 @@ func olderToken(t *testing.T, token string) string {
 	}
 	var claims map[string]any
 	json.Unmarshal(raw, &claims)
-	iat := time.Now().Add(-time.Hour).Unix()
-	claims["iat"], claims["nbf"] = iat, iat
-	delete(claims, "iat_ms")
+	change(claims)
 	payload, _ := json.Marshal(claims)
 	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	body := head + "." + base64.RawURLEncoding.EncodeToString(payload)
@@ -485,4 +500,22 @@ func TestEvictedDeclarations(t *testing.T) {
 		t.Errorf("an older client whose declaration was evicted: %v", err)
 	}
 	a.snapshot("") // its next sync goes through
+}
+
+// A token from before this server version may be shared by devices that
+// signed in within the same second, so it cannot tell whose check an upload
+// relies on: an upload without references must refresh it first. Uploads
+// with references do not depend on it.
+func TestAPreUpgradeTokenMustRefreshForUploadsWithoutReferences(t *testing.T) {
+	a := newGCAccount(t, "preupgrade@example.com")
+	fresh := a.access
+	a.access = preUpgradeToken(t, fresh)
+	if err := a.trySnapshot(""); !syncclient.IsStatus(err, 401) {
+		t.Errorf("an upload without references, with a token from before: %v", err)
+	}
+	x := a.blob(1000)
+	a.snapshot(a.check(x))
+	a.snapshot(syncclient.NoBlobRefs)
+	a.access = fresh
+	a.snapshot("")
 }

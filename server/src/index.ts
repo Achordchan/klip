@@ -124,16 +124,17 @@ async function callerId(request: Request): Promise<string> {
 }
 
 /**
- * 访问令牌的签发时间（毫秒）。令牌已经在 requireSync 里验过签名，这里只读它的声明。
- * 没有 iat_ms 的旧令牌按 iat（秒，向下取整）算，只会显得更早，判断偏保守。
+ * 访问令牌的签发时间（毫秒），以及它是不是这一版签发的（有 jti 和 iat_ms，各不相同）。
+ * 更早签发的令牌，两台设备同一秒登录时可能一模一样，不能当作设备标识（见 UserStore.snapshotRefs）。
+ * 令牌已经在 requireSync 里验过签名，这里只读它的声明。
  */
-function tokenIssuedMs(request: Request): number {
+function tokenIssue(request: Request): { issuedMs: number; unique: boolean } {
   try {
     const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode((bearer(request) ?? "").split(".")[1] ?? "")));
-    if (typeof payload.iat_ms === "number") return payload.iat_ms;
-    return typeof payload.iat === "number" ? payload.iat * 1000 : 0;
+    if (typeof payload.iat_ms === "number" && typeof payload.jti === "string") return { issuedMs: payload.iat_ms, unique: true };
+    return { issuedMs: typeof payload.iat === "number" ? payload.iat * 1000 : 0, unique: false };
   } catch {
-    return 0;
+    return { issuedMs: 0, unique: false };
   }
 }
 
@@ -334,7 +335,8 @@ function forwardUpload(req: Request, env: Env, userId: string, path: string, ext
 const syncSnapshotPut: Handler = async (req, env) => {
   const { user, tier } = await requireSync(req, env);
   return forwardUpload(req, env, user.id, "/snapshot", { "x-klip-tier": JSON.stringify(tier), "x-klip-caller": await callerId(req),
-    "x-klip-caller-issued-ms": String(tokenIssuedMs(req)),
+    "x-klip-caller-issued-ms": String(tokenIssue(req).issuedMs),
+    "x-klip-caller-unique": tokenIssue(req).unique ? "1" : "0",
   });
 };
 
