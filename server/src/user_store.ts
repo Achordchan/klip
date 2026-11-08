@@ -400,7 +400,8 @@ export class UserStore extends DurableObject<Env> {
   }
 
   /**
-   * 注意：blob 记上账之后不会被自动删除（见 resetStorage 的说明）。
+   * 注意：blob 记上账之后不会被自动删除：服务端看不懂快照内容，不知道哪些 blob 还被引用，
+   * 贸然删除会删掉别的设备还要用的附件。限制和打算见 server/README.md 的“blob 不会自动回收”。
    * blob 总字节数：存在 meta 里的计数，和记 blob 在同一个事务里更新。
    * 上传时每收到一块数据都要查一次，不能每次都对整张 blobs 表求和。
    */
@@ -492,45 +493,6 @@ export class UserStore extends DurableObject<Env> {
       await this.drainCleanup();
       await this.flushUsage(userId);
     });
-  }
-
-  /**
-   * 清空这个用户的云端数据（后台操作）：删掉 R2 里他名下的全部文件、清空账目、D1 用量写成 0，
-   * 再推送一次更新。客户端下次同步时看到 manifest 不存在，会把本地的快照和 blob 全部重新上传。
-   *
-   * 为什么需要它：blob 记上账之后不会被自动回收（服务端看不懂快照内容，不知道哪些 blob 还被引用），
-   * 删了历史也不会释放空间，占满档位后就同步不了。这里是给管理员的补救办法。
-   * 拿着快照锁和提交锁执行；正在上传的 blob 的文件不删，它们的提交会照常记账。
-   */
-  async resetStorage(userId: string): Promise<{ removedObjects: number }> {
-    const run = this.snapshotLock.then(() =>
-      this.withCommit(async () => {
-        let removedObjects = 0;
-        let cursor: string | undefined;
-        do {
-          const page = await this.env.BUCKET.list({ prefix: userPrefix(userId), cursor, limit: R2_DELETE_BATCH });
-          const inFlight = new Set(this.sql.exec<{ r2_key: string }>("SELECT r2_key FROM blob_uploads").toArray().map((r) => r.r2_key));
-          const keys = page.objects.map((o) => o.key).filter((k) => !inFlight.has(k));
-          if (keys.length > 0) {
-            await this.env.BUCKET.delete(keys);
-            removedObjects += keys.length;
-          }
-          cursor = page.truncated ? page.cursor : undefined;
-        } while (cursor);
-        this.ctx.storage.transactionSync(() => {
-          this.sql.exec("DELETE FROM snapshots");
-          this.sql.exec("DELETE FROM blobs");
-          this.sql.exec("DELETE FROM cleanup");
-          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes','0')");
-          this.markUsageDirty();
-        });
-        await this.flushUsage(userId);
-        this.broadcast(sseEvent("sync-updated", { reset: true, updatedAt: nowIso() }));
-        return { removedObjects };
-      }),
-    );
-    this.snapshotLock = run.catch(() => {});
-    return run;
   }
 
   async missingBlobs(hashes: string[]): Promise<string[]> {

@@ -39,6 +39,7 @@ export { UserStore };
 const NAME_ID_CLAIM = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier";
 const EMAIL_CLAIM = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress";
 const EVENTS_KEEPALIVE_MS = 20_000;
+const BLOB_CHECK_BATCH = 2000;
 // 一条推送连接最长保持多久。免费版 Worker 每个请求累计只有 10ms CPU，
 // 心跳会一点点用掉它；到时间就正常结束，客户端会立刻重连（并顺带同步一次）。
 const EVENTS_WINDOW_MS = 15 * 60_000;
@@ -310,7 +311,10 @@ const syncBlobCheck: Handler = async (req, env) => {
   const p = (await readJson(req)) ?? {};
   if (!Array.isArray(p.hashes)) return errorJson(400, "missing hashes");
   const hashes = [...new Set(p.hashes.map(normalizeBlobSha256).filter((h): h is string => h !== null))];
-  const missing = hashes.length ? await userStub(env, user.id).missingBlobs(hashes) : [];
+  // DO 的 RPC 参数和返回值各限 1 MiB：分批问（每批 2000 个哈希，约 140 KB）。
+  const stub = userStub(env, user.id);
+  const missing: string[] = [];
+  for (let i = 0; i < hashes.length; i += BLOB_CHECK_BATCH) missing.push(...(await stub.missingBlobs(hashes.slice(i, i + BLOB_CHECK_BATCH))));
   return json({ missing });
 };
 
@@ -476,14 +480,6 @@ const adminResetPassword: Handler = async (req, env) => {
   return json({ success: true, userId: user.id, email: user.email });
 };
 
-const adminResetStorage: Handler = async (req, env) => {
-  const t = await adminTarget(req, env);
-  if (t instanceof Response) return t;
-  const { user } = t;
-  const r = await userStub(env, user.id).resetStorage(user.id);
-  return json({ success: true, userId: user.id, email: user.email, removedObjects: r.removedObjects });
-};
-
 // ---- 路由表 ----
 
 const ROUTES: Array<[string, RegExp, Handler]> = [
@@ -514,7 +510,6 @@ const ROUTES: Array<[string, RegExp, Handler]> = [
   ["POST", /^\/admin\/user\/upgrade$/, adminUpgrade],
   ["POST", /^\/admin\/user\/tier$/, adminSetTier],
   ["POST", /^\/admin\/user\/reset-password$/, adminResetPassword],
-  ["POST", /^\/admin\/user\/reset-storage$/, adminResetStorage],
 ];
 
 export default {
