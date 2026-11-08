@@ -65,7 +65,7 @@ const REF_CLAIM_TTL_MS = DAY_MS;
 const DEFAULT_BLOB_GC_GRACE_MS = DAY_MS;
 /** 引用变少之后过这么久才回收：把一段时间里的多次变化攒成一次（每次回收要扫一遍 blobs 表）。 */
 const DEFAULT_BLOB_GC_DELAY_MS = 10 * 60_000;
-/** 一份声明最多这么多个哈希（ref_sets 一行最多 2MB）。超过就不记声明，这份快照按“引用未知”处理。Worker 据此决定要不要声明。 */
+/** 一份声明最多这么多个哈希（ref_sets 一行最多 2MB）。超过就不收成一份、不给 token（分批记下的照样保护到过期），这份快照按“引用未知”处理。 */
 export const MAX_DECLARED_REFS = 60_000;
 /** 快照“引用已知、没有 blob”时 snapshots.refs 的值。 */
 const NO_REFS = "";
@@ -491,8 +491,7 @@ export class UserStore extends DurableObject<Env> {
     const due = this.gcDue();
     if (due === null || due > now) return;
     // 不满足前提就保持“到期”，之后每次提交再看（只是两次很便宜的查询）；能回收时一定会有快照记录被删，也会重新安排。
-    if (this.sql.exec("SELECT 1 FROM snapshots WHERE current=? LIMIT 1", CURRENT).toArray().length === 0) return;
-    if (this.sql.exec("SELECT 1 FROM snapshots WHERE refs IS NULL LIMIT 1").toArray().length > 0) return;
+    if (this.gcBlocked()) return;
 
     const kept = new Set<string>();
     const wanted = this.sql.exec<{ n: number }>("SELECT COUNT(DISTINCT refs) AS n FROM snapshots WHERE refs != ?", NO_REFS).one().n;
@@ -502,8 +501,9 @@ export class UserStore extends DurableObject<Env> {
       found++;
     }
     if (found !== wanted) {
-      // 有快照的哈希列表找不到：不该发生。宁可不回收。
+      // 有快照的哈希列表找不到：不该发生。宁可不回收，一小时后再看（不让 alarm 空转）。
       console.error("blob gc: a snapshot's ref set is missing, skipping", { wanted, found });
+      this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('gc_due_ms',?)", String(now + 3_600_000));
       return;
     }
     const claimed = new Set<string>();
@@ -562,10 +562,22 @@ export class UserStore extends DurableObject<Env> {
     if (doomed.length > 0) console.log("blob gc", { removed: doomed.length, bytes: doomed.reduce((n, b) => n + b.size, 0) });
   }
 
-  /** 下一次回收在将来：用 alarm 安排上（alarm 只有一个，跑完一次之后要重新安排）。 */
+  /** 回收的前提不满足：没有当前快照，或者还保留着“引用未知”的快照。这时到期了也不回收，等快照记录被删时再看。 */
+  private gcBlocked(): boolean {
+    if (this.sql.exec("SELECT 1 FROM snapshots WHERE current=? LIMIT 1", CURRENT).toArray().length === 0) return true;
+    return this.sql.exec("SELECT 1 FROM snapshots WHERE refs IS NULL LIMIT 1").toArray().length > 0;
+  }
+
+  /**
+   * 用 alarm 安排下一次回收（alarm 只有一个，跑完一次之后要重新安排）。在提交的最后调用：
+   * 提交过程中到期时间可能刚好过去（回收那一步时还没到），这时马上安排；前提不满足的不安排，免得 alarm 空转。
+   */
   private async scheduleGc(): Promise<void> {
     const due = this.gcDue();
-    if (due !== null && due > Date.now()) await this.scheduleMaintenance(due - Date.now());
+    if (due === null) return;
+    const wait = due - Date.now();
+    if (wait > 0) await this.scheduleMaintenance(wait);
+    else if (!this.gcBlocked()) await this.scheduleMaintenance();
   }
 
   /** 把一份待发布的快照变成当前快照，原来的当前快照变成备份。 */
@@ -768,18 +780,19 @@ export class UserStore extends DurableObject<Env> {
   }
 
   /**
-   * 查哪些 blob 服务端还没有（hashes 已经规范化、去重）。declare 不为 null 时，同时把这批哈希记进一条引用声明：
+   * 查哪些 blob 服务端还没有（hashes 已经规范化、去重），同时把这批哈希记进一条引用声明：
    * Worker 按批调用（RPC 参数有大小限制），第一批 token 为 null，新开一条声明；之后各批带上返回的 token
-   * 追加进去；final 那一批把整份列表收成一个 ref_sets（按内容去重）。
+   * 追加进去；final 那一批把整份列表收成一个 ref_sets（按内容去重）。没收成一份的声明（列表太长）
+   * 也照样保护分批记下的 blob，直到过期。
    * 声明在有效期内保护列表里的 blob 不被回收：查完说“已经有了”的 blob，不会在客户端传快照之前被删掉。
    * 返回的 refsToken 由客户端在上传快照时带上；旧客户端不认识它，声明到期自然作废。
    * 带来的 token 已经不存在（过期，或者云端数据刚被清空）时 refsToken 为 null，这次就不算声明。
    */
-  async checkBlobs(hashes: string[], declare: { token: string | null; final: boolean } | null): Promise<{ missing: string[]; refsToken: string | null }> {
+  async checkBlobs(hashes: string[], declare: { token: string | null; final: boolean }): Promise<{ missing: string[]; refsToken: string | null }> {
     // 从这里到查完缺失没有 await：记这批声明和查缺失是同一刻，回收（也是同步执行的）只能在这之前或之后。
     const now = Date.now();
     let token: string | null = null;
-    if (declare) {
+    {
       const t = declare.token ?? hex(crypto.getRandomValues(new Uint8Array(16)));
       token = this.ctx.storage.transactionSync(() => {
         if (declare.token === null) {
@@ -797,7 +810,7 @@ export class UserStore extends DurableObject<Env> {
     for (const h of hashes) {
       if (this.sql.exec("SELECT 1 FROM blobs WHERE sha256=?", h).toArray().length === 0) missing.push(h);
     }
-    if (token && declare?.final) {
+    if (token && declare.final) {
       // 收齐了：合成一份排好序的列表。算哈希要 await，这期间分批记下的列表照样保护着这些 blob。
       const all = new Set<string>();
       for (const r of this.sql.exec<{ hashes: ArrayBuffer }>("SELECT hashes FROM ref_claim_chunks WHERE token=?", token)) decodeRefs(r.hashes, all);

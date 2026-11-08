@@ -249,3 +249,27 @@ func TestALongDeclarationCoversEveryBatch(t *testing.T) {
 		t.Errorf("the declaration names blobs never uploaded: %v", err)
 	}
 }
+
+// A list too long for a declaration gets no token, and its snapshot counts
+// as one of unknown references; the blobs it found are still kept until it
+// is uploaded.
+func TestAnOversizedCheckStillKeepsItsBlobs(t *testing.T) {
+	a := newGCAccount(t, "oversized@example.com")
+	x := a.blob(5000)
+	a.snapshot(a.check(x))
+
+	hashes := make([]string, 0, 60_002)
+	for i := 0; i < 60_001; i++ {
+		hashes = append(hashes, sha([]byte{byte(i), byte(i >> 8), byte(i >> 16), 'o'}))
+	}
+	hashes = append(hashes, x)
+	res, err := a.c.CheckBlobs(a.ctx, a.access, hashes)
+	if err != nil || res.RefsToken != "" || len(res.Missing) != 60_001 {
+		t.Fatalf("check: %d missing, token %q, %v", len(res.Missing), res.RefsToken, err)
+	}
+	a.snapshot(syncclient.NoBlobRefs) // the snapshot with x expires
+	time.Sleep(time.Second)
+	if !a.has(x) {
+		t.Fatal("x was collected after an oversized check found it")
+	}
+}
