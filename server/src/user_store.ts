@@ -792,7 +792,7 @@ export class UserStore extends DurableObject<Env> {
           this.sql.exec("DELETE FROM meta WHERE k='gc_due_ms'");
           this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes','0')");
           // 清空前查过缺失、清空后才上传的旧客户端据此拒绝（见 legacyUploadAllowed）。
-          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('last_reset_ms',?)", String(Date.now()));
+          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_generation',?)", String(this.storageGeneration()));
           this.markUsageDirty();
           return n;
         });
@@ -1002,13 +1002,14 @@ export class UserStore extends DurableObject<Env> {
    * 在 snapshotRefs 里同步调用。
    */
   private legacyUploadAllowed(caller: string): boolean {
-    const resetMs = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='last_reset_ms'").toArray()[0]?.v ?? 0);
-    if (resetMs === 0) return true;
+    // 用代数而不是时间排先后：清空和紧接着的一次检查可能落在同一毫秒。
+    const resetGeneration = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_generation'").toArray()[0]?.v ?? 0);
+    if (resetGeneration === 0) return true;
     const latest = this.sql
-      .exec<{ t: number | null }>("SELECT MAX(created_ms) AS t FROM ref_claims WHERE caller=? AND created_ms > ?", caller, Date.now() - REF_CLAIM_TTL_MS)
-      .one().t;
-    if (latest === null || latest > resetMs) return true;
-    this.sql.exec("DELETE FROM ref_claims WHERE caller=? AND created_ms <= ?", caller, resetMs);
+      .exec<{ g: number | null }>("SELECT MAX(generation) AS g FROM ref_claims WHERE caller=? AND created_ms > ?", caller, Date.now() - REF_CLAIM_TTL_MS)
+      .one().g;
+    if (latest === null || latest >= resetGeneration) return true;
+    this.sql.exec("DELETE FROM ref_claims WHERE caller=? AND generation < ?", caller, resetGeneration);
     return false;
   }
 
