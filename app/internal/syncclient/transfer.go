@@ -156,6 +156,14 @@ func IsBlobRefsRejected(err error) bool {
 	return false
 }
 
+// IsBlobCheckInterrupted says a blob check of many hashes was refused half
+// way: the server dropped its declaration between two batches (too many large
+// declarations at once). Asking again usually succeeds.
+func IsBlobCheckInterrupted(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.StatusCode == http.StatusConflict && ae.Code == "blob_check_interrupted"
+}
+
 // CheckMissingBlobs says which of the hashes the server does not have.
 func (c *Client) CheckMissingBlobs(ctx context.Context, accessToken string, hashes []string) ([]string, error) {
 	res, err := c.CheckBlobs(ctx, accessToken, hashes)

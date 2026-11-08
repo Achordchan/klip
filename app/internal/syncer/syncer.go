@@ -903,7 +903,7 @@ func (s *Syncer) uploadMissingBlobs(ctx context.Context, token string, exp snaps
 	for i, b := range unique {
 		hashes[i] = b.SHA256
 	}
-	check, err := s.cfg.Client.CheckBlobs(ctx, token, hashes)
+	check, err := s.checkBlobs(ctx, token, hashes)
 	if err != nil {
 		return "", err
 	}
@@ -928,6 +928,27 @@ func (s *Syncer) uploadMissingBlobs(ctx context.Context, token string, exp snaps
 	}
 	s.timing("upload", "upload_blobs", started, fmt.Sprintf("%s;uploaded=%d;refs=%t", reason, len(missing), check.RefsToken != ""))
 	return check.RefsToken, nil
+}
+
+// blobCheckAttempts is how many times checkBlobs asks when the server
+// interrupts a long check (see syncclient.IsBlobCheckInterrupted).
+const blobCheckAttempts = 3
+
+// checkBlobs asks the server which blobs it lacks, again a few times (after a
+// short wait) when it interrupts the check: another device's long check can
+// push this one's declaration out half way.
+func (s *Syncer) checkBlobs(ctx context.Context, token string, hashes []string) (syncclient.BlobCheck, error) {
+	for attempt := 1; ; attempt++ {
+		check, err := s.cfg.Client.CheckBlobs(ctx, token, hashes)
+		if err == nil || !syncclient.IsBlobCheckInterrupted(err) || attempt >= blobCheckAttempts {
+			return check, err
+		}
+		select {
+		case <-ctx.Done():
+			return check, ctx.Err()
+		case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+		}
+	}
 }
 
 // ---- download
