@@ -289,6 +289,8 @@ export class UserStore extends DurableObject<Env> {
   // 两次清理不能重叠，否则同一个哈希的删除登记会互相覆盖。
   private async drainCleanup(): Promise<void> {
     this.sql.exec("DELETE FROM cleanup WHERE blob_sha IS NOT NULL AND EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = cleanup.blob_sha)");
+    // 快照文件同理：还被某条快照记录（当前、备份或待发布）用着的 key 不删。
+    this.sql.exec("DELETE FROM cleanup WHERE blob_sha IS NULL AND EXISTS (SELECT 1 FROM snapshots s WHERE s.r2_key = cleanup.r2_key)");
     const rows = this.sql
       .exec<{ r2_key: string; blob_sha: string | null }>(
         "SELECT r2_key, blob_sha FROM cleanup c WHERE c.blob_sha IS NULL OR NOT EXISTS (SELECT 1 FROM blob_uploads u WHERE u.sha256 = c.blob_sha) LIMIT ?",
@@ -305,8 +307,11 @@ export class UserStore extends DurableObject<Env> {
     try {
       await deletion;
       for (const k of keys) this.sql.exec("DELETE FROM cleanup WHERE r2_key=?", k);
+      // 一次最多 1000 个：还有剩的（或刚才因为正在上传跳过的）就再安排一次。
+      if (this.sql.exec("SELECT 1 FROM cleanup LIMIT 1").toArray().length > 0) await this.scheduleMaintenance(60_000);
     } catch (e) {
       console.error("r2 cleanup failed, will retry", String(e));
+      await this.scheduleMaintenance(60_000);
     } finally {
       for (const sha of shas) if (this.blobDeletions.get(sha) === settled) this.blobDeletions.delete(sha);
     }
@@ -447,15 +452,13 @@ export class UserStore extends DurableObject<Env> {
       this.sql.exec("DELETE FROM meta WHERE k='usage_dirty'");
     } catch (e) {
       console.error("update storage_bytes failed, will retry", String(e));
-      const at = Date.now() + 60_000;
-      const current = await this.ctx.storage.getAlarm();
-      if (current === null || current > at) await this.ctx.storage.setAlarm(at);
+      await this.scheduleMaintenance(60_000);
     }
   }
 
-  /** 一秒后用 alarm 在提交锁里做一次清理和用量补写（已经有更早的 alarm 就不动）。 */
-  private async scheduleMaintenance(): Promise<void> {
-    const at = Date.now() + 1_000;
+  /** 过一会儿（默认一秒）用 alarm 在提交锁里做一次清理和用量补写（已经有更早的 alarm 就不动）。 */
+  private async scheduleMaintenance(delayMs = 1_000): Promise<void> {
+    const at = Date.now() + delayMs;
     const current = await this.ctx.storage.getAlarm();
     if (current === null || current > at) await this.ctx.storage.setAlarm(at);
   }
@@ -561,13 +564,22 @@ export class UserStore extends DurableObject<Env> {
           this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) VALUES (?,?)", key, sha);
           this.sql.exec("DELETE FROM blob_uploads WHERE id=?", intent);
         });
+        // 不依赖下一次请求：用 alarm 安排清理。
+        await this.scheduleMaintenance();
       }
     }
   }
 
+  /**
+   * 分配快照版本号（也是 R2 key 的一部分）。最后分配过的号存在 meta 里，失败撤销的也算，
+   * 所以版本号只增不减，新上传不会用到一个还在等清理的旧 key。
+   */
   private nextVersion(): string {
-    const last = this.sql.exec<{ v: string | null }>("SELECT MAX(CAST(version AS INTEGER)) AS v FROM snapshots").one().v;
-    return String(Math.max(Date.now(), last === null ? 0 : Number(last) + 1));
+    const maxRow = this.sql.exec<{ v: number | null }>("SELECT MAX(CAST(version AS INTEGER)) AS v FROM snapshots").one().v ?? 0;
+    const lastAllocated = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='last_version'").toArray()[0]?.v ?? 0);
+    const version = Math.max(Date.now(), maxRow + 1, lastAllocated + 1);
+    this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('last_version',?)", String(version));
+    return String(version);
   }
 
   /**
