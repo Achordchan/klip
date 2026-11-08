@@ -314,12 +314,14 @@ export class UserStore extends DurableObject<Env> {
         set_id TEXT,
         created_ms INTEGER NOT NULL,
         generation INTEGER NOT NULL,
-        oversized INTEGER NOT NULL DEFAULT 0
+        oversized INTEGER NOT NULL DEFAULT 0,
+        caller TEXT NOT NULL DEFAULT ''
       );
       CREATE TABLE IF NOT EXISTS caller_checks (
         caller TEXT PRIMARY KEY,
         generation INTEGER NOT NULL,
-        checked_ms INTEGER NOT NULL
+        checked_ms INTEGER NOT NULL,
+        invalidated INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS ref_claim_chunks (
         token TEXT NOT NULL,
@@ -544,27 +546,29 @@ export class UserStore extends DurableObject<Env> {
   /**
    * 给声明占的空间设上限（条数、字节数）：声明不计入档位容量，不设限的话反复查一堆不存在的哈希就能
    * 无限写入元数据。超出时从最旧的声明开始作废，keep（正在记的这一条）不动。在事务里调用。
-   * 作废的声明不再保护它的 blob；还在用它的新客户端上传快照时会收到 blob_refs_expired，重查一遍。
+   * 作废的声明不再保护它的 blob；还在用它的新客户端上传快照时会收到 blob_refs_expired，重查一遍；
+   * 旧客户端（不带声明上传）的检查记录标成作废，它的上传会被拒一次（见 legacyUploadAllowed）。
+   * 为下载保留的声明（hold:）不算在内、也不作废：它们随快照记录的删除产生，数量跟着快照走。
    */
   private boundRefClaims(keep: string): void {
     const rows = this.sql
-      .exec<{ token: string; set_id: string | null; chunk_bytes: number; set_bytes: number }>(
-        `SELECT c.token AS token, c.set_id AS set_id,
+      .exec<{ token: string; set_id: string | null; chunk_bytes: number; set_bytes: number; caller: string; created_ms: number }>(
+        `SELECT c.token AS token, c.set_id AS set_id, c.caller AS caller, c.created_ms AS created_ms,
            COALESCE((SELECT SUM(length(k.hashes)) FROM ref_claim_chunks k WHERE k.token = c.token), 0) AS chunk_bytes,
            CASE WHEN c.set_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.refs = c.set_id)
              THEN COALESCE((SELECT length(r.hashes) FROM ref_sets r WHERE r.id = c.set_id), 0) ELSE 0 END AS set_bytes
-         FROM ref_claims c ORDER BY (c.token = ?) DESC, c.created_ms DESC`,
+         FROM ref_claims c WHERE c.token NOT LIKE 'hold:%' ORDER BY (c.token = ?) DESC, c.created_ms DESC`,
         keep,
       )
       .toArray();
     let count = 0;
     let bytes = 0;
     const counted = new Set<string>();
-    const evict: string[] = [];
+    const evict: { token: string; caller: string; created_ms: number }[] = [];
     for (const r of rows) {
       const size = r.chunk_bytes + (r.set_id && !counted.has(r.set_id) ? r.set_bytes : 0);
       if (r.token !== keep && (count + 1 > MAX_REF_CLAIMS || bytes + size > MAX_REF_CLAIM_BYTES)) {
-        evict.push(r.token);
+        evict.push(r);
         continue;
       }
       count++;
@@ -572,7 +576,11 @@ export class UserStore extends DurableObject<Env> {
       if (r.set_id) counted.add(r.set_id);
     }
     if (evict.length === 0) return;
-    for (const t of evict) this.sql.exec("DELETE FROM ref_claims WHERE token=?", t);
+    for (const e of evict) {
+      this.sql.exec("DELETE FROM ref_claims WHERE token=?", e.token);
+      // 这是那台设备最近一次检查的话，它的检查不再有保护：记下作废。
+      if (e.caller) this.sql.exec("UPDATE caller_checks SET invalidated=1 WHERE caller=? AND checked_ms <= ?", e.caller, e.created_ms);
+    }
     this.dropOrphanRefs();
     console.warn("ref claims over limit, evicted the oldest", { evicted: evict.length });
   }
@@ -915,11 +923,22 @@ export class UserStore extends DurableObject<Env> {
       token = this.ctx.storage.transactionSync(() => {
         if (declare.token === null) {
           this.pruneRefClaims(now);
-          this.sql.exec("INSERT INTO ref_claims (token, set_id, created_ms, generation) VALUES (?,NULL,?,?)", t, now, this.storageGeneration());
+          this.sql.exec(
+            "INSERT INTO ref_claims (token, set_id, created_ms, generation, caller) VALUES (?,NULL,?,?,?)",
+            t,
+            now,
+            this.storageGeneration(),
+            declare.caller,
+          );
           // 记下这台设备最近一次查缺失时的代数（见 legacyUploadAllowed）。令牌过期之后它就传不上来了，
           // 刷新令牌后旧客户端会重新查一遍、换一个调用方标识，所以更早的记录可以删掉。
           this.sql.exec("DELETE FROM caller_checks WHERE checked_ms < ?", now - CALLER_CHECK_KEEP_MS);
-          this.sql.exec("INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms) VALUES (?,?,?)", declare.caller, this.storageGeneration(), now);
+          this.sql.exec(
+            "INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms, invalidated) VALUES (?,?,?,0)",
+            declare.caller,
+            this.storageGeneration(),
+            now,
+          );
         } else if (this.sql.exec("SELECT 1 FROM ref_claims WHERE token=? AND set_id IS NULL AND created_ms > ?", t, now - REF_CLAIM_TTL_MS).toArray().length === 0) {
           return null;
         }
@@ -1092,26 +1111,34 @@ export class UserStore extends DurableObject<Env> {
     // 旧客户端查缺失和上传快照用同一个令牌（遇到 401 刷新令牌后会重新查一遍），所以它的检查不早于令牌签发；
     // 那次检查的声明保护它查到的 blob 24 小时。令牌签发不到 24 小时，回收就碰不到那些 blob。
     // 访问令牌只有两小时有效，下面这条正常走不到，留着把这个前提写明：超过了就不再担保。
-    if (this.storageGeneration() > 0 && Date.now() - issuedMs >= REF_CLAIM_TTL_MS) {
-      this.sql.exec("INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms) VALUES (?,?,?)", caller, this.storageGeneration(), Date.now());
-      return false;
-    }
+    if (this.storageGeneration() > 0 && Date.now() - issuedMs >= REF_CLAIM_TTL_MS) return this.refuseLegacy(caller);
+    // caller_checks 不随声明过期：只要这个令牌还能用，它最近那次检查就还记着。
+    const last = this.sql
+      .exec<{ generation: number; invalidated: number }>("SELECT generation, invalidated FROM caller_checks WHERE caller=?", caller)
+      .toArray()[0];
+    // 它最近那次检查的声明因为超出上限被作废了：那些 blob 不再受保护，不再担保（见 boundRefClaims）。
+    if (last?.invalidated) return this.refuseLegacy(caller);
     // 用代数而不是时间排先后：清空和紧接着的一次检查可能落在同一毫秒。
     const resetGeneration = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='reset_generation'").toArray()[0]?.v ?? 0);
     if (resetGeneration === 0) return true;
-    // caller_checks 不随声明过期：只要这个令牌还能用，它清空前的那次检查就还记着。
-    const last = this.sql.exec<{ generation: number }>("SELECT generation FROM caller_checks WHERE caller=?", caller).toArray()[0];
-    if (last) {
-      if (last.generation >= resetGeneration) return true;
-    } else {
-      // 没有记录：令牌是开始记录之后签发的，就说明它从没查过缺失（只有文字），放行。
-      // 签发得更早的，可能在开始记录之前查过、没留下记录：保守拒绝一次。
-      const trackingSince = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='caller_tracking_ms'").one().v);
-      if (issuedMs >= trackingSince) return true;
-    }
-    // 拒绝这一次，并记下“已经拦过”：这台设备下次同步会重新导出，有 blob 就重新查（记录随之更新），
-    // 只有文字就不查，凭这条记录放行。
-    this.sql.exec("INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms) VALUES (?,?,?)", caller, this.storageGeneration(), Date.now());
+    if (last) return last.generation >= resetGeneration || this.refuseLegacy(caller);
+    // 没有记录：令牌是开始记录之后签发的，就说明它从没查过缺失（只有文字），放行。
+    // 签发得更早的，可能在开始记录之前查过、没留下记录：保守拒绝一次。
+    const trackingSince = Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='caller_tracking_ms'").one().v);
+    return issuedMs >= trackingSince || this.refuseLegacy(caller);
+  }
+
+  /**
+   * 拒绝一次不带声明的上传，并记下“已经拦过”（当前代数、未作废）：这台设备的这次同步就此失败，
+   * 下次同步会重新导出，有 blob 就重新查（记录随之更新），只有文字就不查，凭这条记录放行。
+   */
+  private refuseLegacy(caller: string): false {
+    this.sql.exec(
+      "INSERT OR REPLACE INTO caller_checks (caller, generation, checked_ms, invalidated) VALUES (?,?,?,0)",
+      caller,
+      this.storageGeneration(),
+      Date.now(),
+    );
     return false;
   }
 

@@ -445,3 +445,44 @@ func TestDeclarationsAreBounded(t *testing.T) {
 		t.Errorf("a check of 250001 hashes: %v", err)
 	}
 }
+
+// An older client's check whose declaration went over the limit no longer
+// vouches for its upload; the holds kept for downloads are not part of the
+// limit.
+func TestEvictedDeclarations(t *testing.T) {
+	a := newGCAccount(t, "evicted@example.com", nastest.Var("BLOB_GC_DROP_HOLD_SECONDS", "3600"))
+	x, y := a.blob(1000), a.blob(1000)
+	a.snapshot(a.check(x))
+	a.snapshot(syncclient.NoBlobRefs) // x's snapshot goes: x is held for downloads
+
+	older := a.access
+	if _, err := a.c.CheckBlobs(a.ctx, older, []string{y}); err != nil { // an older client checks
+		t.Fatal(err)
+	}
+	other := a.srv.Login(a.ctx, "evicted@example.com", "password1").AccessToken
+	refs := ""
+	for i := 0; i < 200; i++ {
+		res, err := a.c.CheckBlobs(a.ctx, other, []string{y})
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs = res.RefsToken
+	}
+	// A collection runs (the other device's snapshot with y goes): x is still held.
+	a.access = other
+	if err := a.c.UploadBlob(a.ctx, other, y, a.blobs[y]); err != nil {
+		t.Fatal(err)
+	}
+	a.snapshot(refs)
+	a.snapshot(syncclient.NoBlobRefs)
+	time.Sleep(time.Second)
+	if !a.has(x) {
+		t.Error("the hold for downloads was evicted with the declarations")
+	}
+
+	a.access = older
+	if err := a.trySnapshot(""); !syncclientIs(err, 409, "storage_generation_stale") {
+		t.Errorf("an older client whose declaration was evicted: %v", err)
+	}
+	a.snapshot("") // its next sync goes through
+}
