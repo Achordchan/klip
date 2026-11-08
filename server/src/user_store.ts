@@ -204,6 +204,8 @@ export class UserStore extends DurableObject<Env> {
   // 正在从 R2 删除的 blob（按哈希）：同一个哈希的新上传要等删除结束再开始，
   // 免得删除落在新文件写入之后。
   private blobDeletions = new Map<string, Promise<void>>();
+  // 正在上传的 blob（按哈希）：同一个哈希的上传排队，见 uploadBlob。
+  private blobUploadLocks = new Map<string, Promise<unknown>>();
   // 发验证码按用途排队。
   private codeLocks = new Map<string, Promise<unknown>>();
   // 上次写 manifest 的时间：R2 同一个 key 每秒最多写一次，连续发布时先等够间隔。
@@ -541,13 +543,30 @@ export class UserStore extends DurableObject<Env> {
     return (request.headers.get("content-encoding") ?? "").toLowerCase().includes("gzip");
   }
 
+  /**
+   * 同一个哈希的上传排队一个个来：两台设备同时传同一个附件时，后到的等前一个结束，
+   * 再查一次账目，前一个已经记账就直接返回 existing，不会重复占额度，也不会对同一个 key 连续写。
+   */
   private async uploadBlob(request: Request, userId: string, sha: string, tier: TierPolicy): Promise<Response> {
+    const run = (this.blobUploadLocks.get(sha) ?? Promise.resolve()).then(() => this.uploadBlobLocked(request, userId, sha, tier));
+    const tail = run.catch(() => {});
+    this.blobUploadLocks.set(sha, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.blobUploadLocks.get(sha) === tail) this.blobUploadLocks.delete(sha);
+    }
+  }
+
+  private async uploadBlobLocked(request: Request, userId: string, sha: string, tier: TierPolicy): Promise<Response> {
     // 同一个哈希的文件正在被清理就先等删完；等完之后到登记上传意图之间没有 await，
     // 之后的清理会因为这条意图而跳过它。
     for (let pending = this.blobDeletions.get(sha); pending; pending = this.blobDeletions.get(sha)) await pending;
     const existing = this.sql.exec<{ size: number }>("SELECT size FROM blobs WHERE sha256=?", sha).toArray()[0];
     if (existing) {
-      await request.body?.cancel();
+      // 把客户端还在发的请求体读完再回复（不解压不计算），否则客户端会在发送途中被断开（EPIPE）。
+      // 排在同一个哈希后面的上传通常就走到这里：它等锁时请求体一点都没读。
+      await request.body?.pipeTo(new WritableStream());
       return json({ sha256: sha, size: existing.size, existing: true });
     }
     // 额度一直占着，直到 blob 在提交里记进账目才释放：排队等提交的这段时间里，
