@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -219,6 +220,48 @@ func TestResetStorage(t *testing.T) {
 		t.Error("the account did not fill up again")
 	}
 	a.snapshot(syncclient.NoBlobRefs) // a snapshot without blobs is always fine
+}
+
+// A reset that stops after the manifest is deleted (as when the Durable
+// Object restarts there) is finished before the next snapshot is published:
+// the account does not stay with no manifest but all its data still counted.
+func TestAnInterruptedResetIsFinishedBeforeTheNextUpload(t *testing.T) {
+	a := newGCAccount(t, "interrupted@example.com", nastest.Var("TEST_INTERRUPT_RESET", "1"))
+	x := a.blob(30_000)
+	a.snapshot(a.check(x))
+	old := a.check(x)
+
+	body, _ := json.Marshal(map[string]any{"emailOrUserId": "interrupted@example.com"})
+	req, _ := http.NewRequest(http.MethodPost, a.srv.URL+"/admin/user/reset-storage", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+nastest.AdminKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == 200 {
+		t.Fatal("the interrupted reset reported success")
+	}
+	if _, err := a.c.GetManifestJSON(a.ctx, a.access); !syncclient.IsStatus(err, 404) {
+		t.Fatalf("manifest after the interrupted reset: %v", err)
+	}
+	if !a.has(x) || a.usage() == 0 {
+		t.Fatal("the interrupted reset already removed the data: the test does not test anything")
+	}
+
+	// The next upload finishes the reset first, so the check from before it is stale.
+	if err := a.trySnapshot(old); !syncclientIs(err, 409, "storage_generation_stale") {
+		t.Errorf("an upload after the interrupted reset: %v", err)
+	}
+	a.expectGone(x)
+	if u := a.usage(); u != 0 {
+		t.Errorf("usage after the reset was finished: %d", u)
+	}
+	a.snapshot(a.check(x))
+	if !a.has(x) || a.usage() == 0 {
+		t.Error("the account did not fill up again")
+	}
 }
 
 // Device B has checked its blobs (and found x on the server) and is about to

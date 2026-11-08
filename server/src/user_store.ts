@@ -355,9 +355,19 @@ export class UserStore extends DurableObject<Env> {
    * - 发布到一半的快照：看 R2 里的 manifest 指向谁，指向它就补成当前快照，否则撤销。
    * - 上传到一半的 blob（有上传意图、没有记账）：R2 里的文件交给待清理表删掉。
    * - 没写成功的 D1 用量：再写一次。
+   * - 做到一半的清空（见 resetStorage）：先把它做完，再处理别的。
    */
   private async recoverPublication(): Promise<void> {
     await this.scheduleGc(); // 迁移时安排的回收、或者上次没来得及安排的
+    if (this.sql.exec("SELECT 1 FROM meta WHERE k='reset_pending'").toArray().length > 0) {
+      const resetUser = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k='user'").toArray()[0]?.v;
+      try {
+        if (resetUser) await this.finishReset(resetUser);
+      } catch (e) {
+        // 留到下一次快照上传开始前（uploadSnapshot 先调用 finishReset）。
+        console.error("finish storage reset failed, will retry before the next upload", String(e));
+      }
+    }
     const pending = this.sql.exec<SnapshotRow>(`SELECT ${SNAPSHOT_COLS} FROM snapshots WHERE current=?`, PENDING).toArray();
     const hasCleanup = this.sql.exec("SELECT 1 FROM cleanup LIMIT 1").toArray().length > 0;
     const hasBlobIntents = this.sql.exec("SELECT 1 FROM blob_uploads LIMIT 1").toArray().length > 0;
@@ -865,41 +875,55 @@ export class UserStore extends DurableObject<Env> {
    * 不带声明的旧客户端见 legacyUploadAllowed）；
    * 正在上传的 blob 不在账目里，不受影响，它们的提交照常记账。
    * 拿着快照锁和提交锁执行，期间没有快照在上传或发布。
+   * 删 manifest 之前先记下“清空进行中”（meta reset_pending）：删完 manifest、事务还没提交时 DO 重启，
+   * 启动恢复会接着把清空做完；恢复也失败的话，下一次快照上传开始前先做完它（见 finishReset）。
    */
   async resetStorage(userId: string): Promise<{ removedObjects: number }> {
     const run = this.snapshotLock.then(() =>
       this.withCommit(async () => {
-        // manifest 不进待清理表：清理晚于新快照发布的话，会删掉新的 manifest。失败就抛出，什么都没改。
-        await this.env.BUCKET.delete(manifestKey(userId));
-        const queued = this.ctx.storage.transactionSync(() => {
-          this.bumpGeneration();
-          let n = 0;
-          for (const r of this.sql.exec<{ version: string; r2_key: string | null }>("SELECT version, r2_key FROM snapshots").toArray()) {
-            this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key) VALUES (?)", r.r2_key ?? snapshotKey(userId, r.version));
-            n++;
-          }
-          for (const b of this.sql.exec<{ sha256: string }>("SELECT sha256 FROM blobs").toArray()) {
-            this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) VALUES (?,?)", blobKey(userId, b.sha256), b.sha256);
-            n++;
-          }
-          this.sql.exec("DELETE FROM snapshots");
-          this.sql.exec("DELETE FROM blobs");
-          this.sql.exec("DELETE FROM ref_sets WHERE NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.set_id = ref_sets.id)");
-          this.sql.exec("DELETE FROM meta WHERE k='gc_due_ms'");
-          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes','0')");
-          // 清空前查过缺失、清空后才上传的旧客户端据此拒绝（见 legacyUploadAllowed）。
-          this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_generation',?)", String(this.storageGeneration()));
-          this.markUsageDirty();
-          return n;
-        });
-        await this.drainCleanup();
-        await this.flushUsage(userId);
-        this.broadcast(sseEvent("sync-updated", { reset: true, updatedAt: nowIso() }));
-        return { removedObjects: queued + 1 };
+        this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_pending','1')");
+        return { removedObjects: await this.finishReset(userId, this.env.TEST_INTERRUPT_RESET === "1") };
       }),
     );
     this.snapshotLock = run.catch(() => {});
     return run;
+  }
+
+  /**
+   * 做完记下的清空（见 resetStorage），没有就什么都不做，返回 0。调用时不能有快照在上传或发布：
+   * 拿着快照锁和提交锁，或者在 DO 启动恢复里。失败就抛出，reset_pending 留着（manifest 可能已经删掉了），下次再做：管理员看到失败，清空也会在下次快照上传前或 DO 重启时做完。
+   */
+  private async finishReset(userId: string, interruptForTest = false): Promise<number> {
+    if (this.sql.exec("SELECT 1 FROM meta WHERE k='reset_pending'").toArray().length === 0) return 0;
+    // manifest 不进待清理表：清理晚于新快照发布的话，会删掉新的 manifest。失败就抛出，账目没动。
+    await this.env.BUCKET.delete(manifestKey(userId));
+    if (interruptForTest) throw new Error("storage reset interrupted (TEST_INTERRUPT_RESET)");
+    const queued = this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM meta WHERE k='reset_pending'");
+      this.bumpGeneration();
+      let n = 0;
+      for (const r of this.sql.exec<{ version: string; r2_key: string | null }>("SELECT version, r2_key FROM snapshots").toArray()) {
+        this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key) VALUES (?)", r.r2_key ?? snapshotKey(userId, r.version));
+        n++;
+      }
+      for (const b of this.sql.exec<{ sha256: string }>("SELECT sha256 FROM blobs").toArray()) {
+        this.sql.exec("INSERT OR IGNORE INTO cleanup (r2_key, blob_sha) VALUES (?,?)", blobKey(userId, b.sha256), b.sha256);
+        n++;
+      }
+      this.sql.exec("DELETE FROM snapshots");
+      this.sql.exec("DELETE FROM blobs");
+      this.sql.exec("DELETE FROM ref_sets WHERE NOT EXISTS (SELECT 1 FROM ref_claims c WHERE c.set_id = ref_sets.id)");
+      this.sql.exec("DELETE FROM meta WHERE k='gc_due_ms'");
+      this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('blob_bytes','0')");
+      // 清空前查过缺失、清空后才上传的旧客户端据此拒绝（见 legacyUploadAllowed）。
+      this.sql.exec("INSERT OR REPLACE INTO meta (k,v) VALUES ('reset_generation',?)", String(this.storageGeneration()));
+      this.markUsageDirty();
+      return n;
+    });
+    await this.drainCleanup();
+    await this.flushUsage(userId);
+    this.broadcast(sseEvent("sync-updated", { reset: true, updatedAt: nowIso() }));
+    return queued + 1;
   }
 
   /**
@@ -1191,8 +1215,12 @@ export class UserStore extends DurableObject<Env> {
    * 写 manifest 的结果不明时先回读核对，读不到就保留待发布状态，留给下次上传或 DO 重启时的 reconcilePending。
    */
   private async uploadSnapshot(request: Request, userId: string, tier: TierPolicy): Promise<Response> {
-    // 先处理上次留下的、结果不明的发布（拿着 snapshotLock，没有别的快照在上传）。
-    await this.withCommit(() => this.reconcilePending(userId));
+    // 先做完没做完的清空，再处理上次留下的、结果不明的发布（拿着 snapshotLock，没有别的快照在上传）。
+    // 清空做不完就让这次上传失败：不能在 manifest 已删、账目还在的状态下发布新快照。
+    await this.withCommit(async () => {
+      await this.finishReset(userId);
+      await this.reconcilePending(userId);
+    });
     // 这份快照引用了哪些 blob（见 checkBlobs）。从这里到登记待发布快照之间没有 await：
     // 核对过的 blob 不会在登记之前被回收；登记之后，这份快照的引用就保护着它们。
     const refs = this.snapshotRefs(request.headers.get("x-klip-blob-refs"), {

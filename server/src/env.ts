@@ -27,6 +27,8 @@ export interface Env {
   BLOB_GC_DELAY_SECONDS?: string;
   BLOB_GC_DROP_HOLD_SECONDS?: string;
   BACKUP_RETENTION_SECONDS?: string;
+  // 只给测试用：设成 1 时后台清空删完 manifest 就中断（模拟 DO 在这时重启），由下一次快照上传接着做完。
+  TEST_INTERRUPT_RESET?: string;
 }
 
 export interface TierPolicy {
