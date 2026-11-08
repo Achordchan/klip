@@ -476,6 +476,14 @@ const adminResetPassword: Handler = async (req, env) => {
   return json({ success: true, userId: user.id, email: user.email });
 };
 
+const adminResetStorage: Handler = async (req, env) => {
+  const t = await adminTarget(req, env);
+  if (t instanceof Response) return t;
+  const { user } = t;
+  const r = await userStub(env, user.id).resetStorage(user.id);
+  return json({ success: true, userId: user.id, email: user.email, removedObjects: r.removedObjects });
+};
+
 // ---- 路由表 ----
 
 const ROUTES: Array<[string, RegExp, Handler]> = [
@@ -506,6 +514,7 @@ const ROUTES: Array<[string, RegExp, Handler]> = [
   ["POST", /^\/admin\/user\/upgrade$/, adminUpgrade],
   ["POST", /^\/admin\/user\/tier$/, adminSetTier],
   ["POST", /^\/admin\/user\/reset-password$/, adminResetPassword],
+  ["POST", /^\/admin\/user\/reset-storage$/, adminResetStorage],
 ];
 
 export default {

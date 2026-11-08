@@ -70,6 +70,20 @@ npx wrangler deploy
 
 `wrangler.jsonc` 里的 `routes` 会把 Worker 绑到 `klip.achord.cn`，Cloudflare 自动建 DNS 记录和证书（`achord.cn` 需要托管在同一个 Cloudflare 账号下）。
 
+## blob 不会自动回收
+
+图片和文件（blob）上传、记账之后，服务端不会自动删除它们，它们会一直计入容量（旧的 Python 版也是这样）。服务端看不懂快照内容，不知道哪些 blob 还在被引用，贸然删除可能删掉别的设备还要用的附件。所以用户删掉历史之后，空间不会释放；攒到档位上限后，同步会返回 409 `storage_limit_exceeded`。
+
+补救办法：管理员清空这个用户的云端数据。
+
+```bash
+curl -X POST https://klip.achord.cn/admin/user/reset-storage \
+  -H "Authorization: Bearer <ADMIN_KEY 或后台登录得到的令牌>" \
+  -d '{"emailOrUserId":"user@example.com"}'
+```
+
+这个操作会删掉该用户在 R2 里的全部快照、备份和 blob，并把用量清零，然后推送一次更新。客户端下次同步时发现云端没有 manifest，会把本地的快照和用到的 blob 重新上传，只保留现在还用得到的那部分。其他设备随后会下载这份新快照。由客户端在上传时声明引用、服务端自动回收的方案，留到以后单独实现。
+
 ## 密码哈希的限制
 
 密码用 PBKDF2-SHA512、100000 次迭代存储（ASP.NET Core Identity v3 格式）。Workers 运行时的 PBKDF2 单次最多只能算 100000 次迭代，所以迭代次数更高的哈希在这里无法验证，会被当作密码错误。目前库里的哈希都是这个后端自己按 100000 次生成的，不受影响。将来如果从别处导入账号，迭代次数更高的用户需要走“找回密码”，或者由管理员在后台重置密码（`POST /admin/user/reset-password`）。
